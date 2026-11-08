@@ -1,0 +1,45 @@
+# Lint, type-check, test, Django deploy checks and dependency audit on every pull request
+# and every push to main.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # Python version comes from .python-version; uv installs it.
+      - uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+
+      - run: uv sync --locked
+      - run: uv run ruff check
+      - run: uv run ruff format --check
+      - run: uv run mypy .
+      - run: uv run pytest
+
+      - name: Django production checks
+        env:
+          DJANGO_ALLOWED_HOSTS: signal.example.invalid
+          SIGNALING_ALLOWED_ORIGINS: https://call.example.invalid
+        run: |
+          DJANGO_SECRET_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(50))')" \
+            uv run python manage.py check --deploy --fail-level WARNING
+
+      - run: uv run pip-audit

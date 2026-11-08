@@ -1,0 +1,70 @@
+[project]
+name = "secure-call-backend"
+version = "0.0.0"
+description = "Signaling server for Secure Call: end-to-end encrypted 1-to-1 video calls"
+readme = "README.md"
+license = "AGPL-3.0-only"
+requires-python = ">=3.14"
+dependencies = [
+    "channels-redis>=4.3",
+    "channels[daphne]>=4.3",
+    "django>=6.1,<6.2",
+    "pydantic>=2.14",
+]
+
+[dependency-groups]
+dev = [
+    "django-stubs>=6.1.2",
+    "mypy>=2.4.1",
+    "pip-audit>=2.10.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.1.post1",
+    "pytest-django>=4.14.0",
+    "ruff>=0.17.4",
+]
+
+[tool.uv]
+# This is an application, not a library: uv manages the environment but never builds it.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "SIM", "RUF",
+    "S",     # flake8-bandit security rules
+    "DJ",    # Django
+    "ASYNC", # async pitfalls
+    "PT",    # pytest style
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"] # assert is how pytest works
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+plugins = ["mypy_django_plugin.main", "pydantic.mypy"]
+exclude = ["^\\.venv/"]
+
+[[tool.mypy.overrides]]
+# Channels and Daphne ship without type information.
+module = ["channels.*", "daphne.*", "channels_redis.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# Consumers subclass Channels' untyped base classes.
+module = ["signaling.consumers"]
+disallow_subclassing_any = false
+
+[tool.django-stubs]
+django_settings_module = "config.settings_test"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings_test"
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"

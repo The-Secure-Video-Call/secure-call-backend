@@ -1,0 +1,24 @@
+{
+  "additionalProperties": false,
+  "description": "Outer shape of every message in both directions. Unknown fields are rejected.",
+  "properties": {
+    "type": {
+      "description": "Message type, e.g. 'ping'. Lowercase letters and dashes only.",
+      "pattern": "^[a-z][a-z-]{0,31}$",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "description": "Protocol version.",
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "v",
+    "type"
+  ],
+  "title": "Envelope",
+  "type": "object"
+}

@@ -1,0 +1,31 @@
+{
+  "additionalProperties": false,
+  "description": "Sent by the server when it can't act on a message.",
+  "properties": {
+    "code": {
+      "enum": [
+        "bad-message",
+        "unsupported-type"
+      ],
+      "title": "Code",
+      "type": "string"
+    },
+    "type": {
+      "const": "error",
+      "default": "error",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "default": 1,
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "code"
+  ],
+  "title": "ErrorMessage",
+  "type": "object"
+}
