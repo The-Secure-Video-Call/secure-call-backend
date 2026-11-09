@@ -31,8 +31,8 @@ def join_text(room_id: str = ROOM_ID) -> str:
     return json.dumps({"v": 1, "type": "join", "roomId": room_id})
 
 
-def signal_text(payload: str) -> str:
-    return json.dumps({"v": 1, "type": "signal", "payload": payload})
+def signal_text(payload: str, iv: str | None = "A" * 16) -> str:
+    return json.dumps({"v": 1, "type": "signal", "payload": payload, "iv": iv})
 
 
 async def connect_client() -> WebsocketCommunicator:
@@ -87,6 +87,32 @@ async def test_signal_is_relayed_unchanged_both_ways_and_never_echoed() -> None:
     assert await first.receive_from() == from_second
     assert await second.receive_nothing()
     await first.disconnect()
+    await second.disconnect()
+
+
+@pytest.mark.parametrize(
+    "bad_text",
+    [
+        '{"v":1,"type":"signal","payload":"QUFB"}',
+        signal_text("QUFB", iv=None),
+        signal_text("QUFB", iv="A" * 15),
+        signal_text("QUFB", iv="A" * 17),
+        signal_text("QUFB", iv="AAAAAAAAAAAA!AAA"),
+    ],
+    ids=["missing-iv", "iv-null", "iv-too-short", "iv-too-long", "iv-not-base64"],
+)
+async def test_signal_with_missing_or_bad_iv_is_closed_and_not_relayed(bad_text: str) -> None:
+    first, second = await make_full_room()
+
+    await first.send_to(text_data=bad_text)
+    assert (await first.receive_output()) == {
+        "type": "websocket.close",
+        "code": CLOSE_POLICY_VIOLATION,
+    }
+    await first.disconnect()
+    # The only thing the other member sees is the peer leaving, never the signal.
+    assert json.loads(await second.receive_from()) == PEER_LEFT
+    assert await second.receive_nothing()
     await second.disconnect()
 
 

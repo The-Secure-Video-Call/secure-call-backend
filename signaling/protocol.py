@@ -66,10 +66,9 @@ class SignalMessage(BaseModel):
         max_length=MAX_PAYLOAD_CHARS,
         description="Opaque base64 string. Never decoded by the server.",
     )
-    iv: str | None = Field(
-        default=None,
+    iv: str = Field(
         pattern=IV_PATTERN,
-        description="Base64 of 12 bytes. Optional in M1, required from M2 (encryption).",
+        description="Required. Base64 of the 12-byte AES-GCM IV (16 characters).",
     )
 
 
