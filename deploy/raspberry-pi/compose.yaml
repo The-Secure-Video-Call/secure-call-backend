@@ -52,6 +52,35 @@ services:
     networks:
       - internal
 
+  # TURN relay for calls across NATs (PLAN.md 3.5). Host networking because the relay port
+  # range and Docker NAT do not mix. Router forwards: see README.md "TURN". The config
+  # denies every private, loopback and link-local peer; never loosen it.
+  coturn:
+    # Pinned version. TODO: add the @sha256 digest once looked up with
+    # `docker buildx imagetools inspect coturn/coturn:4.6.3`.
+    image: coturn/coturn:4.6.3
+    container_name: secure-call-coturn
+    restart: unless-stopped
+    network_mode: host
+    # The secret comes from .env (compose substitution), never from a file in the repo.
+    # No env_file here: coturn must not receive the backend's other secrets.
+    command:
+      - '-c'
+      - '/etc/coturn/turnserver.conf'
+      - '--static-auth-secret=${TURN_SHARED_SECRET:?Set TURN_SHARED_SECRET in .env}'
+      # Replacing the image's default command drops its external-ip detection; behind a
+      # home NAT the relay must advertise the public IP: "<public-ip>/<pi-lan-ip>".
+      - '--external-ip=${TURN_EXTERNAL_IP:?Set TURN_EXTERNAL_IP in .env}'
+    # Docker keeps stdout on disk; keep little of it. (The secret is visible in
+    # `docker inspect` and the process list on the Pi; keep the Pi's users trusted.)
+    logging:
+      driver: json-file
+      options:
+        max-size: '1m'
+        max-file: '2'
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
 networks:
   internal: {}
 
