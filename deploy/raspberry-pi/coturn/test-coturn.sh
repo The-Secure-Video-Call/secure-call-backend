@@ -55,7 +55,14 @@ expect() {
   if grep -Eqi 'Error response from daemon|No such container|is not running' <<<"$output"; then
     echo "FAIL: $label (container or client not usable)"; failures=$((failures + 1)); return
   fi
-  if grep -Fq 'channel bind: success' <<<"$output"; then
+  # bound: a relay address was granted, the server sent no error (the 401 challenge that starts
+  # every long-term-credential exchange is not an error), and either a bind/permission success
+  # line is present or the send summary shows messages sent with 0 dropped. 8.8.8.8 does not
+  # echo, so a reply is not expected.
+  if grep -Fq 'Received relay addr' <<<"$output" \
+    && ! grep -Eq 'error (40[02-9]|4[1-9][0-9]|5[0-9][0-9])' <<<"$output" \
+    && { grep -Fq 'channel bind: success' <<<"$output" \
+      || { grep -Eq 'tot_send_msgs=[1-9]' <<<"$output" && grep -Eq 'total send dropped 0([^0-9]|$)' <<<"$output"; }; }; then
     got=bound
   elif grep -Fq 'Received relay addr' <<<"$output" && grep -Fq 'channel bind: error 403' <<<"$output"; then
     got=forbidden
@@ -72,9 +79,11 @@ expect() {
   fi
   if [ "$got" = "$want" ]; then
     echo "PASS: $label"
+    # Show the whole client output for the valid check, so the log shows which line proves it.
+    if [ "$want" = bound ]; then echo "--- full client output ---"; echo "$output"; echo "--- end ---"; fi
   else
     echo "FAIL: $label (wanted $want, got $got)"
-    echo "$output" | tail -n 15
+    if [ "$want" = bound ]; then echo "$output"; else echo "$output" | tail -n 15; fi
     failures=$((failures + 1))
   fi
 }
@@ -87,6 +96,8 @@ wait_for_turn_port() {
   done
   return 1
 }
+
+restart_coturn() { docker restart "$container_name" >/dev/null && wait_for_turn_port; }
 
 cleanup
 docker run -d --name "$container_name" --network host \
@@ -102,7 +113,14 @@ expect "valid credential allocates and may relay to a public peer" bound "$(run_
 expect "wrong credential refused" no_allocation "$(run_client 600 "$public_peer" "wrong-password")"
 expect "expired credential refused" no_allocation "$(run_client -60 "$public_peer")"
 for private_peer in 127.0.0.1 192.168.1.10 10.0.0.5 172.16.0.5 169.254.1.1 0.0.0.0 100.64.0.1 \
-  224.0.0.1 ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
+  224.0.0.1; do
+  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")" "$private_peer"
+done
+
+# bps-capacity / max-bps allows about 37 concurrent allocations (README), and the checks above
+# are close to that, so restart for fresh state before the IPv6 and mapped group.
+restart_coturn || { echo "FAIL: coturn did not restart"; exit 1; }
+for private_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
   expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")" "$private_peer"
 done
 
@@ -129,7 +147,7 @@ fi
 # with a credential that expires 5 s later, wait 10 s, then send a Refresh for that allocation.
 # The server runs with host networking, so the probe on the runner reaches it on 127.0.0.1.
 # Restart first, so the probe starts from fresh state and shares no quota with the other checks.
-if ! { docker restart "$container_name" >/dev/null && wait_for_turn_port; }; then
+if ! restart_coturn; then
   echo "FAIL: coturn did not restart"; failures=$((failures + 1))
 fi
 read -r short_user short_pass < <(make_credential 5)

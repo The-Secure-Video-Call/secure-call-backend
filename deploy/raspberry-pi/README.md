@@ -38,6 +38,9 @@ Sized for a 200 Mbit/s line: `max-bps=500000` (4 Mbit/s per session, enough for 
 `bps-capacity=18750000` (150 Mbit/s, 75% of the line, so the house keeps headroom),
 `user-quota=12` and `total-quota=100` as specified in the issue. Note the 41-port relay range
 (49160-49200) limits real capacity to about 41 allocations, below `total-quota`.
+The bandwidth cap is the tighter limit: `bps-capacity` / `max-bps` = 18750000 / 500000 allows
+about 37 concurrent relayed allocations. A 38th gets `486 (Allocation Bandwidth Quota Reached)`.
+This is intended; the test restarts coturn between groups of checks so it never hits it.
 
 ### Tests
 
@@ -50,7 +53,8 @@ Do not add `denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255`: coturn matche
 against the mapped range too, so it refuses every public IPv4 peer. The config denies only the
 mapped forms of the private ranges. No `denied-peer-ip` range may start at `0.0.0.0` or `::`
 (the ranges start at `0.0.0.1` and `::ffff:0.0.0.1`), because an "any" address as the lower
-bound is suspected to match every peer.
+bound matches every peer: removing `denied-peer-ip=::` is what made public peers work in CI
+run 42690621732.
 
 ### IPv6
 
