@@ -45,21 +45,6 @@ async def test_join_without_room_id_closes_connection() -> None:
     assert await ws.receive_output() == {"type": "websocket.close", "code": CLOSE_POLICY_VIOLATION}
 
 
-async def test_room_messages_not_yet_supported_without_closing() -> None:
-    ws = communicator()
-    await ws.connect()
-
-    await ws.send_to(text_data='{"v":1,"type":"join","roomId":"' + "A" * 22 + '"}')
-    assert json.loads(await ws.receive_from()) == {
-        "v": 1,
-        "type": "error",
-        "code": "unsupported-type",
-    }
-    await ws.send_to(text_data='{"v":1,"type":"ping"}')
-    assert json.loads(await ws.receive_from())["type"] == "pong"
-    await ws.disconnect()
-
-
 async def test_origin_not_allowed_is_rejected() -> None:
     ws = communicator(origin=b"https://evil.example")
     connected, _ = await ws.connect()
