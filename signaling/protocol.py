@@ -132,7 +132,7 @@ class ErrorMessage(BaseModel):
 
     v: Literal[1] = 1
     type: Literal["error"] = "error"
-    code: Literal["room-full", "rate-limited", "bad-message", "unsupported-type"]
+    code: Literal["room-full", "room-expired", "rate-limited", "bad-message", "unsupported-type"]
 
 
 class PongMessage(BaseModel):

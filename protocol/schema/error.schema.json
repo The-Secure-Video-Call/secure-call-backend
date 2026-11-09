@@ -5,6 +5,7 @@
     "code": {
       "enum": [
         "room-full",
+        "room-expired",
         "rate-limited",
         "bad-message",
         "unsupported-type"
