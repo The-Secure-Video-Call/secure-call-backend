@@ -20,10 +20,13 @@ Check specifically:
    limits, the 2-person room limit and room expiry enforced; resources freed on disconnect.
 4. **Settings**: DEBUG off by default, no default secret key in production, no allowed origins by
    default, HTTPS/HSTS/security headers intact, nothing secret committed.
-5. **TURN**: only short-lived HMAC credentials, compared and generated with the `hmac`/`secrets`
+5. **Database**: credentials only from environment variables; the database is bound to localhost
+   or a private network; no call data (room IDs, call times, IP addresses, message contents)
+   is ever written to it; queries use the ORM or parameters, never string formatting.
+6. **TURN**: only short-lived HMAC credentials, compared and generated with the `hmac`/`secrets`
    modules, never static passwords.
-6. **Dependencies**: no new dependency without a clear reason; nothing that phones home.
-7. **Async correctness**: no blocking calls in consumers; no shared mutable state across
+7. **Dependencies**: no new dependency without a clear reason; nothing that phones home.
+8. **Async correctness**: no blocking calls in consumers; no shared mutable state across
    connections without a lock or the channel layer.
 
 Report findings ranked by severity (critical, high, medium, low). For each one give the file and

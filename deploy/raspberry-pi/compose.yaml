@@ -1,0 +1,28 @@
+# PostgreSQL for the Raspberry Pi test server.
+#
+# On the Pi, in this folder:
+#   cp .env.example .env      # then set a long random POSTGRES_PASSWORD in .env
+#   docker compose up -d
+#
+# The database listens on 127.0.0.1 only, so it is reachable from the Pi itself and nothing
+# else. Never forward port 5432 on your router.
+services:
+  postgres:
+    image: postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-securecall}
+      POSTGRES_USER: ${POSTGRES_USER:-securecall}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    ports:
+      - '127.0.0.1:5432:5432'
+    volumes:
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

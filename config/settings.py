@@ -4,7 +4,9 @@ Everything environment-specific comes from environment variables, and the defaul
 safe production values: DEBUG is off and the server refuses to start without a secret key.
 For local development, set DJANGO_DEBUG=1 (see README.md).
 
-The signaling server stores nothing: there is no database, no sessions and no user accounts.
+Signaling stores nothing. A PostgreSQL database can be connected (POSTGRES_* variables) for
+future user accounts only; it must never hold call data such as room IDs, call times, IP
+addresses or message contents.
 """
 
 import os
@@ -60,8 +62,31 @@ ROOT_URLCONF = "config.urls"
 ASGI_APPLICATION = "config.asgi.application"
 TEMPLATES: list[dict[str, object]] = []
 
-# No database: signaling keeps no records.
+# --- Database --------------------------------------------------------------------------------
+
+# Optional PostgreSQL, for future user accounts only (see the module docstring). Without
+# POSTGRES_HOST there is no database at all. The database must only be reachable from the
+# backend's own machine or private network: never expose port 5432 to the internet.
+POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "")
 DATABASES: dict[str, dict[str, object]] = {}
+if POSTGRES_HOST:
+    POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
+    if not POSTGRES_PASSWORD and not DEBUG:
+        raise ImproperlyConfigured("POSTGRES_PASSWORD must be set when POSTGRES_HOST is set.")
+    DATABASES["default"] = {
+        "ENGINE": "django.db.backends.postgresql",
+        "HOST": POSTGRES_HOST,
+        "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+        "NAME": os.environ.get("POSTGRES_DB", "securecall"),
+        "USER": os.environ.get("POSTGRES_USER", "securecall"),
+        "PASSWORD": POSTGRES_PASSWORD,
+        # ASGI: no persistent connections (Django's advice); add pooling with real traffic.
+        "CONN_MAX_AGE": 0,
+        "OPTIONS": {
+            "sslmode": os.environ.get("POSTGRES_SSLMODE", "prefer"),
+            "connect_timeout": 5,
+        },
+    }
 
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"

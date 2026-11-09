@@ -12,7 +12,8 @@ The architecture and security design are in the web app's
 ## Stack
 
 Python 3.14 · Django 6.1 · Channels 4.3 + Daphne (WebSockets) · Pydantic 2 (message validation) ·
-uv · ruff · mypy · pytest. No database: the server stores nothing.
+uv · ruff · mypy · pytest. Optional PostgreSQL 18 (psycopg 3), reserved for future user accounts:
+signaling itself stores nothing.
 
 ## Run locally
 
@@ -49,11 +50,44 @@ the server refuses to start without a secret key.
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated host names this server answers to. |
 | `SIGNALING_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to open a WebSocket, e.g. `https://call.example.com`. Empty means none. |
 | `REDIS_URL` | Optional. Use Redis for the channel layer so several server processes can share rooms. |
+| `POSTGRES_HOST` | Optional. Set it to connect PostgreSQL; leave it unset for no database. |
+| `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` | Default `5432`, `securecall`, `securecall`. |
+| `POSTGRES_PASSWORD` | Required when `POSTGRES_HOST` is set (outside DEBUG). |
+| `POSTGRES_SSLMODE` | Default `prefer`. Use `require` if the database is on another machine. |
 | `DJANGO_SECURE_SSL_REDIRECT` | Defaults to on in production. TLS is terminated by the reverse proxy. |
 | `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. |
 
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.
+
+## Database (PostgreSQL)
+
+The database is connected now but holds nothing yet. It is reserved for future user accounts and
+must never store call data: no room IDs, call times, IP addresses or message contents.
+
+### On the Raspberry Pi test server
+
+Requirements: Docker with the Compose plugin.
+
+```sh
+cd deploy/raspberry-pi
+cp .env.example .env        # set POSTGRES_PASSWORD and DJANGO_SECRET_KEY in .env
+docker compose up -d        # PostgreSQL 18, listening on 127.0.0.1:5432 only
+```
+
+Then, from the repo root on the Pi, check the backend can reach it:
+
+```sh
+set -a; . deploy/raspberry-pi/.env; set +a
+uv run python manage.py check --database default
+uv run python manage.py migrate
+uv run pytest tests/test_database.py
+```
+
+Keep the database private: port 5432 is bound to `127.0.0.1` and must never be forwarded on your
+router. Only the backend's HTTPS port (443) should be reachable from the internet.
+
+CI starts a throwaway PostgreSQL for every run, so the connection is tested on each PR.
 
 ## Protocol contract
 
