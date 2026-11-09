@@ -26,15 +26,29 @@ run_client() {
   docker exec "$container_name" timeout 20 turnutils_uclient -v -y -u "$1" -w "$2" -e "$3" -n 1 -m 1 127.0.0.1 2>&1
 }
 
-# $1 label, $2 ok|refused, $3 client output
+# $1 label, $2 bound|forbidden|no_allocation, $3 client output
+# turnutils_uclient (4.6.3) prints, as seen in CI:
+#   allocation worked:      "Received relay addr: ..." (after a 401 challenge, which is NOT a refusal)
+#   peer allowed:           "channel bind: success"
+#   peer denied by config:  "channel bind: error 403 (Forbidden IP)"
+# bound         = allocation worked AND the channel bind to the peer succeeded
+# forbidden     = allocation worked AND the channel bind was refused with 403 (never a success)
+# no_allocation = no relay address was ever granted (bad or expired credential)
 expect() {
   local label="$1" want="$2" output="$3" got
-  # An unreachable container or a client crash must never count as "refused".
+  # An unreachable container or a client crash must never count as a result.
   if grep -Eqi 'Error response from daemon|No such container|is not running' <<<"$output"; then
     echo "FAIL: $label (container or client not usable)"; failures=$((failures + 1)); return
   fi
-  # Assumption, verify on first CI run: refusals print 401/403/Forbidden/Unauthorized or an error.
-  if grep -Eqi '401|403|unauthorized|forbidden|cannot create|error' <<<"$output"; then got=refused; else got=ok; fi
+  if grep -Fq 'channel bind: success' <<<"$output"; then
+    got=bound
+  elif grep -Fq 'Received relay addr' <<<"$output" && grep -Fq 'channel bind: error 403' <<<"$output"; then
+    got=forbidden
+  elif ! grep -Fq 'Received relay addr' <<<"$output"; then
+    got=no_allocation
+  else
+    got=unclear
+  fi
   if [ "$got" = "$want" ]; then
     echo "PASS: $label"
   else
@@ -58,12 +72,12 @@ read -r good_user good_pass < <(make_credential $((now + 600)))
 read -r old_user old_pass < <(make_credential $((now - 60)))
 public_peer="8.8.8.8"
 
-expect "valid credential allocates" ok "$(run_client "$good_user" "$good_pass" "$public_peer")"
-expect "wrong credential refused" refused "$(run_client "$good_user" "wrong-password" "$public_peer")"
-expect "expired credential refused" refused "$(run_client "$old_user" "$old_pass" "$public_peer")"
+expect "valid credential allocates and may relay to a public peer" bound "$(run_client "$good_user" "$good_pass" "$public_peer")"
+expect "wrong credential refused" no_allocation "$(run_client "$good_user" "wrong-password" "$public_peer")"
+expect "expired credential refused" no_allocation "$(run_client "$old_user" "$old_pass" "$public_peer")"
 for private_peer in 127.0.0.1 192.168.1.10 10.0.0.5 172.16.0.5 169.254.1.1 0.0.0.0 100.64.0.1 \
-  224.0.0.1 ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1; do
-  expect "relay to $private_peer refused" refused "$(run_client "$good_user" "$good_pass" "$private_peer")"
+  224.0.0.1 ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
+  expect "relay to $private_peer refused" forbidden "$(run_client "$good_user" "$good_pass" "$private_peer")"
 done
 
 # The server logs must not contain the username or the peer IP.
@@ -80,12 +94,18 @@ else
   echo "PASS: CLI port 5766 closed"
 fi
 
-# Informational probe (not asserted): is an allocation refresh refused once the username
-# has expired? The credential expires in 5 s; the client keeps the allocation open longer.
+# Refresh-after-expiry probe (result recorded in README.md for #26, not asserted): allocate
+# with a credential that expires 5 s later, wait 10 s, then send a Refresh for that allocation.
+# The server runs with host networking, so the probe on the runner reaches it on 127.0.0.1.
 read -r short_user short_pass < <(make_credential $(($(date +%s) + 5)))
-echo "--- refresh-after-expiry probe (informational, read the output) ---"
-docker exec "$container_name" timeout 40 turnutils_uclient -v -y -u "$short_user" -w "$short_pass" \
-  -e "$public_peer" -n 1 -m 30 -l 100 127.0.0.1 2>&1 | tail -n 20
+probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 10 2>&1)"
+if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then
+  grep -E '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"
+else
+  echo "FAIL: refresh-after-expiry probe did not produce a result"
+  echo "$probe_output" | tail -n 5
+  failures=$((failures + 1))
+fi
 
 if [ "$failures" -eq 0 ]; then
   echo "All coturn checks passed."

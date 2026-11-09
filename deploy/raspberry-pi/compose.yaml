@@ -56,9 +56,9 @@ services:
   # range and Docker NAT do not mix. Router forwards: see README.md "TURN". The config
   # denies every private, loopback and link-local peer; never loosen it.
   coturn:
-    # Pinned version. TODO: add the @sha256 digest once looked up with
-    # `docker buildx imagetools inspect coturn/coturn:4.6.3`.
-    image: coturn/coturn:4.6.3
+    # Pinned by version and digest (the digest `docker pull coturn/coturn:4.6.3` reported in CI;
+    # compare with `docker buildx imagetools inspect coturn/coturn:4.6.3`).
+    image: coturn/coturn:4.6.3@sha256:71c3c990283385567f11794ee692e3a47b66fd9b0bb39e42afbe776e331dd888
     container_name: secure-call-coturn
     restart: unless-stopped
     network_mode: host

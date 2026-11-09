@@ -29,8 +29,8 @@ Manual steps (owner):
    - Or open https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/, add
      `turn:turn.securevideocall.com:3478` with that username and password, and gather: a
      `relay` candidate should appear.
-6. **Pin the digest:** the image is pinned to a version tag; add `@sha256:...` from
-   `docker buildx imagetools inspect coturn/coturn:4.6.3`.
+6. **Image pin:** the image is pinned to `4.6.3` plus its `@sha256:` digest (taken from the CI
+   pull). When upgrading, update both, e.g. from `docker buildx imagetools inspect coturn/coturn:<tag>`.
 
 ### Quotas
 
@@ -42,6 +42,19 @@ Sized for a 200 Mbit/s line: `max-bps=500000` (4 Mbit/s per session, enough for 
 ### Tests
 
 `coturn/test-coturn.sh` starts the pinned image with this config and a test secret and checks
-valid, wrong, expired credentials and private peers. It needs Docker and is run by CI.
-Refresh after expiry is probed by the script's informational section; record the result here
-once CI has shown it.
+that a valid credential can bind a public peer (8.8.8.8), that wrong and expired credentials get
+no allocation, and that 15 private, loopback, link-local, multicast and IPv4-mapped peers get
+`403 Forbidden IP`. It needs Docker and is run by CI.
+
+Do not add `denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255`: coturn matches IPv4 peers
+against the mapped range too, so it refuses every public IPv4 peer. The config denies only the
+mapped forms of the private ranges.
+
+### Refresh after expiry (input for #26)
+
+`coturn/refresh_after_expiry.py` allocates with a credential that expires 5 s later, waits 10 s,
+and sends a Refresh. CI prints `REFRESH AFTER EXPIRY: allowed` or `REFRESH AFTER EXPIRY: refused`.
+Result: **pending the next CI run** (fill in here, then set the credential TTL in #26 accordingly:
+if refresh is allowed, an expired credential keeps its existing allocation alive, so the TTL only
+needs to cover call setup; if refused, the TTL must cover the longest call or the client must
+fetch a new credential before it expires).
