@@ -73,7 +73,7 @@ published on `127.0.0.1:5434` by default (`POSTGRES_PUBLISH_ADDR` and `POSTGRES_
 
 ```
 Browser --wss://signal.securevideocall.com--> router :443 --> Nginx Proxy Manager
-        --> secure-call-backend container :8000 --> PostgreSQL container
+        --> Pi :8001 (secure-call-backend container) --> PostgreSQL container
 ```
 
 **How updates arrive:** every merge to `main` runs **Publish backend image**
@@ -94,12 +94,12 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
    ```sh
    git clone https://github.com/The-Secure-Video-Call/secure-call-backend.git
    cd secure-call-backend/deploy/raspberry-pi
-   docker network ls           # note Nginx Proxy Manager's network name
-   cp .env.example .env        # set NPM_NETWORK, DJANGO_SECRET_KEY and POSTGRES_PASSWORD
+   cp .env.example .env        # set BACKEND_PUBLISH_ADDR, DJANGO_SECRET_KEY, POSTGRES_PASSWORD
    docker compose up -d
    ```
 4. **Nginx Proxy Manager, Add Proxy Host:** domain `signal.securevideocall.com`; scheme `http`,
-   forward hostname `secure-call-backend`, port `8000`; **Websockets Support** and **Block
+   forward hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
+   machine), port `8001`; **Websockets Support** and **Block
    Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **Force SSL**, **HTTP/2**
    and **HSTS** on.
 5. **Automatic updates:** `crontab -e`, then add (with your path):

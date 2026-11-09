@@ -6,10 +6,11 @@
 # and add update.sh to cron (see README.md) so new images are picked up automatically.
 #
 # Network layout:
-#   - "proxy" is Nginx Proxy Manager's existing Docker network (NPM_NETWORK in .env). The
-#     backend joins it, so the proxy reaches it at http://secure-call-backend:8000.
-#   - "internal" holds the backend and PostgreSQL. The proxy is not on it.
-#   - The backend publishes no port on the Pi; the only way in is through the proxy.
+#   - The backend is published on BACKEND_PUBLISH_ADDR:BACKEND_PUBLISH_PORT (default
+#     127.0.0.1:8001). Nginx Proxy Manager forwards signal.securevideocall.com there; when the
+#     proxy runs on another machine, set BACKEND_PUBLISH_ADDR to this Pi's home-network IP.
+#     Never forward this port on your router: only the proxy's 80 and 443 face the internet.
+#   - "internal" holds the backend and PostgreSQL.
 #   - PostgreSQL is published on POSTGRES_PUBLISH_ADDR:POSTGRES_PUBLISH_PORT (default
 #     127.0.0.1:5434, the Pi only) for database tools. Never forward that port, 5432 or 81
 #     (the proxy's admin page) on your router.
@@ -27,9 +28,10 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+    ports:
+      - '${BACKEND_PUBLISH_ADDR:-127.0.0.1}:${BACKEND_PUBLISH_PORT:-8001}:8000'
     networks:
       - internal
-      - proxy
 
   postgres:
     image: postgres:18
@@ -52,9 +54,6 @@ services:
 
 networks:
   internal: {}
-  proxy:
-    external: true
-    name: ${NPM_NETWORK:?Set NPM_NETWORK in .env (find it with docker network ls)}
 
 volumes:
   pgdata:
