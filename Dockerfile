@@ -1,0 +1,31 @@
+# syntax=docker/dockerfile:1
+# Signaling server image. Built for the Raspberry Pi (arm64) and amd64 by
+# .github/workflows/publish-image.yml and published to ghcr.io.
+
+# --- Build stage: install the locked dependencies into /app/.venv with uv --------------------
+FROM python:3.14-slim AS build
+COPY --from=ghcr.io/astral-sh/uv:0.12.13 /uv /bin/uv
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    UV_PROJECT_ENVIRONMENT=/app/.venv
+WORKDIR /app
+COPY pyproject.toml uv.lock .python-version ./
+RUN uv sync --locked --no-dev --no-install-project
+COPY manage.py ./
+COPY config ./config
+COPY signaling ./signaling
+
+# --- Runtime stage: same Python, no build tools, non-root user --------------------------------
+FROM python:3.14-slim
+RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
+WORKDIR /app
+COPY --from=build /app /app
+ENV PATH=/app/.venv/bin:$PATH \
+    PYTHONUNBUFFERED=1 \
+    DJANGO_SETTINGS_MODULE=config.settings
+USER app
+EXPOSE 8000
+# Apply database migrations when a database is configured, then serve. Daphne runs with
+# -v 0 so its access log (which records visitor IP addresses) is off.
+CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; exec daphne -v 0 -b 0.0.0.0 -p 8000 config.asgi:application"]

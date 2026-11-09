@@ -1,0 +1,15 @@
+# Only manage.py, config/, signaling/ and the dependency files go into the image.
+.git
+.github
+.claude
+.venv
+**/__pycache__
+.mypy_cache
+.ruff_cache
+.pytest_cache
+.env
+.env.*
+tests
+deploy
+protocol
+*.md

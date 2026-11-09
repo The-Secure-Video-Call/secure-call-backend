@@ -1,12 +1,33 @@
-# PostgreSQL for the Raspberry Pi test server.
+# Backend + PostgreSQL for the Raspberry Pi test server, behind Nginx Proxy Manager.
 #
 # On the Pi, in this folder:
-#   cp .env.example .env      # then set a long random POSTGRES_PASSWORD in .env
+#   cp .env.example .env      # then fill in the values marked "set"
 #   docker compose up -d
+# and add update.sh to cron (see README.md) so new images are picked up automatically.
 #
-# The database listens on 127.0.0.1 only, so it is reachable from the Pi itself and nothing
-# else. Never forward port 5432 on your router.
+# Network layout:
+#   - "proxy" is Nginx Proxy Manager's existing Docker network (NPM_NETWORK in .env). The
+#     backend joins it, so the proxy reaches it at http://secure-call-backend:8000.
+#   - "internal" holds the backend and PostgreSQL. The proxy is not on it.
+#   - The backend publishes no port on the Pi; the only way in is through the proxy.
+#   - PostgreSQL listens on 127.0.0.1 only. Never forward port 5432 (or 81, the proxy's
+#     admin page) on your router.
 services:
+  backend:
+    image: ghcr.io/the-secure-video-call/secure-call-backend:main
+    container_name: secure-call-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Inside Docker the database is reached by its service name.
+      POSTGRES_HOST: postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - internal
+      - proxy
+
   postgres:
     image: postgres:18
     restart: unless-stopped
@@ -23,6 +44,14 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - internal
+
+networks:
+  internal: {}
+  proxy:
+    external: true
+    name: ${NPM_NETWORK:?Set NPM_NETWORK in .env (find it with docker network ls)}
 
 volumes:
   pgdata:
