@@ -27,5 +27,7 @@ ENV PATH=/app/.venv/bin:$PATH \
 USER app
 EXPOSE 8000
 # Apply database migrations when a database is configured, then serve. Daphne runs with
-# -v 0 so its access log (which records visitor IP addresses) is off.
-CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; exec daphne -v 0 -b 0.0.0.0 -p 8000 config.asgi:application"]
+# -v 0 so its access log (which records visitor IP addresses) is off. A WebSocket ping goes out
+# every 10 s and a client that has not answered 20 s later is dropped (worst case about 30 s),
+# which runs the consumer's disconnect so the peer gets peer-left and the seat is freed.
+CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; exec daphne -v 0 --ping-interval 10 --ping-timeout 20 -b 0.0.0.0 -p 8000 config.asgi:application"]
