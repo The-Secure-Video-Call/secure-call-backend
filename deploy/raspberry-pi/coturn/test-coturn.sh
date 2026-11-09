@@ -11,19 +11,30 @@ test_secret="ci-only-test-secret-not-used-anywhere"
 container_name="coturn-test"
 failures=0
 
-cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; }
+usernames_file="$(mktemp)"
+
+cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file"; }
 trap cleanup EXIT
 
-# $1 = expiry unix time. Prints "username password" (coturn REST credential, PLAN.md 3.5).
+# $1 = seconds until the credential expires (negative = already expired). Prints
+# "username password" (coturn REST credential, PLAN.md 3.5). Every call gets its own random
+# username, so user-quota=12 never interferes between checks.
 make_credential() {
-  local username="$1" password
+  local username password
+  username="$(( $(date +%s) + $1 )):$(openssl rand -hex 6)"
   password="$(printf '%s' "$username" | openssl dgst -sha1 -hmac "$test_secret" -binary | openssl base64)"
+  echo "$username" >>"$usernames_file"
   echo "$username $password"
 }
 
-# $1 username, $2 password, $3 peer ip. Prints the client's output.
+# $1 = seconds until expiry, $2 = peer ip, $3 = optional wrong password. Uses a fresh credential.
+# Prints the client's output. No -y: that is client-to-client mode, which ignores -e and binds
+# the client's own relay address instead of the peer.
 run_client() {
-  docker exec "$container_name" timeout 20 turnutils_uclient -v -y -u "$1" -w "$2" -e "$3" -n 1 -m 1 127.0.0.1 2>&1
+  local username password
+  read -r username password < <(make_credential "$1")
+  if [ -n "${3-}" ]; then password="$3"; fi
+  docker exec "$container_name" timeout 20 turnutils_uclient -v -u "$username" -w "$password" -e "$2" -n 1 -m 1 127.0.0.1 2>&1
 }
 
 # $1 label, $2 bound|forbidden|no_allocation, $3 client output
@@ -67,21 +78,19 @@ for _ in $(seq 1 20); do
   sleep 1
 done
 
-now="$(date +%s)"
-read -r good_user good_pass < <(make_credential $((now + 600)))
-read -r old_user old_pass < <(make_credential $((now - 60)))
 public_peer="8.8.8.8"
 
-expect "valid credential allocates and may relay to a public peer" bound "$(run_client "$good_user" "$good_pass" "$public_peer")"
-expect "wrong credential refused" no_allocation "$(run_client "$good_user" "wrong-password" "$public_peer")"
-expect "expired credential refused" no_allocation "$(run_client "$old_user" "$old_pass" "$public_peer")"
+expect "valid credential allocates and may relay to a public peer" bound "$(run_client 600 "$public_peer")"
+expect "wrong credential refused" no_allocation "$(run_client 600 "$public_peer" "wrong-password")"
+expect "expired credential refused" no_allocation "$(run_client -60 "$public_peer")"
 for private_peer in 127.0.0.1 192.168.1.10 10.0.0.5 172.16.0.5 169.254.1.1 0.0.0.0 100.64.0.1 \
   224.0.0.1 ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
-  expect "relay to $private_peer refused" forbidden "$(run_client "$good_user" "$good_pass" "$private_peer")"
+  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")"
 done
 
-# The server logs must not contain the username or the peer IP.
-if docker logs "$container_name" 2>&1 | grep -Fq -e "$good_user" -e "$public_peer"; then
+# The server logs must not contain any username or the peer IP.
+server_logs="$(docker logs "$container_name" 2>&1)"
+if grep -Fq -f "$usernames_file" <<<"$server_logs" || grep -Fq "$public_peer" <<<"$server_logs"; then
   echo "FAIL: coturn logs contain a username or peer IP"; failures=$((failures + 1))
 else
   echo "PASS: logs contain no username or peer IP"
@@ -97,7 +106,7 @@ fi
 # Refresh-after-expiry probe (result recorded in README.md for #26, not asserted): allocate
 # with a credential that expires 5 s later, wait 10 s, then send a Refresh for that allocation.
 # The server runs with host networking, so the probe on the runner reaches it on 127.0.0.1.
-read -r short_user short_pass < <(make_credential $(($(date +%s) + 5)))
+read -r short_user short_pass < <(make_credential 5)
 probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 10 2>&1)"
 if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then
   grep -E '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"
