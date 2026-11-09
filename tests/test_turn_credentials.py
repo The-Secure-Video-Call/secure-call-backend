@@ -29,6 +29,16 @@ def test_credential_matches_rfc_2202_hmac_sha1_test_vector() -> None:
     assert base64.b64decode(credential).hex() == expected_hex
 
 
+def test_credential_matches_known_answer_in_coturn_format() -> None:
+    # Computed outside this code (OpenSSL 3.6), cross-checked with Python hmac + hashlib:
+    #   printf '%s' "$username" | openssl dgst -sha1 -hmac "$secret" -binary | openssl base64
+    # with secret = SHARED_SECRET and username = "1700003600:AAECAwQFBgcICQoLDA0ODw".
+    username = make_turn_username(1_700_003_600, bytes(range(16)))
+    assert username == "1700003600:AAECAwQFBgcICQoLDA0ODw"
+
+    assert make_turn_credential(SHARED_SECRET, username) == "zqLrZg/hlbZwDap9GTW4GMooDRI="
+
+
 def test_username_is_expiry_then_base64url_of_16_random_bytes() -> None:
     username = make_turn_username(1_700_003_600, bytes(range(16)))
 
