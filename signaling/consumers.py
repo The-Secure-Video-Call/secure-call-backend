@@ -6,6 +6,10 @@ Security rules (PLAN.md 3.5):
 - the Origin was checked before this consumer runs (see config/asgi.py);
 - binary frames and messages over SIGNALING_MAX_MESSAGE_BYTES close the connection;
 - malformed messages close the connection;
+- bad connections are closed with application codes, because Daphne (Autobahn) only lets an
+  application send 1000 or 3000-4999 (anything else raises and skips `disconnect`):
+  4003 unsupported data (a binary frame), 4008 policy violation (a malformed or invalid message),
+  4009 message too big. 1000 stays the normal close (`room-full`, `room-expired`);
 - a room holds at most two connections and expires (see rooms.py): members get `room-expired`;
 - `signal` text is relayed to the other member exactly as received. It is validated like every
   message but never stored or logged; message contents and room IDs are never logged.
@@ -34,10 +38,10 @@ from signaling.protocol import (
 )
 from signaling.rooms import group_name_for_room, room_registry
 
-# WebSocket close codes (RFC 6455, section 7.4.1).
-CLOSE_UNSUPPORTED_DATA = 1003
-CLOSE_POLICY_VIOLATION = 1008
-CLOSE_MESSAGE_TOO_BIG = 1009
+# Application close codes: the standard RFC 6455 meaning (1003, 1008, 1009) in the last digits.
+CLOSE_UNSUPPORTED_DATA = 4003
+CLOSE_POLICY_VIOLATION = 4008
+CLOSE_MESSAGE_TOO_BIG = 4009
 
 
 class SignalingConsumer(AsyncWebsocketConsumer):
@@ -51,15 +55,15 @@ class SignalingConsumer(AsyncWebsocketConsumer):
 
     async def receive(self, text_data: str | None = None, bytes_data: bytes | None = None) -> None:
         if text_data is None:
-            await self.close(code=CLOSE_UNSUPPORTED_DATA)
+            await self.leave_room_then_close(CLOSE_UNSUPPORTED_DATA)
             return
         if len(text_data.encode("utf-8")) > settings.SIGNALING_MAX_MESSAGE_BYTES:
-            await self.close(code=CLOSE_MESSAGE_TOO_BIG)
+            await self.leave_room_then_close(CLOSE_MESSAGE_TOO_BIG)
             return
         try:
             message = ClientMessage.model_validate_json(text_data).root
         except ValidationError:
-            await self.close(code=CLOSE_POLICY_VIOLATION)
+            await self.leave_room_then_close(CLOSE_POLICY_VIOLATION)
             return
 
         if isinstance(message, PingMessage):
@@ -104,6 +108,16 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         if not room_registry.is_member(self.room_id, self.channel_name):
             return  # our room expired and the close is on its way: relay nothing
         await self.send_event_to_peer(group_name_for_room(self.room_id), "peer_signal", signal_text)
+
+    async def leave_room_then_close(self, close_code: int) -> None:
+        """Defence in depth: clean up first so the peer gets `peer-left` even if closing fails.
+
+        The close still happens if cleanup raises, so a bad connection never stays open.
+        """
+        try:
+            await self.leave_room()
+        finally:
+            await self.close(code=close_code)
 
     async def leave_room(self) -> None:
         room_id = self.room_id
