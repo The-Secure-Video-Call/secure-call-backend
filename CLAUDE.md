@@ -26,6 +26,8 @@ sections before starting any task.
 ## Code conventions
 
 - Type hints everywhere; `uv run mypy .` (strict) must pass.
+- No relative imports: always import from the package root, e.g. `from signaling.protocol import Envelope`,
+  never `from .protocol import Envelope`. Ruff enforces this (TID252).
 - `uv run ruff check` and `uv run ruff format --check` must pass (security rules included).
 - Every change to protocol, room or consumer logic needs tests, including at least one negative
   test (tampered, replayed, oversized or malformed input is rejected).
