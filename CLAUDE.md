@@ -23,6 +23,16 @@ sections before starting any task.
   defaults must stay safe for production (DEBUG off, no allowed origins).
 - TURN credentials are short-lived HMAC credentials only (PLAN.md 3.5); no static passwords.
 
+## Structure (keep it flat and simple)
+
+- `config/`: settings, ASGI and URL routing only.
+- `signaling/`: one module per job, named for that job: `protocol.py` (message models),
+  `consumers.py` (WebSocket handling), `rooms.py` (room state), `views.py` (HTTP endpoints).
+  A new job gets a new module here, e.g. `turn_credentials.py`, `rate_limits.py`.
+- `tests/`: one `test_<module>.py` per module it tests.
+- No extra layers or catch-all modules (`services/`, `managers/`, `helpers/`, `utils.py`) and no
+  folders nested deeper than `signaling/` unless a PR explains why they are needed.
+
 ## Code conventions
 
 - Type hints everywhere; `uv run mypy .` (strict) must pass.
