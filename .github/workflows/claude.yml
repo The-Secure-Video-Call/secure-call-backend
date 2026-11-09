@@ -45,5 +45,5 @@ jobs:
           # Console promotional API credits don't cover Claude Code / this Action.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           # Claude may run exactly these commands (plain `uv sync` only, so it can't add
-          # packages from the command line), with up to 60 turns per job.
-          claude_args: '--max-turns 60 --allowedTools "Bash(uv sync),Bash(uv run pytest:*),Bash(uv run ruff check:*),Bash(uv run ruff format:*),Bash(uv run mypy:*),Bash(uv run python -m signaling.export_schema),Bash(uv run python manage.py check:*)"'
+          # packages from the command line), with up to 150 turns (steps) per job.
+          claude_args: '--max-turns 150 --allowedTools "Bash(uv sync),Bash(uv run pytest:*),Bash(uv run ruff check:*),Bash(uv run ruff format:*),Bash(uv run mypy:*),Bash(uv run python -m signaling.export_schema),Bash(uv run python manage.py check:*)"'
