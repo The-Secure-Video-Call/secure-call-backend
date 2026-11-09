@@ -61,16 +61,17 @@ def test_every_type_has_valid_and_two_invalid_fixtures(direction: str, types: li
 
 def test_oversized_payload_is_rejected_in_both_directions() -> None:
     # Too large for a fixture file (64 KiB), so it is built here. Clients should do the same.
-    text = json.dumps({"v": 1, "type": "signal", "payload": "A" * (MAX_PAYLOAD_CHARS + 1)})
+    payload = "A" * (MAX_PAYLOAD_CHARS + 1)
+    text = json.dumps({"v": 1, "type": "signal", "payload": payload, "iv": "A" * 16})
     for model in (ClientMessage, ServerMessage):
         with pytest.raises(ValidationError):
             model.model_validate_json(text)
 
 
 def test_largest_payload_is_accepted_and_one_more_rejected() -> None:
-    SignalMessage(payload="A" * MAX_PAYLOAD_CHARS)
+    SignalMessage(payload="A" * MAX_PAYLOAD_CHARS, iv="A" * 16)
     with pytest.raises(ValidationError):
-        SignalMessage(payload="A" * (MAX_PAYLOAD_CHARS + 1))
+        SignalMessage(payload="A" * (MAX_PAYLOAD_CHARS + 1), iv="A" * 16)
 
 
 def test_largest_signal_message_fits_the_size_limit() -> None:
@@ -78,5 +79,20 @@ def test_largest_signal_message_fits_the_size_limit() -> None:
     assert len(message.model_dump_json().encode()) <= 64 * 1024
 
 
-def test_signal_iv_is_optional() -> None:
-    assert SignalMessage(payload="AAAA").iv is None
+@pytest.mark.parametrize(
+    "iv", [None, "", "A" * 15, "A" * 17, "AAAAAAAAAAAA!AAA", "AAAAAAAAAAAAAA=="]
+)
+def test_signal_with_a_bad_iv_is_rejected(iv: str | None) -> None:
+    text = json.dumps({"v": 1, "type": "signal", "payload": "AAAA", "iv": iv})
+    with pytest.raises(ValidationError):
+        ClientMessage.model_validate_json(text)
+    with pytest.raises(ValidationError):
+        ServerMessage.model_validate_json(text)
+
+
+def test_signal_without_iv_is_rejected() -> None:
+    text = json.dumps({"v": 1, "type": "signal", "payload": "AAAA"})
+    with pytest.raises(ValidationError):
+        ClientMessage.model_validate_json(text)
+    with pytest.raises(ValidationError):
+        ServerMessage.model_validate_json(text)
