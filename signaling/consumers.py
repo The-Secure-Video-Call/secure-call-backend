@@ -6,7 +6,7 @@ Security rules (PLAN.md 3.5):
 - the Origin was checked before this consumer runs (see config/asgi.py);
 - binary frames and messages over SIGNALING_MAX_MESSAGE_BYTES close the connection;
 - malformed messages close the connection;
-- a room holds at most two connections;
+- a room holds at most two connections and expires (see rooms.py): members get `room-expired`;
 - `signal` text is relayed to the other member exactly as received. It is validated like every
   message but never stored or logged; message contents and room IDs are never logged.
 
@@ -101,6 +101,8 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         if self.room_id is None:
             await self.send_message(ErrorMessage(code="bad-message"))
             return
+        if not room_registry.is_member(self.room_id, self.channel_name):
+            return  # our room expired and the close is on its way: relay nothing
         await self.send_event_to_peer(group_name_for_room(self.room_id), "peer_signal", signal_text)
 
     async def leave_room(self) -> None:
@@ -135,6 +137,18 @@ class SignalingConsumer(AsyncWebsocketConsumer):
 
     async def peer_left(self, event: dict[str, Any]) -> None:
         await self.forward_event_text_unless_from_self(event)
+
+    async def room_expired(self, event: dict[str, Any]) -> None:
+        """The registry removed our room (waiting or total limit). Tell the client and close."""
+        room_id = self.room_id
+        if room_id is None or group_name_for_room(room_id) != event["group_name"]:
+            return  # stale: we already left that room (and maybe joined another)
+        if room_registry.is_member(room_id, self.channel_name):
+            return  # stale: we left and rejoined the same room ID; this is a live new room
+        self.room_id = None
+        await self.channel_layer.group_discard(group_name_for_room(room_id), self.channel_name)
+        await self.send_message(ErrorMessage(code="room-expired"))
+        await self.close()
 
     async def send_message(self, message: BaseModel) -> None:
         await self.send(text_data=message.model_dump_json())
