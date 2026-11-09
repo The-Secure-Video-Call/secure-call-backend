@@ -1,0 +1,29 @@
+{
+  "additionalProperties": false,
+  "description": "Ask to enter a room. `roomId` is derived in the browser; the room secret never leaves it.",
+  "properties": {
+    "roomId": {
+      "description": "base64url, 22-43 characters.",
+      "pattern": "^[A-Za-z0-9_-]{22,43}$",
+      "title": "Roomid",
+      "type": "string"
+    },
+    "type": {
+      "const": "join",
+      "default": "join",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "default": 1,
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "roomId"
+  ],
+  "title": "JoinMessage",
+  "type": "object"
+}

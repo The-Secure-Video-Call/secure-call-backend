@@ -1,0 +1,19 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "const": "leave",
+      "default": "leave",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "default": 1,
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "title": "LeaveMessage",
+  "type": "object"
+}

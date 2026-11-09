@@ -29,11 +29,27 @@ async def test_ping_gets_pong() -> None:
     await ws.disconnect()
 
 
-async def test_unknown_type_gets_error_without_closing() -> None:
+async def test_unknown_type_closes_connection() -> None:
+    ws = communicator()
+    await ws.connect()
+
+    await ws.send_to(text_data='{"v":1,"type":"teleport"}')
+    assert await ws.receive_output() == {"type": "websocket.close", "code": CLOSE_POLICY_VIOLATION}
+
+
+async def test_join_without_room_id_closes_connection() -> None:
     ws = communicator()
     await ws.connect()
 
     await ws.send_to(text_data='{"v":1,"type":"join"}')
+    assert await ws.receive_output() == {"type": "websocket.close", "code": CLOSE_POLICY_VIOLATION}
+
+
+async def test_room_messages_not_yet_supported_without_closing() -> None:
+    ws = communicator()
+    await ws.connect()
+
+    await ws.send_to(text_data='{"v":1,"type":"join","roomId":"' + "A" * 22 + '"}')
     assert json.loads(await ws.receive_from()) == {
         "v": 1,
         "type": "error",

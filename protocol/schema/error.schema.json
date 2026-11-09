@@ -4,6 +4,8 @@
   "properties": {
     "code": {
       "enum": [
+        "room-full",
+        "rate-limited",
         "bad-message",
         "unsupported-type"
       ],
