@@ -10,8 +10,8 @@
 #     backend joins it, so the proxy reaches it at http://secure-call-backend:8000.
 #   - "internal" holds the backend and PostgreSQL. The proxy is not on it.
 #   - The backend publishes no port on the Pi; the only way in is through the proxy.
-#   - PostgreSQL listens on 127.0.0.1 only. Never forward port 5432 (or 81, the proxy's
-#     admin page) on your router.
+#   - PostgreSQL publishes no port at all, so only the backend (on "internal") can reach it.
+#     Never forward 5432 or 81 (the proxy's admin page) on your router.
 services:
   backend:
     image: ghcr.io/the-secure-video-call/secure-call-backend:main
@@ -35,8 +35,6 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-securecall}
       POSTGRES_USER: ${POSTGRES_USER:-securecall}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
-    ports:
-      - '127.0.0.1:5432:5432'
     volumes:
       - pgdata:/var/lib/postgresql
     healthcheck:
