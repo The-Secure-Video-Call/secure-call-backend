@@ -9,6 +9,7 @@ dependencies = [
     "channels-redis>=4.3",
     "channels[daphne]>=4.3",
     "django>=6.1,<6.2",
+    "psycopg[binary]>=3.3",
     "pydantic>=2.14",
 ]
 

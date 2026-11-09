@@ -15,7 +15,10 @@ sections before starting any task.
 - Keep the WebSocket Origin check (`OriginValidator` in `config/asgi.py`), the message size limit,
   rate limits and the 2-person room limit. Never weaken them, or the security headers and HTTPS
   settings in `config/settings.py`, to make something work. Explain in the PR instead.
-- No database, no sessions, no user accounts unless PLAN.md is changed first.
+- PostgreSQL is connected (when `POSTGRES_HOST` is set) for future user accounts only. Never
+  store call data in it: no room IDs, call times, IP addresses or message contents. Adding
+  tables, sessions or accounts needs a PLAN.md change first. The database is never exposed
+  to the internet.
 - Never commit secrets. Everything environment-specific comes from environment variables, and the
   defaults must stay safe for production (DEBUG off, no allowed origins).
 - TURN credentials are short-lived HMAC credentials only (PLAN.md 3.5); no static passwords.
