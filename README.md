@@ -65,8 +65,9 @@ off.
 The database is connected now but holds nothing yet. It is reserved for future user accounts and
 must never store call data: no room IDs, call times, IP addresses or message contents.
 
-The database runs next to the backend on the Raspberry Pi (see below) and publishes no port: only
-the backend container can reach it. CI starts a throwaway PostgreSQL for every run, so the connection is tested on each PR.
+The database runs next to the backend on the Raspberry Pi (see below). For database tools it is
+published on `127.0.0.1:5434` by default (`POSTGRES_PUBLISH_ADDR` and `POSTGRES_PUBLISH_PORT` in
+`.env`); never forward that port on your router. CI starts a throwaway PostgreSQL for every run, so the connection is tested on each PR.
 
 ## Deploying to the Raspberry Pi
 
@@ -107,8 +108,8 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
    ```
 6. **Check:** `curl https://signal.securevideocall.com/healthz` returns `{"status": "ok"}`.
 
-To look inside the database from the Pi:
-`docker compose exec postgres psql -U securecall securecall`.
+To look inside the database from the Pi: `docker compose exec postgres psql -U securecall
+securecall`, or point a database tool at port `5434`.
 
 ## Protocol contract
 
