@@ -48,6 +48,35 @@ sections before starting any task.
   and add valid/invalid examples to `protocol/fixtures/`. The web client depends on these files.
 - Add dependencies with `uv add` only when clearly needed, and say why in the PR.
 
+## The other repo
+
+Every Claude run (tasks and reviews) has a read-only copy of secure-call's latest `main` at
+`.reference/secure-call/`. Read it to see how the web app really uses the server (`apps/web/src/signaling/`,
+`apps/web/src/rtc/`, `packages/protocol/`) before changing what the server sends or accepts.
+
+- Never edit or commit anything under `.reference/` (git ignores it anyway).
+- If the work needs a change in secure-call, don't work around it here: say in your reply
+  what has to change there and why, so it can become an issue in that repo.
+
+### When work in the two repos depends on each other
+
+The two Claudes can't talk to each other or see each other's unmerged branches, only `main`.
+
+1. **The message contract comes first.** The backend's `signaling/protocol.py` (exported to
+   `protocol/`) is the agreed interface. Code against the contract, never against code that
+   isn't merged yet. A contract change is made in the backend first; the web app follows after
+   it is merged (`pnpm protocol:sync`).
+2. **Check before you start.** If the issue says "Depends on" another issue, look in
+   `.reference/secure-call/` (or this repo) for what it needs. If it isn't on `main` yet,
+   don't build a stand-in or guess: reply **"Blocked by <repo>#<issue>"**, list exactly what
+   you need from it, and stop without pushing.
+3. **Never change the other side's behaviour by assumption.** If you find the contract or the
+   other repo's code doesn't support what your issue needs, say what has to change and why;
+   the change becomes its own issue there, and your issue waits for it.
+4. **Keep each side working on its own.** Merge order follows the dependencies (contract,
+   then server, then client), and every PR must pass its own CI without the other's
+   unmerged work.
+
 ## Working on issues
 
 - One milestone checklist item per pull request. Reference the issue (`Closes #<number>`).

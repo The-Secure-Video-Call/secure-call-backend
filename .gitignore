@@ -10,3 +10,5 @@ htmlcov/
 .env.*
 !.env.example
 *.log
+# Read-only copy of the other repo, checked out by the Claude workflows
+.reference/
