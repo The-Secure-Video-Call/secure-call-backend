@@ -17,7 +17,7 @@ DEFAULT_PRINT = (
 def load_settings(
     env: dict[str, str], code: str = DEFAULT_PRINT
 ) -> subprocess.CompletedProcess[str]:
-    prefixes = ("DJANGO_", "SIGNALING_", "POSTGRES_")
+    prefixes = ("DJANGO_", "SIGNALING_", "POSTGRES_", "TURN_")
     clean_env = {k: v for k, v in os.environ.items() if not k.startswith(prefixes)}
     return subprocess.run(  # noqa: S603 - fixed command, no user input
         [sys.executable, "-c", code],
@@ -78,6 +78,50 @@ def test_postgres_settings_come_from_environment() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "django.db.backends.postgresql 127.0.0.1 accounts"
+
+
+TURN_PRINT = (
+    "import config.settings as s; "
+    "print(bool(s.TURN_SHARED_SECRET), s.TURN_URLS, s.TURN_CREDENTIAL_TTL_SECONDS)"
+)
+
+
+def test_turn_is_off_by_default_with_one_hour_ttl() -> None:
+    result = load_settings({"DJANGO_SECRET_KEY": "k" * 60}, TURN_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "False [] 3600"
+
+
+def test_turn_settings_come_from_environment() -> None:
+    env = {
+        "DJANGO_SECRET_KEY": "k" * 60,
+        "TURN_SHARED_SECRET": "s",
+        "TURN_URLS": "turn:a.example:3478, turns:a.example:5349",
+        "TURN_CREDENTIAL_TTL_SECONDS": "7200",
+    }
+    result = load_settings(env, TURN_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "True ['turn:a.example:3478', 'turns:a.example:5349'] 7200"
+
+
+def test_bad_turn_settings_stop_startup_without_echoing_the_secret() -> None:
+    secret = "very-secret-value"  # noqa: S105 - test value
+    bad_envs = [
+        {"TURN_URLS": "http://a.example"},
+        {"TURN_URLS": "turn:a,turn:b,turn:c,turn:d,turn:e"},
+        {"TURN_CREDENTIAL_TTL_SECONDS": "0"},
+        {"TURN_CREDENTIAL_TTL_SECONDS": "31536000"},
+        {"TURN_CREDENTIAL_TTL_SECONDS": "soon"},
+    ]
+    for bad_env in bad_envs:
+        env = {"DJANGO_SECRET_KEY": "k" * 60, "TURN_SHARED_SECRET": secret, **bad_env}
+        result = load_settings(env, TURN_PRINT)
+
+        assert result.returncode != 0, bad_env
+        assert "ImproperlyConfigured" in result.stderr
+        assert secret not in result.stderr
     assert "not-a-real-password" not in result.stdout + result.stderr
 
 

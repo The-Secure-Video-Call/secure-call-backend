@@ -18,6 +18,7 @@ Relaying uses one Channels group per room. A group send reaches every member inc
 sender, so each relayed event carries the sender's channel name and the sender skips it.
 """
 
+import time
 from typing import Any
 
 from channels.generic.websocket import AsyncWebsocketConsumer
@@ -35,8 +36,10 @@ from signaling.protocol import (
     PingMessage,
     PongMessage,
     SignalMessage,
+    TurnCredentials,
 )
 from signaling.rooms import group_name_for_room, room_registry
+from signaling.turn_credentials import issue_turn_credentials
 
 # Application close codes: the standard RFC 6455 meaning (1003, 1008, 1009) in the last digits.
 CLOSE_UNSUPPORTED_DATA = 4003
@@ -97,9 +100,20 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.send_message(ErrorMessage(code="room-full"))
             await self.close()
             return
-        await self.send_message(JoinedMessage(role=role))
+        await self.send_message(JoinedMessage(role=role, turn=self.issue_turn_credentials()))
         if role == "second":
             await self.send_event_to_peer(group_name, "peer_joined", PeerJoinedMessage())
+
+    def issue_turn_credentials(self) -> TurnCredentials | None:
+        """New credentials for this connection, or None when TURN is not fully configured."""
+        if not settings.TURN_SHARED_SECRET or not settings.TURN_URLS:
+            return None
+        return issue_turn_credentials(
+            settings.TURN_SHARED_SECRET,
+            settings.TURN_URLS,
+            settings.TURN_CREDENTIAL_TTL_SECONDS,
+            int(time.time()),
+        )
 
     async def relay_signal_to_peer(self, signal_text: str) -> None:
         if self.room_id is None:
@@ -165,4 +179,6 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         await self.close()
 
     async def send_message(self, message: BaseModel) -> None:
-        await self.send(text_data=message.model_dump_json())
+        # exclude_none: an unset optional field (`turn`) is left out, never sent as null. No
+        # other server message has an optional field; keep it that way or change this.
+        await self.send(text_data=message.model_dump_json(exclude_none=True))
