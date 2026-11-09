@@ -51,4 +51,6 @@ jobs:
           # Also review Dependabot's dependency-update PRs. GitHub doesn't give those
           # runs the normal Actions secrets, so CLAUDE_CODE_OAUTH_TOKEN must also be
           # available as a Dependabot secret.
-          allowed_bots: 'dependabot[bot]'
+          # Also review the commits Claude pushes to a PR after a follow-up comment:
+          # GitHub reports those pushes as github-actions[bot].
+          allowed_bots: 'dependabot[bot],github-actions[bot]'
