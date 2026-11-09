@@ -1,20 +1,38 @@
 """WebSocket consumer for signaling.
 
 Validates every message against the `ClientMessage` union (unknown types close the
-connection) and answers `ping`. Room logic (join/signal/leave) arrives in the next M1 issue;
-until then those messages are answered with `unsupported-type`.
-Security rules that already apply (PLAN.md 3.5):
+connection), answers `ping` and runs rooms: `join`, `signal` and `leave`.
+Security rules (PLAN.md 3.5):
 - the Origin was checked before this consumer runs (see config/asgi.py);
 - binary frames and messages over SIGNALING_MAX_MESSAGE_BYTES close the connection;
 - malformed messages close the connection;
-- message contents are never logged.
+- a room holds at most two connections;
+- `signal` text is relayed to the other member exactly as received. It is validated like every
+  message but never stored or logged; message contents and room IDs are never logged.
+
+Relaying uses one Channels group per room. A group send reaches every member including the
+sender, so each relayed event carries the sender's channel name and the sender skips it.
 """
+
+from typing import Any
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 from pydantic import BaseModel, ValidationError
 
-from signaling.protocol import ClientMessage, ErrorMessage, PingMessage, PongMessage
+from signaling.protocol import (
+    ClientMessage,
+    ErrorMessage,
+    JoinedMessage,
+    JoinMessage,
+    LeaveMessage,
+    PeerJoinedMessage,
+    PeerLeftMessage,
+    PingMessage,
+    PongMessage,
+    SignalMessage,
+)
+from signaling.rooms import group_name_for_room, room_registry
 
 # WebSocket close codes (RFC 6455, section 7.4.1).
 CLOSE_UNSUPPORTED_DATA = 1003
@@ -23,8 +41,13 @@ CLOSE_MESSAGE_TOO_BIG = 1009
 
 
 class SignalingConsumer(AsyncWebsocketConsumer):
+    room_id: str | None = None
+
     async def connect(self) -> None:
         await self.accept()
+
+    async def disconnect(self, code: int) -> None:
+        await self.leave_room()
 
     async def receive(self, text_data: str | None = None, bytes_data: bytes | None = None) -> None:
         if text_data is None:
@@ -41,8 +64,77 @@ class SignalingConsumer(AsyncWebsocketConsumer):
 
         if isinstance(message, PingMessage):
             await self.send_message(PongMessage())
-        else:
-            await self.send_message(ErrorMessage(code="unsupported-type"))
+        elif isinstance(message, JoinMessage):
+            await self.join_room(message.roomId)
+        elif isinstance(message, SignalMessage):
+            await self.relay_signal_to_peer(text_data)
+        elif isinstance(message, LeaveMessage):
+            if self.room_id is None:
+                await self.send_message(ErrorMessage(code="bad-message"))
+            else:
+                await self.leave_room()
+
+    async def join_room(self, room_id: str) -> None:
+        if self.room_id is not None:
+            await self.send_message(ErrorMessage(code="bad-message"))
+            return
+        group_name = group_name_for_room(room_id)
+
+        async def remember_room_and_join_group() -> None:
+            # Runs under the registry lock. Setting room_id first means disconnect() cleans up
+            # even if this task is cancelled halfway.
+            self.room_id = room_id
+            await self.channel_layer.group_add(group_name, self.channel_name)
+
+        role = await room_registry.add_member(
+            room_id, self.channel_name, remember_room_and_join_group
+        )
+        if role is None:
+            await self.send_message(ErrorMessage(code="room-full"))
+            await self.close()
+            return
+        await self.send_message(JoinedMessage(role=role))
+        if role == "second":
+            await self.send_event_to_peer(group_name, "peer_joined", PeerJoinedMessage())
+
+    async def relay_signal_to_peer(self, signal_text: str) -> None:
+        if self.room_id is None:
+            await self.send_message(ErrorMessage(code="bad-message"))
+            return
+        await self.send_event_to_peer(group_name_for_room(self.room_id), "peer_signal", signal_text)
+
+    async def leave_room(self) -> None:
+        room_id = self.room_id
+        if room_id is None:
+            return
+        self.room_id = None
+        group_name = group_name_for_room(room_id)
+        await room_registry.remove_member(room_id, self.channel_name)
+        await self.channel_layer.group_discard(group_name, self.channel_name)
+        await self.send_event_to_peer(group_name, "peer_left", PeerLeftMessage())
+
+    async def send_event_to_peer(
+        self, group_name: str, event_type: str, body: BaseModel | str
+    ) -> None:
+        text = body if isinstance(body, str) else body.model_dump_json()
+        await self.channel_layer.group_send(
+            group_name,
+            {"type": event_type, "text": text, "sender_channel_name": self.channel_name},
+        )
+
+    async def forward_event_text_unless_from_self(self, event: dict[str, Any]) -> None:
+        if event["sender_channel_name"] != self.channel_name:
+            await self.send(text_data=event["text"])
+
+    # Channels calls these handlers by the event "type" above.
+    async def peer_joined(self, event: dict[str, Any]) -> None:
+        await self.forward_event_text_unless_from_self(event)
+
+    async def peer_signal(self, event: dict[str, Any]) -> None:
+        await self.forward_event_text_unless_from_self(event)
+
+    async def peer_left(self, event: dict[str, Any]) -> None:
+        await self.forward_event_text_unless_from_self(event)
 
     async def send_message(self, message: BaseModel) -> None:
         await self.send(text_data=message.model_dump_json())
