@@ -45,8 +45,12 @@ run_client() {
 # bound         = allocation worked AND the channel bind to the peer succeeded
 # forbidden     = allocation worked AND the channel bind was refused with 403 (never a success)
 # no_allocation = no relay address was ever granted (bad or expired credential)
+# family_mismatch = the client could not get a relay of the peer's address family ("relay addr
+#               cannot be received"): the relay is IPv4-only, so an IPv6 peer is never relayed.
+#               Accepted as "refused" for IPv6 peers (containing ':') only. "unclear" always fails.
+# $4 = peer ip (optional)
 expect() {
-  local label="$1" want="$2" output="$3" got
+  local label="$1" want="$2" output="$3" peer="${4-}" got
   # An unreachable container or a client crash must never count as a result.
   if grep -Eqi 'Error response from daemon|No such container|is not running' <<<"$output"; then
     echo "FAIL: $label (container or client not usable)"; failures=$((failures + 1)); return
@@ -55,10 +59,16 @@ expect() {
     got=bound
   elif grep -Fq 'Received relay addr' <<<"$output" && grep -Fq 'channel bind: error 403' <<<"$output"; then
     got=forbidden
+  elif grep -Fq 'relay addr cannot be received' <<<"$output"; then
+    got=family_mismatch
   elif ! grep -Fq 'Received relay addr' <<<"$output"; then
     got=no_allocation
   else
     got=unclear
+  fi
+  if [ "$got" = family_mismatch ] && [ "$want" = forbidden ] && [[ "$peer" == *:* ]]; then
+    got=forbidden
+    echo "NOTE: $label: IPv4-only relay, IPv6 peer not relayable (family_mismatch accepted)"
   fi
   if [ "$got" = "$want" ]; then
     echo "PASS: $label"
@@ -69,14 +79,22 @@ expect() {
   fi
 }
 
+wait_for_turn_port() {
+  local attempt
+  for attempt in $(seq 1 20); do
+    (exec 3<>/dev/tcp/127.0.0.1/3478) 2>/dev/null && return 0
+    sleep 1
+  done
+  return 1
+}
+
 cleanup
 docker run -d --name "$container_name" --network host \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" --external-ip=127.0.0.1 >/dev/null || exit 1
-for _ in $(seq 1 20); do
-  (exec 3<>/dev/tcp/127.0.0.1/3478) 2>/dev/null && break
-  sleep 1
-done
+wait_for_turn_port || { echo "FAIL: coturn did not start"; exit 1; }
+echo "turnutils_uclient address-family options (for reference):"
+docker exec "$container_name" turnutils_uclient -h 2>&1 | grep -E '^ +-[46XY]' || true
 
 public_peer="8.8.8.8"
 
@@ -85,13 +103,17 @@ expect "wrong credential refused" no_allocation "$(run_client 600 "$public_peer"
 expect "expired credential refused" no_allocation "$(run_client -60 "$public_peer")"
 for private_peer in 127.0.0.1 192.168.1.10 10.0.0.5 172.16.0.5 169.254.1.1 0.0.0.0 100.64.0.1 \
   224.0.0.1 ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
-  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")"
+  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")" "$private_peer"
 done
 
-# The server logs must not contain any username or the peer IP.
+# The server logs must not contain any username or the peer IP. Logging is off in the config, so
+# they should be empty; if not, show the offending lines with the values masked.
 server_logs="$(docker logs "$container_name" 2>&1)"
 if grep -Fq -f "$usernames_file" <<<"$server_logs" || grep -Fq "$public_peer" <<<"$server_logs"; then
-  echo "FAIL: coturn logs contain a username or peer IP"; failures=$((failures + 1))
+  echo "FAIL: coturn logs contain a username or peer IP. Offending lines (values masked):"
+  grep -F -e "$public_peer" -f "$usernames_file" <<<"$server_logs" | head -n 10 \
+    | sed -E 's/[0-9]{9,}:[0-9a-f]{12}/<USERNAME>/g; s/[0-9]{1,3}(\.[0-9]{1,3}){3}/<IP>/g'
+  failures=$((failures + 1))
 else
   echo "PASS: logs contain no username or peer IP"
 fi
@@ -106,6 +128,10 @@ fi
 # Refresh-after-expiry probe (result recorded in README.md for #26, not asserted): allocate
 # with a credential that expires 5 s later, wait 10 s, then send a Refresh for that allocation.
 # The server runs with host networking, so the probe on the runner reaches it on 127.0.0.1.
+# Restart first, so the probe starts from fresh state and shares no quota with the other checks.
+if ! { docker restart "$container_name" >/dev/null && wait_for_turn_port; }; then
+  echo "FAIL: coturn did not restart"; failures=$((failures + 1))
+fi
 read -r short_user short_pass < <(make_credential 5)
 probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 10 2>&1)"
 if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then

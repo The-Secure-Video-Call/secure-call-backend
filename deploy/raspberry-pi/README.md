@@ -48,7 +48,23 @@ no allocation, and that 15 private, loopback, link-local, multicast and IPv4-map
 
 Do not add `denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255`: coturn matches IPv4 peers
 against the mapped range too, so it refuses every public IPv4 peer. The config denies only the
-mapped forms of the private ranges.
+mapped forms of the private ranges. No `denied-peer-ip` range may start at `0.0.0.0` or `::`
+(the ranges start at `0.0.0.1` and `::ffff:0.0.0.1`), because an "any" address as the lower
+bound is suspected to match every peer.
+
+### IPv6
+
+This relay is IPv4-only and never relays to IPv6 peers. The test client only gets an IPv4 relay,
+so for IPv6 and IPv4-mapped peers it reports an address-family mismatch
+(`relay addr cannot be received`), which the script accepts as "refused" for IPv6 peers only.
+The IPv6 and mapped deny ranges in `turnserver.conf` are defence in depth and are not exercised
+by the test.
+
+### Logging
+
+coturn logs nothing (`no-stdout-log`, `log-file=/dev/null`): session lines can contain
+usernames and peer IPs, which must never be logged. The cost is that startup errors are not
+visible in `docker logs`; to debug, temporarily run coturn by hand with a different config.
 
 ### Refresh after expiry (input for #26)
 
