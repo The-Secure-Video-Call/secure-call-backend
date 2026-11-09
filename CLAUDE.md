@@ -28,6 +28,9 @@ sections before starting any task.
 - Type hints everywhere; `uv run mypy .` (strict) must pass.
 - No relative imports: always import from the package root, e.g. `from signaling.protocol import Envelope`,
   never `from .protocol import Envelope`. Ruff enforces this (TID252).
+- Names say exactly what the value holds, even if that makes them long: `members_by_room_id`,
+  `max_message_bytes`, `peer_channel_name`, not `d`, `tmp`, `data`, `info` or `obj`. Single letters
+  only for short loop counters. Functions are named for what they do (`relay_signal_to_peer`).
 - `uv run ruff check` and `uv run ruff format --check` must pass (security rules included).
 - Every change to protocol, room or consumer logic needs tests, including at least one negative
   test (tampered, replayed, oversized or malformed input is rejected).
