@@ -65,29 +65,50 @@ off.
 The database is connected now but holds nothing yet. It is reserved for future user accounts and
 must never store call data: no room IDs, call times, IP addresses or message contents.
 
-### On the Raspberry Pi test server
+The database runs next to the backend on the Raspberry Pi (see below), listening on `127.0.0.1`
+only. CI starts a throwaway PostgreSQL for every run, so the connection is tested on each PR.
 
-Requirements: Docker with the Compose plugin.
+## Deploying to the Raspberry Pi
 
-```sh
-cd deploy/raspberry-pi
-cp .env.example .env        # set POSTGRES_PASSWORD and DJANGO_SECRET_KEY in .env
-docker compose up -d        # PostgreSQL 18, listening on 127.0.0.1:5432 only
+```
+Browser --wss://signal.securevideocall.com--> router :443 --> Nginx Proxy Manager
+        --> secure-call-backend container :8000 --> PostgreSQL container
 ```
 
-Then, from the repo root on the Pi, check the backend can reach it:
+**How updates arrive:** every merge to `main` runs **Publish backend image**
+(`.github/workflows/publish-image.yml`). After approval in the repo's **production**
+environment, it builds the image for arm64 (the Pi) and amd64 and publishes it as
+`ghcr.io/the-secure-video-call/secure-call-backend:main`. On the Pi, `update.sh` (run by cron)
+pulls a new image and restarts the backend. GitHub never connects to the Pi.
 
-```sh
-set -a; . deploy/raspberry-pi/.env; set +a
-uv run python manage.py check --database default
-uv run python manage.py migrate
-uv run pytest tests/test_database.py
-```
+### One-time setup on the Pi
 
-Keep the database private: port 5432 is bound to `127.0.0.1` and must never be forwarded on your
-router. Only the backend's HTTPS port (443) should be reachable from the internet.
+Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager already running.
 
-CI starts a throwaway PostgreSQL for every run, so the connection is tested on each PR.
+1. **DNS:** in ServerByt's DNS editor, point `signal.securevideocall.com` (A record) at your
+   home's static IP.
+2. **Router:** forward TCP 80 and 443 to the Pi (Nginx Proxy Manager). Never forward 81 (its
+   admin page) or 5432 (the database).
+3. **Get the files and fill in the settings:**
+   ```sh
+   git clone https://github.com/The-Secure-Video-Call/secure-call-backend.git
+   cd secure-call-backend/deploy/raspberry-pi
+   docker network ls           # note Nginx Proxy Manager's network name
+   cp .env.example .env        # set NPM_NETWORK, DJANGO_SECRET_KEY and POSTGRES_PASSWORD
+   docker compose up -d
+   ```
+4. **Nginx Proxy Manager, Add Proxy Host:** domain `signal.securevideocall.com`; scheme `http`,
+   forward hostname `secure-call-backend`, port `8000`; **Websockets Support** and **Block
+   Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **Force SSL**, **HTTP/2**
+   and **HSTS** on.
+5. **Automatic updates:** `crontab -e`, then add (with your path):
+   ```
+   */5 * * * * /home/pi/secure-call-backend/deploy/raspberry-pi/update.sh >/dev/null 2>&1
+   ```
+6. **Check:** `curl https://signal.securevideocall.com/healthz` returns `{"status": "ok"}`.
+
+To check the database from the Pi itself:
+`set -a; . deploy/raspberry-pi/.env; set +a; uv run pytest tests/test_database.py`.
 
 ## Protocol contract
 

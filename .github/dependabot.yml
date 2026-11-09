@@ -8,3 +8,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+  # Base images in the Dockerfile (python, uv).
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: weekly
