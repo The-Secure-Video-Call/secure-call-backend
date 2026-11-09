@@ -1,0 +1,141 @@
+{
+  "$defs": {
+    "JoinMessage": {
+      "additionalProperties": false,
+      "description": "Ask to enter a room. `roomId` is derived in the browser; the room secret never leaves it.",
+      "properties": {
+        "roomId": {
+          "description": "base64url, 22-43 characters.",
+          "pattern": "^[A-Za-z0-9_-]{22,43}$",
+          "title": "Roomid",
+          "type": "string"
+        },
+        "type": {
+          "const": "join",
+          "default": "join",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "roomId"
+      ],
+      "title": "JoinMessage",
+      "type": "object"
+    },
+    "LeaveMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "leave",
+          "default": "leave",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "title": "LeaveMessage",
+      "type": "object"
+    },
+    "PingMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "ping",
+          "default": "ping",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "title": "PingMessage",
+      "type": "object"
+    },
+    "SignalMessage": {
+      "additionalProperties": false,
+      "description": "Opaque data for the other peer. Same shape in both directions.",
+      "properties": {
+        "iv": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9+/]{16}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Base64 of 12 bytes. Optional in M1, required from M2 (encryption).",
+          "title": "Iv"
+        },
+        "payload": {
+          "description": "Opaque base64 string. Never decoded by the server.",
+          "maxLength": 64512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "title": "Payload",
+          "type": "string"
+        },
+        "type": {
+          "const": "signal",
+          "default": "signal",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "payload"
+      ],
+      "title": "SignalMessage",
+      "type": "object"
+    }
+  },
+  "description": "Any message a client may send. Unknown `type` values are rejected.",
+  "discriminator": {
+    "mapping": {
+      "join": "#/$defs/JoinMessage",
+      "leave": "#/$defs/LeaveMessage",
+      "ping": "#/$defs/PingMessage",
+      "signal": "#/$defs/SignalMessage"
+    },
+    "propertyName": "type"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/JoinMessage"
+    },
+    {
+      "$ref": "#/$defs/SignalMessage"
+    },
+    {
+      "$ref": "#/$defs/LeaveMessage"
+    },
+    {
+      "$ref": "#/$defs/PingMessage"
+    }
+  ],
+  "title": "ClientMessage"
+}

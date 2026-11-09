@@ -1,0 +1,19 @@
+{
+  "additionalProperties": false,
+  "properties": {
+    "type": {
+      "const": "peer-left",
+      "default": "peer-left",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "default": 1,
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "title": "PeerLeftMessage",
+  "type": "object"
+}

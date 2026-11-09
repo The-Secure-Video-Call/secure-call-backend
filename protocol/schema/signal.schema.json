@@ -1,0 +1,45 @@
+{
+  "additionalProperties": false,
+  "description": "Opaque data for the other peer. Same shape in both directions.",
+  "properties": {
+    "iv": {
+      "anyOf": [
+        {
+          "pattern": "^[A-Za-z0-9+/]{16}$",
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Base64 of 12 bytes. Optional in M1, required from M2 (encryption).",
+      "title": "Iv"
+    },
+    "payload": {
+      "description": "Opaque base64 string. Never decoded by the server.",
+      "maxLength": 64512,
+      "minLength": 1,
+      "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+      "title": "Payload",
+      "type": "string"
+    },
+    "type": {
+      "const": "signal",
+      "default": "signal",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "default": 1,
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "payload"
+  ],
+  "title": "SignalMessage",
+  "type": "object"
+}

@@ -1,0 +1,203 @@
+{
+  "$defs": {
+    "ErrorMessage": {
+      "additionalProperties": false,
+      "description": "Sent by the server when it can't act on a message.",
+      "properties": {
+        "code": {
+          "enum": [
+            "room-full",
+            "rate-limited",
+            "bad-message",
+            "unsupported-type"
+          ],
+          "title": "Code",
+          "type": "string"
+        },
+        "type": {
+          "const": "error",
+          "default": "error",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "code"
+      ],
+      "title": "ErrorMessage",
+      "type": "object"
+    },
+    "JoinedMessage": {
+      "additionalProperties": false,
+      "description": "Sent to a client that entered a room. TURN credentials are added in M3.",
+      "properties": {
+        "role": {
+          "enum": [
+            "first",
+            "second"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "type": {
+          "const": "joined",
+          "default": "joined",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "role"
+      ],
+      "title": "JoinedMessage",
+      "type": "object"
+    },
+    "PeerJoinedMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "peer-joined",
+          "default": "peer-joined",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "title": "PeerJoinedMessage",
+      "type": "object"
+    },
+    "PeerLeftMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "peer-left",
+          "default": "peer-left",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "title": "PeerLeftMessage",
+      "type": "object"
+    },
+    "PongMessage": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "const": "pong",
+          "default": "pong",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "title": "PongMessage",
+      "type": "object"
+    },
+    "SignalMessage": {
+      "additionalProperties": false,
+      "description": "Opaque data for the other peer. Same shape in both directions.",
+      "properties": {
+        "iv": {
+          "anyOf": [
+            {
+              "pattern": "^[A-Za-z0-9+/]{16}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Base64 of 12 bytes. Optional in M1, required from M2 (encryption).",
+          "title": "Iv"
+        },
+        "payload": {
+          "description": "Opaque base64 string. Never decoded by the server.",
+          "maxLength": 64512,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$",
+          "title": "Payload",
+          "type": "string"
+        },
+        "type": {
+          "const": "signal",
+          "default": "signal",
+          "title": "Type",
+          "type": "string"
+        },
+        "v": {
+          "const": 1,
+          "default": 1,
+          "title": "V",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "payload"
+      ],
+      "title": "SignalMessage",
+      "type": "object"
+    }
+  },
+  "description": "Any message the server may send.",
+  "discriminator": {
+    "mapping": {
+      "error": "#/$defs/ErrorMessage",
+      "joined": "#/$defs/JoinedMessage",
+      "peer-joined": "#/$defs/PeerJoinedMessage",
+      "peer-left": "#/$defs/PeerLeftMessage",
+      "pong": "#/$defs/PongMessage",
+      "signal": "#/$defs/SignalMessage"
+    },
+    "propertyName": "type"
+  },
+  "oneOf": [
+    {
+      "$ref": "#/$defs/JoinedMessage"
+    },
+    {
+      "$ref": "#/$defs/PeerJoinedMessage"
+    },
+    {
+      "$ref": "#/$defs/PeerLeftMessage"
+    },
+    {
+      "$ref": "#/$defs/SignalMessage"
+    },
+    {
+      "$ref": "#/$defs/ErrorMessage"
+    },
+    {
+      "$ref": "#/$defs/PongMessage"
+    }
+  ],
+  "title": "ServerMessage"
+}

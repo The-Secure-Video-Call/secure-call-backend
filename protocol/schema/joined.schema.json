@@ -1,0 +1,31 @@
+{
+  "additionalProperties": false,
+  "description": "Sent to a client that entered a room. TURN credentials are added in M3.",
+  "properties": {
+    "role": {
+      "enum": [
+        "first",
+        "second"
+      ],
+      "title": "Role",
+      "type": "string"
+    },
+    "type": {
+      "const": "joined",
+      "default": "joined",
+      "title": "Type",
+      "type": "string"
+    },
+    "v": {
+      "const": 1,
+      "default": 1,
+      "title": "V",
+      "type": "integer"
+    }
+  },
+  "required": [
+    "role"
+  ],
+  "title": "JoinedMessage",
+  "type": "object"
+}
