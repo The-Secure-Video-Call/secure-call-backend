@@ -23,9 +23,24 @@ sections before starting any task.
   defaults must stay safe for production (DEBUG off, no allowed origins).
 - TURN credentials are short-lived HMAC credentials only (PLAN.md 3.5); no static passwords.
 
+## Structure (keep it flat and simple)
+
+- `config/`: settings, ASGI and URL routing only.
+- `signaling/`: one module per job, named for that job: `protocol.py` (message models),
+  `consumers.py` (WebSocket handling), `rooms.py` (room state), `views.py` (HTTP endpoints).
+  A new job gets a new module here, e.g. `turn_credentials.py`, `rate_limits.py`.
+- `tests/`: one `test_<module>.py` per module it tests.
+- No extra layers or catch-all modules (`services/`, `managers/`, `helpers/`, `utils.py`) and no
+  folders nested deeper than `signaling/` unless a PR explains why they are needed.
+
 ## Code conventions
 
 - Type hints everywhere; `uv run mypy .` (strict) must pass.
+- No relative imports: always import from the package root, e.g. `from signaling.protocol import Envelope`,
+  never `from .protocol import Envelope`. Ruff enforces this (TID252).
+- Names say exactly what the value holds, even if that makes them long: `members_by_room_id`,
+  `max_message_bytes`, `peer_channel_name`, not `d`, `tmp`, `data`, `info` or `obj`. Single letters
+  only for short loop counters. Functions are named for what they do (`relay_signal_to_peer`).
 - `uv run ruff check` and `uv run ruff format --check` must pass (security rules included).
 - Every change to protocol, room or consumer logic needs tests, including at least one negative
   test (tampered, replayed, oversized or malformed input is rejected).

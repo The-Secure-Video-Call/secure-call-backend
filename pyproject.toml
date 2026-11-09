@@ -39,7 +39,12 @@ select = [
     "DJ",    # Django
     "ASYNC", # async pitfalls
     "PT",    # pytest style
+    "TID",   # tidy imports: no relative imports (see below)
 ]
+
+[tool.ruff.lint.flake8-tidy-imports]
+# Every import is absolute, e.g. `from signaling.protocol import ...`, never `from .protocol`.
+ban-relative-imports = "all"
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101"] # assert is how pytest works
