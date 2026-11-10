@@ -19,8 +19,15 @@ updates:
     schedule:
       interval: weekly
   # postgres in compose.yaml, pinned by digest. After merging a bump, update the Pi by hand
-  # (see deploy/raspberry-pi/README.md): update.sh only updates the backend.
+  # (see "PostgreSQL updates" in README.md): update.sh only updates the backend.
   - package-ecosystem: docker-compose
     directory: /deploy/raspberry-pi
     schedule:
       interval: weekly
+    ignore:
+      # A new PostgreSQL major needs a data migration (pg_upgrade), never a plain image bump.
+      - dependency-name: postgres
+        update-types: ["version-update:semver-major"]
+      # Our own images: built by publish-image.yml and on the Pi, referenced by a moving tag.
+      - dependency-name: ghcr.io/the-secure-video-call/secure-call-backend
+      - dependency-name: secure-call-coturn
