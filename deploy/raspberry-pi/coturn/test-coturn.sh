@@ -264,7 +264,9 @@ black_listing_count=0
 other_log_lines=""
 while IFS= read -r log_line; do
   [ -z "${log_line//[[:space:]]/}" ] && continue
-  stripped_line="${log_line#INFO: }"
+  # coturn prefixes every line with "<seconds>: (<pid>): ", e.g. "0: (1): INFO: ...".
+  stripped_line="$(sed -E 's/^[0-9]+: \([0-9]+\): //' <<<"$log_line")"
+  stripped_line="${stripped_line#INFO: }"
   if [[ "$stripped_line" == "Black listing: "* ]]; then
     listed_range="${stripped_line#Black listing: }"
     # A single address may be printed as "a-a"; accept it for an "a" line.
@@ -275,7 +277,7 @@ while IFS= read -r log_line; do
     else
       unexpected_log_lines+="$log_line"$'\n'
     fi
-  elif grep -Eq -e "$allowed_log_line_pattern" <<<"$log_line"; then
+  elif grep -Eq -e "$allowed_log_line_pattern" <<<"$stripped_line"; then
     other_log_lines+="$log_line"$'\n'
   else
     unexpected_log_lines+="$log_line"$'\n'
