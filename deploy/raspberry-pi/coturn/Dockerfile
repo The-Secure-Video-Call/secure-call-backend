@@ -1,4 +1,4 @@
-# coturn 4.6.3 without the file capability on the turnserver binary.
+# coturn 4.18.0 without the file capability on the turnserver binary.
 #
 # The official image puts CAP_NET_BIND_SERVICE=+ep on turnserver so an unprivileged user can bind
 # low ports. We listen on 3478 and 49160-49200 only, so we do not need it; and with the capability
@@ -7,8 +7,9 @@
 # non-root process too (CapEff 0x400). Stripping it lets us run with `cap_drop: ALL`, no cap_add and
 # no-new-privileges.
 #
-# Pinned by version and digest (the digest `docker pull coturn/coturn:4.6.3` reported in CI;
-# compare with `docker buildx imagetools inspect coturn/coturn:4.6.3`).
+# Pinned by version and digest (the multi-platform digest Dependabot proposed in #47; compare with
+# `docker buildx imagetools inspect coturn/coturn:4.18.0`). Dependabot proposes upgrades, and the
+# CI coturn job must pass before one is merged.
 FROM coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
 
 USER root

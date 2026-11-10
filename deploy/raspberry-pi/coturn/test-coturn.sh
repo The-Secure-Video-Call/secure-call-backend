@@ -90,8 +90,10 @@ expect() {
   # line is present or the send summary shows messages sent with 0 dropped. 8.8.8.8 does not
   # echo, so a reply is not expected.
   local channel_bind_succeeded=no
+  # "success: 0x<channel>" is printed only by uclient's ChannelBind success path
+  # (startuclient.c), so it counts wherever it appears.
   if grep -Fq 'channel bind: success' <<<"$output" \
-    || grep -A1 -F 'cb response received' <<<"$output" | grep -Eq 'success: 0x[0-9a-fA-F]+'; then
+    || grep -Eq 'success: 0x[0-9a-fA-F]+' <<<"$output"; then
     channel_bind_succeeded=yes
   fi
   if grep -Fq 'Received relay addr' <<<"$output" \
@@ -230,7 +232,8 @@ docker run -d --name "$container_name" --network "$network_name" --ip "$containe
   --tmpfs /var/log:size=1m,mode=1777,noexec,nosuid,nodev \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   --entrypoint turnserver \
-  "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
+  "$image" -c /etc/coturn/turnserver.conf --log-file=stdout --no-stdout-log \
+  --static-auth-secret="$test_secret" \
   --external-ip="$test_public_ip/$container_ip" --denied-peer-ip="$test_public_ip" \
   --relay-ip="$container_ip" --listening-ip="$container_ip" --listening-ip=127.0.0.1 \
   --stale-nonce=20 >/dev/null || exit 1
@@ -307,28 +310,29 @@ else
   failures=$((failures + 1))
 fi
 
-# Listening sockets, read from the container's own /proc/net (its network namespace): no TLS or
-# DTLS listener on 5349 (TCP or UDP), no CLI on 5766, and TCP listens on 3478 only. Ports are hex.
-socket_tables="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null)"
-if [ -z "$socket_tables" ]; then
-  echo "FAIL: could not read the container's socket tables"; failures=$((failures + 1))
+# Sockets, read from the container's own /proc/net (its network namespace) before any client
+# runs, as "address:port" in /proc's hex: TCP listeners and every UDP socket must be coturn's 3478
+# (0D96) or Docker's embedded DNS on 127.0.0.11 (0B00007F, which Docker itself runs in every
+# container on a user-defined network, on random ports). So no TLS/DTLS listener on 5349, no CLI
+# (127.0.0.1:5766 by default), no web-admin or prometheus port, and no other UDP service, which
+# matters because --external-ip puts this container's address on coturn's peer whitelist.
+# No relay port is open yet at this point. Reading nothing, or no 3478, fails.
+tcp_listeners="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
+  | awk '$4 == "0A" && $2 ~ /:[0-9A-F]+$/ {print $2}' | sort -u)"
+udp_sockets="$(docker exec -u 0 "$container_name" cat /proc/net/udp /proc/net/udp6 2>/dev/null \
+  | awk '$2 ~ /:[0-9A-F]+$/ {print $2}' | sort -u)"
+echo "TCP listeners (hex address:port):"; sed 's/^/    /' <<<"$tcp_listeners"
+echo "UDP sockets (hex address:port):"; sed 's/^/    /' <<<"$udp_sockets"
+unexpected_sockets="$(printf '%s\n%s\n' "$tcp_listeners" "$udp_sockets" | grep -v '^$' \
+  | grep -Ev '^0B00007F:|:0D96$' || true)"
+if ! grep -Eq ':0D96$' <<<"$tcp_listeners" || ! grep -Eq ':0D96$' <<<"$udp_sockets"; then
+  echo "FAIL: coturn's 3478 is missing from the socket tables (could not read them?)"
+  failures=$((failures + 1))
+elif [ -n "$unexpected_sockets" ]; then
+  echo "FAIL: a socket other than 3478 (and Docker's DNS on 127.0.0.11) is open"
+  failures=$((failures + 1))
 else
-  local_ports="$(awk '$2 ~ /:[0-9A-F]{4}$/ {split($2, a, ":"); print a[2]}' <<<"$socket_tables" | sort -u)"
-  # TCP listeners as "address:port" in /proc's hex. 0B00007F is 127.0.0.11, Docker's embedded DNS
-  # server, which Docker itself runs in every container on a user-defined network (random ports);
-  # it is not coturn. Every other TCP listener must be coturn's 3478 (0D96).
-  tcp_listeners="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
-    | awk '$4 == "0A" {print $2}' | sort -u)"
-  echo "TCP listeners (hex address:port):"; sed 's/^/    /' <<<"$tcp_listeners"
-  unexpected_tcp_listeners="$(grep -Ev '^0B00007F:|:0D96$' <<<"$tcp_listeners" || true)"
-  if grep -Eqx '14E5|1686' <<<"$local_ports"; then
-    echo "FAIL: a socket is bound to 5349 (TLS/DTLS) or 5766 (CLI)"; failures=$((failures + 1))
-  elif ! grep -Eq ':0D96$' <<<"$tcp_listeners" || [ -n "$unexpected_tcp_listeners" ]; then
-    echo "FAIL: TCP listens on something other than 3478 (and Docker's DNS on 127.0.0.11)"
-    failures=$((failures + 1))
-  else
-    echo "PASS: no socket on 5349 (TLS/DTLS) or 5766 (CLI); TCP listens on 3478 only (plus Docker's DNS)"
-  fi
+  echo "PASS: TCP and UDP only on 3478 (plus Docker's DNS): no TLS/DTLS, CLI, web-admin or other port"
 fi
 
 # bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
@@ -493,7 +497,9 @@ fi
 # certificate and key files exist (openssl_load_certificates -> print_abs_file_name), even with
 # no-tls and without "dtls", and loads them only when TLS is on. The socket check above proves no
 # TLS/DTLS listener runs. Any other WARNING or ERROR line fails.
-banner_problems="$(grep -E '(^|: )(WARNING|ERROR)' <<<"$startup_banner" \
+# A cipher-suite line means coturn built a TLS or DTLS context (with "dtls", DTLS would also be
+# accepted on the shared 3478 listener, which the socket check cannot see): that fails too.
+banner_problems="$(grep -E '(^|: )(WARNING|ERROR)|^INFO: D?TLS cipher suite:' <<<"$startup_banner" \
   | grep -Evx 'WARNING: (Certificate|Private key) file not found or not readable: //turn_server_(cert|pkey)\.pem' || true)"
 if [ -n "$banner_problems" ]; then
   echo "FAIL: coturn's startup banner has a WARNING or ERROR line (values masked):"
@@ -535,7 +541,7 @@ while IFS= read -r log_line; do
   [[ "$log_line" =~ ^(DEBUG|INFO):\ Global\ turn\ allocation\ count\ (incremented|decremented),\ now\ [0-9]+$ ]] && continue
   [ "$log_line" = "INFO: stateless-nonce: listener fast-path challenge active" ] && continue
   if { [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ check_stun_auth:\ Cannot\ find\ credentials\ of\ user\ \<(.+)\>$ ]] \
-      || [[ "$log_line" =~ ^ERROR:\ credentials\ of\ user\ \<(.+)\>\ (are\ wrong|have\ expired)\ \([^\)]*\)$ ]] \
+      || [[ "$log_line" =~ ^ERROR:\ credentials\ of\ user\ \<(.+)\>\ (are\ wrong\ \(message\ integrity\ does\ not\ match\ any\ auth\ secret\)|have\ expired\ \(the\ time-limited\ username\ timestamp\ is\ in\ the\ past\))$ ]] \
       || [[ "$log_line" =~ ^ERROR:\ Cannot\ find\ credentials\ of\ user\ \<(.+)\>$ ]]; } \
     && grep -Fxq -e "${BASH_REMATCH[1]}" "$failed_login_usernames_file"; then
     continue
@@ -580,26 +586,27 @@ else
   echo "PASS: docker logs hold only coturn's startup banner ($(wc -l <"$denied_ranges_file" | tr -d ' ') deny ranges, all from the config), allocation counters and the deliberate failed logins; no other username, no session or peer line, no WARNING; compose discards coturn's console output"
 fi
 
-# Logging must stay off by configuration, not only by luck: no verbose, syslog or log-binding
-# option in the config (comments ignored) or on the container's command line.
+# Logging must stay off, and features coturn 4.18 keeps off by default must stay off, by
+# configuration, not by luck: none of these options in the config (comments ignored) or on the
+# container's command line. DTLS, the CLI, web-admin, prometheus, RFC 5780, loopback or
+# whitelisted peers, TLS ports and certificates, mobility, server relay and multiplexed peers are
+# all opt-in in 4.18 (mainrelay.c defaults), so the absence of these words is what keeps them off.
+opt_in_options='verbose|Verbose|syslog|log-binding|dtls|cli|web-admin|prometheus|rfc5780|allow-loopback-peers|allowed-peer-ip|tls-listening-port|cert|pkey|mobility|server-relay|multiplex-peer'
 if grep -Ev '^[[:space:]]*#' "$here/turnserver.conf" \
-  | grep -Eiq '^[[:space:]]*(verbose|syslog|log-binding|Verbose)([[:space:]]|=|$)'; then
-  echo "FAIL: turnserver.conf enables verbose, syslog or log-binding"; failures=$((failures + 1))
-elif grep -Ev '^[[:space:]]*#' "$here/../compose.yaml" | grep -Eq -- "--verbose|--syslog|--log-binding|'-v'|'-V'"; then
-  echo "FAIL: compose.yaml passes a verbose, syslog or log-binding option"; failures=$((failures + 1))
+  | grep -Eq "^[[:space:]]*($opt_in_options)([[:space:]]|=|\$)"; then
+  echo "FAIL: turnserver.conf enables an option that must stay off"; failures=$((failures + 1))
+elif grep -Ev '^[[:space:]]*#' "$here/../compose.yaml" \
+  | grep -Eq -- "--($opt_in_options)(['\"=[:space:]]|\$)|'-v'|'-V'"; then
+  echo "FAIL: compose.yaml passes an option that must stay off"; failures=$((failures + 1))
 else
-  echo "PASS: config has no verbose, syslog or log-binding"
+  echo "PASS: no verbose or syslog logging, and no opt-in TLS/DTLS, CLI, web-admin or peer option"
 fi
 
 # No log file may hold a username or peer IP, and none may exist outside the tmpfs mounts.
 inspect_log_files "end of run"
 
-# The admin CLI must be off.
-if (exec 3<>/dev/tcp/"$container_ip"/5766) 2>/dev/null; then
-  echo "FAIL: CLI port 5766 is open"; failures=$((failures + 1))
-else
-  echo "PASS: CLI port 5766 closed"
-fi
+# The admin CLI must be off: the socket check above covers 5766 on every address (the CLI binds
+# 127.0.0.1 by default, which a probe from outside the container could never see).
 
 if [ "$failures" -eq 0 ]; then
   echo "All coturn checks passed."

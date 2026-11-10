@@ -109,6 +109,11 @@ services:
     command:
       - '-c'
       - '/etc/coturn/turnserver.conf'
+      # Logging to stdout only (discarded below). coturn reads command-line log options before
+      # the config file, so no early warning can make it open a log file. Keep identical to
+      # coturn/test-coturn.sh.
+      - '--log-file=stdout'
+      - '--no-stdout-log'
       - '--static-auth-secret=${TURN_SHARED_SECRET:?Set TURN_SHARED_SECRET in .env}'
       # Behind the home NAT (and Docker's) the relay must advertise the public IP:
       # "<public-ip>/<container address>". 172.30.200.2 is this container's fixed address.
