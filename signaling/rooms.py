@@ -25,6 +25,11 @@ MAX_MEMBERS_PER_ROOM: Final = 2
 # Production expiry limits (PLAN.md section 7). Fixed in code on purpose: not environment variables.
 WAITING_ALONE_LIMIT_SECONDS: Final = 10 * 60
 TOTAL_LIFETIME_LIMIT_SECONDS: Final = 4 * 60 * 60
+# TURN credentials one room may be given over its life: 2 members plus reconnects (the web client
+# reconnects with backoff and every join gets fresh credentials). A guard against runaway
+# reconnects only: the count dies with the room (no old room IDs are kept), so leaving and
+# rejoining, or creating rooms, is not stopped. Shared by both members (see README.md).
+MAX_TURN_CREDENTIALS_PER_ROOM: Final = 20
 
 Role = Literal["first", "second"]
 NotifyRoomExpired = Callable[[str, list[str]], Awaitable[None]]
@@ -63,6 +68,9 @@ class _Room:
     # When the total-lifetime limit closes the room, on the monotonic clock that asyncio's timer
     # also uses (so wall-clock steps, for example NTP after boot, cannot skew it).
     closes_at_monotonic_time: float = 0.0
+    # Credentials handed out for this room so far. Dies with the room, so a recreated room ID
+    # starts again at 0 (no list of old room IDs is kept).
+    turn_credentials_issued: int = 0
 
 
 class RoomRegistry:
@@ -145,6 +153,17 @@ class RoomRegistry:
         if room is None:
             return None
         return room.closes_at_monotonic_time - self._monotonic_clock()
+
+    def try_take_turn_credential_slot(self, room_id: str) -> bool:
+        """Count one TURN credential for this room and return True, or False when it is used up.
+
+        No await inside, so the check and the count cannot interleave with another join.
+        """
+        room = self._rooms_by_room_id.get(room_id)
+        if room is None or room.turn_credentials_issued >= MAX_TURN_CREDENTIALS_PER_ROOM:
+            return False
+        room.turn_credentials_issued += 1
+        return True
 
     def room_count(self) -> int:
         return len(self._rooms_by_room_id)

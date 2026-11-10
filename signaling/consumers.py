@@ -160,6 +160,11 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             logger.warning("TURN credential not issued: the room has no time left.")
             return None
         # Charged only when a credential is really issued (after the room-time checks above).
+        # The room's own budget first: a room that is used up must not also spend its IP's cap.
+        # The cost: a client over its IP cap can still use up its own room's slots (a judgment
+        # call; the other order would let one room drain the IP cap shared with other rooms).
+        if self.room_id is None or not room_registry.try_take_turn_credential_slot(self.room_id):
+            return None  # this room has had its share: the join works, just without a relay
         if not turn_credential_limiter.try_acquire(self.client_key):
             return None  # over the hourly cap: the join works, just without a relay
         return issue_turn_credentials(

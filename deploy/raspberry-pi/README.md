@@ -85,12 +85,57 @@ Manual steps (owner):
 
 Sized for a 200 Mbit/s line: `max-bps=500000` (4 Mbit/s per session, enough for a 720p call),
 `bps-capacity=18750000` (150 Mbit/s, 75% of the line, so the house keeps headroom),
-`user-quota=6` (usernames are per join; a browser needs about 2 allocations, plus 2 more during
-an ICE restart) and `total-quota=100`. Note the 41-port relay range
+`user-quota=6`, `max-allocate-lifetime=600` and `total-quota=100` (see below for what these do
+and do not limit). Note the 41-port relay range
 (49160-49200) limits real capacity to about 41 allocations, below `total-quota`.
 The bandwidth cap is the tighter limit: `bps-capacity` / `max-bps` = 18750000 / 500000 allows
 about 37 concurrent relayed allocations. A 38th gets `486 (Allocation Bandwidth Quota Reached)`.
 This is intended; the test restarts coturn between groups of checks so it never hits it.
+
+#### Why `user-quota=6` (reasoned, not yet measured)
+
+GitHub Actions has no Safari and I could not run Chrome against the container, so the number comes
+from how browsers gather relay candidates: one allocation per TURN URL (we send two: UDP and TCP)
+per network interface they use. That is 2 on one interface, and an ICE restart briefly keeps the
+old allocations next to the new ones: 4. `6` is that plus a margin of 2; `4` would leave none. A
+phone on Wi-Fi and mobile data at once could reach 8 during a restart; it would then get `486`
+for the extras (the ones that worked stay, and direct candidates still exist outside privacy
+mode). **To check on real devices:** open `chrome://webrtc-internals` (and Safari's Web Inspector)
+during a call and an ICE restart, and count the relay candidates gathered per peer connection.
+If the maximum seen is below 4, the quota can go lower; if it is above 6, raise it.
+
+#### What one client can still do
+
+`user-quota` counts per username, and **every credential has a new username**, so it limits one
+credential, not one client. With 41 relay ports and `user-quota=6`, **about 7 credentials fill
+every relay port** (41 / 6 rounded up); `bps-capacity` / `max-bps` (about 37 sessions at full
+rate) is reached with fewer allocations per credential. What brakes the number of credentials:
+
+- the backend's cap of 120 credentials per client IP per hour (`signaling/rate_limits.py`). It
+  cannot be lower, because many people share one address, so 7 is well inside it;
+- the backend's cap of 20 credentials per room (`signaling/rooms.py`), which stops a reconnect
+  loop in one occupied room from being an endless credential source. The count lives only while
+  the room exists (we keep no list of old room IDs), so **it resets when the room empties: one
+  client that leaves and rejoins the same ID, or a script that creates rooms, is not stopped by
+  it.** It is a guard against runaway reconnects, not a defence against a hostile client. Also
+  note it is shared by both members: one of them reconnecting 20 times leaves the room without
+  a relay until it ends (privacy-mode calls then fail closed).
+
+So **one client can still fill the relay.** The impact is availability only: media stays
+DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full, privacy-mode
+calls fail closed ("Privacy mode needs our relay...") and normal calls lose their TURN fallback
+(direct calls still work). Closing this needs the relay to know who asked for a credential (for
+example a per-client allocation count in coturn, or an authenticated user), which is outside
+`turnserver.conf` in 4.6.3 and outside the current design (no accounts).
+
+#### How long one allocation can live
+
+`max-allocate-lifetime=600` limits each Allocate or Refresh to 10 minutes (coturn's default is
+an hour), so a client that stops refreshing loses its relay port within 10 minutes. It does not
+limit the total: a client can keep refreshing. coturn 4.6.3 has no option to refuse a Refresh after
+the REST credential's expiry or to cap an allocation's total life. What it actually does is
+checked by the CI probe (next sections). So an allocation lives as long as the client keeps
+refreshing it, and the credential's expiry (up to the 4 h room lifetime) does not end it.
 
 ### Tests
 
@@ -110,6 +155,8 @@ the bandwidth quota). It checks that:
   `403` or `443` from CreatePermission for 7 IPv6 and IPv4-mapped peers on an IPv4 allocation
   (with a public IPv4 peer as a control that must succeed). CreatePermission for the stand-in
   public IP and for the relay's own IP is printed but not asserted (see "Our own addresses");
+- one credential gets 6 allocations and the 7th is refused with `486`
+  (`coturn/allocation_quota_probe.py`);
 - a second raw STUN probe (`coturn/relay_reachability_probe.py`) checks where packets go (see
   "Our own addresses");
 - the test builds `coturn/Dockerfile`, creates the same bridge network and runs the image with the
@@ -217,7 +264,12 @@ what coturn prints:
 - `compose.yaml` keeps coturn's console output discarded.
 
 
-### Refresh after expiry (informational, for #26)
+### Refresh after expiry (asserted in CI since #37; background from #26)
+
+`test-coturn.sh` now asserts the probe result against `expected_refresh_after_expiry`. It is
+`allowed`, the only result seen so far (coturn 4.6.3 has no option to change it), and a change
+(for example after an image bump) fails the test so these notes get updated.
+
 
 `coturn/refresh_after_expiry.py` allocates with a credential that expires 5 s later, waits 25 s
 (the test runs coturn with `--stale-nonce=20`, so the nonce has been rotated by then), and sends a
