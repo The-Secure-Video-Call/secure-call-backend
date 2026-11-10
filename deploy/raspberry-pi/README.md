@@ -18,8 +18,8 @@ Manual steps (owner):
 3. **Secret:** on the Pi run `openssl rand -base64 32` and put the result in `.env` as
    `TURN_SHARED_SECRET`. Then `docker compose up -d coturn`. The same value goes to the backend
    later (#26). Never commit it.
-   Also set `TURN_PUBLIC_IP` (the home's public IPv4); without it the relay advertises the LAN
-   address. Compose passes it as `--external-ip=<public IP>/<Pi LAN IP>` and also as
+   Also set `TURN_PUBLIC_IP` (the home's public IPv4, which must be static: if it changes, update
+   `.env` and restart coturn). Compose passes it as `--external-ip=<public IP>/<Pi LAN IP>` and also as
    `--denied-peer-ip=<public IP>`, so nobody can be relayed to the router through the public
    address (hairpin NAT), even if the value is wrong in a way that defeats coturn's own rewrite.
    And set `TURN_RELAY_IP` to the Pi's LAN IPv4, so relays are IPv4-only (see "IPv6" below).
