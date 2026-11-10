@@ -62,7 +62,7 @@ from signaling.rate_limits import (
     new_join_limiter,
     new_message_bucket,
     new_turn_credential_limiter,
-    try_acquire_fine_then_coarse,
+    try_acquire_coarse_then_fine,
 )
 from signaling.rooms import group_name_for_room, room_registry
 from signaling.turn_credentials import issue_turn_credentials
@@ -194,7 +194,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.send_message(ErrorMessage(code="bad-message"))
             return
         self.join_attempted = True  # a join in progress must not be cut off by the join timeout
-        if not try_acquire_fine_then_coarse(
+        if not try_acquire_coarse_then_fine(
             join_limiter, coarse_join_limiter, self.client_key, self.coarse_client_key
         ):
             await self.send_message(ErrorMessage(code="rate-limited"))
@@ -244,7 +244,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             logger.warning("TURN credential not issued: the room has no time left.")
             return None
         # Charged only when a credential is really issued (after the room-time checks above).
-        if not try_acquire_fine_then_coarse(
+        if not try_acquire_coarse_then_fine(
             turn_credential_limiter,
             coarse_turn_credential_limiter,
             self.client_key,

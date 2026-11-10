@@ -12,11 +12,11 @@ Privacy rules:
 IPv6 clients are counted twice: by /64 (the fine key, the same caps as one IPv4 address) and by
 /48 (the coarse key, with COARSE_CAP_FACTOR times the caps), because one customer can control
 65,536 /64s and each would otherwise get its own limits and map entries. An action must pass both.
-The fine limiter is charged first and given back when the coarse one refuses, so a refusal never
-leaves a charge. IPv4 has no coarse key and is counted once, as before. A /48 is one map entry
-however many /64s it uses, so evicting entries (which resets counters) takes MAX_TRACKED_CLIENTS
-distinct /48s active within the window, each a separate customer allocation; /64s of one /48
-cannot do it.
+The coarse limiter is charged first and given back when the fine one refuses, so a refusal never
+leaves a charge, and a /48 over its cap never touches (or evicts from) the fine map. IPv4 has no
+coarse key and is counted once, as before. A /48 is one map entry however many /64s it uses, so
+evicting entries (which resets counters) takes MAX_TRACKED_CLIENTS distinct /48s active within
+the window, each a separate customer allocation; /64s of one /48 cannot do it.
 
 The clock is passed in so tests can fake it. With several server processes each one counts on
 its own, so the effective limit is the limit times the number of processes.
@@ -153,17 +153,22 @@ class SlidingWindowLimiter:
         return len(self.event_times_by_client_key)
 
 
-def try_acquire_fine_then_coarse(
+def try_acquire_coarse_then_fine(
     fine_limiter: SlidingWindowLimiter,
     coarse_limiter: SlidingWindowLimiter,
     client_key: bytes,
     coarse_client_key: bytes | None,
 ) -> bool:
-    """Charge the fine limiter, then the coarse one; give the fine one back if coarse refuses."""
-    if not fine_limiter.try_acquire(client_key):
-        return False  # the coarse limiter is never touched
+    """Charge the coarse limiter, then the fine one; give the coarse one back if fine refuses.
+
+    Coarse goes first on purpose: a /48 over its cap is refused without touching the fine map,
+    so fresh /64s from it cannot insert fine entries and evict other clients' entries.
+    """
     if coarse_client_key is not None and not coarse_limiter.try_acquire(coarse_client_key):
-        fine_limiter.give_back(client_key)
+        return False  # the fine limiter is never touched
+    if not fine_limiter.try_acquire(client_key):
+        if coarse_client_key is not None:
+            coarse_limiter.give_back(coarse_client_key)
         return False
     return True
 

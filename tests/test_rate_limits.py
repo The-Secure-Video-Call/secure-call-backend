@@ -30,7 +30,7 @@ from signaling.rate_limits import (
     new_connection_limiter,
     new_join_limiter,
     new_turn_credential_limiter,
-    try_acquire_fine_then_coarse,
+    try_acquire_coarse_then_fine,
 )
 from signaling.rooms import room_registry
 from signaling.routing import websocket_urlpatterns
@@ -701,25 +701,27 @@ def test_give_back_undoes_the_newest_event_and_drops_an_empty_key() -> None:
     assert [limiter.try_acquire(key) for _ in range(3)] == [True, True, False]
 
 
-def test_fine_is_charged_first_and_given_back_when_coarse_refuses() -> None:
+def test_coarse_refusal_never_touches_the_fine_limiter() -> None:
     clock = FakeClock()
-    fine = SlidingWindowLimiter(5, 60.0, clock=clock)
+    fine = SlidingWindowLimiter(5, 60.0, max_tracked_clients=2, clock=clock)
     coarse = SlidingWindowLimiter(2, 60.0, clock=clock)
     fine_key = client_key_for_ip("2001:db8:1:1::")
     other_fine_key = client_key_for_ip("2001:db8:1:2::")
     coarse_key = coarse_client_key_for_ip("2001:db8:1:1::")
     assert coarse_key is not None
 
-    assert try_acquire_fine_then_coarse(fine, coarse, fine_key, coarse_key)
-    assert try_acquire_fine_then_coarse(fine, coarse, other_fine_key, coarse_key)
-    assert not try_acquire_fine_then_coarse(fine, coarse, fine_key, coarse_key)
+    assert try_acquire_coarse_then_fine(fine, coarse, fine_key, coarse_key)
+    assert try_acquire_coarse_then_fine(fine, coarse, other_fine_key, coarse_key)
+    # The /48 is at its cap: fresh /64s are refused without inserting (or evicting) fine entries.
+    for number in range(20):
+        fresh_fine_key = client_key_for_ip(f"2001:db8:1:{number + 16:x}::")
+        assert not try_acquire_coarse_then_fine(fine, coarse, fresh_fine_key, coarse_key)
 
-    # The refused attempt left no charge on either limiter.
-    assert len(fine.event_times_by_client_key[fine_key]) == 1
+    assert set(fine.event_times_by_client_key) == {fine_key, other_fine_key}
     assert len(coarse.event_times_by_client_key[coarse_key]) == 2
 
 
-def test_fine_refusal_never_charges_the_coarse_limiter() -> None:
+def test_fine_refusal_gives_the_coarse_charge_back() -> None:
     clock = FakeClock()
     fine = SlidingWindowLimiter(1, 60.0, clock=clock)
     coarse = SlidingWindowLimiter(5, 60.0, clock=clock)
@@ -727,8 +729,9 @@ def test_fine_refusal_never_charges_the_coarse_limiter() -> None:
     coarse_key = coarse_client_key_for_ip("2001:db8:1:1::")
     assert coarse_key is not None
 
-    assert try_acquire_fine_then_coarse(fine, coarse, fine_key, coarse_key)
-    assert not try_acquire_fine_then_coarse(fine, coarse, fine_key, coarse_key)
+    assert try_acquire_coarse_then_fine(fine, coarse, fine_key, coarse_key)
+    assert not try_acquire_coarse_then_fine(fine, coarse, fine_key, coarse_key)
+    assert len(fine.event_times_by_client_key[fine_key]) == 1
     assert len(coarse.event_times_by_client_key[coarse_key]) == 1
 
 
@@ -736,7 +739,7 @@ def test_ipv4_is_counted_once_by_the_fine_limiter_only() -> None:
     fine = SlidingWindowLimiter(2, 60.0, clock=FakeClock())
     coarse = SlidingWindowLimiter(1, 60.0, clock=FakeClock())
     key = client_key_for_ip(CLIENT_IP)
-    results = [try_acquire_fine_then_coarse(fine, coarse, key, None) for _ in range(3)]
+    results = [try_acquire_coarse_then_fine(fine, coarse, key, None) for _ in range(3)]
     assert results == [True, True, False]
     assert coarse.tracked_client_count() == 0
 
@@ -746,7 +749,7 @@ def test_maps_stay_bounded_under_many_distinct_prefixes() -> None:
     fine = SlidingWindowLimiter(5, 60.0, max_tracked_clients=50, clock=FakeClock())
     for number in range(500):
         client_ip = f"2001:db8:{number:x}:1::"
-        try_acquire_fine_then_coarse(
+        try_acquire_coarse_then_fine(
             fine, coarse, client_key_for_ip(client_ip), coarse_client_key_for_ip(client_ip)
         )
     assert coarse.tracked_client_count() == 50
@@ -758,7 +761,7 @@ def test_many_slash_64s_of_one_slash_48_cannot_evict_its_coarse_entry() -> None:
     fine = SlidingWindowLimiter(1000, 60.0, max_tracked_clients=50, clock=FakeClock())
     for number in range(500):
         client_ip = f"2001:db8:1:{number:x}::"
-        try_acquire_fine_then_coarse(
+        try_acquire_coarse_then_fine(
             fine, coarse, client_key_for_ip(client_ip), coarse_client_key_for_ip(client_ip)
         )
     assert coarse.tracked_client_count() == 1
