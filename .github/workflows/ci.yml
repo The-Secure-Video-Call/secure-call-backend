@@ -64,3 +64,15 @@ jobs:
             uv run python manage.py check --deploy --fail-level WARNING
 
       - run: uv run pip-audit
+
+  # The hardened coturn config (deploy/raspberry-pi/coturn/) against the pinned image:
+  # valid credentials allocate; wrong or expired credentials and private peers are refused.
+  coturn:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Hardened coturn checks
+        run: bash deploy/raspberry-pi/coturn/test-coturn.sh
