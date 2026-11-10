@@ -115,7 +115,9 @@ cannot be lower, because many people share one address, so 7 is well inside it.
 
 A per-room credential budget was tried (#39) and removed: rooms are free to create and its count
 reset when a room emptied, so it did not stop a hostile client, while a long call with many
-reconnects could use it up and lose privacy mode.
+reconnects could use it up and lose privacy mode. The per-IP cap has the same effect at a higher
+threshold: over it, `joined` has no `turn` and privacy-mode calls fail closed for everyone on
+that address until the hour window frees credentials.
 
 So **one client can still fill the relay.** The impact is availability only: media stays
 DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full, privacy-mode
