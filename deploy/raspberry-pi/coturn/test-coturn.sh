@@ -356,6 +356,19 @@ for edge_peer in 0.0.0.1 100.127.255.255 172.31.255.255 198.19.0.1 192.0.0.1 240
   expect "range edge $edge_peer refused" forbidden "$(run_client 600 "$edge_peer")"
 done
 
+# A fresh coturn first: every probe keeps about 4 of the 41 relay ports (min-port..max-port) until
+# coturn restarts, so one group of 15 probes ran out of ports ("no available ports").
+restart_or_exit
+echo "== Group 2b: edges of the documentation and 6to4 anycast blocks are denied =="
+# 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and 192.88.99.0/24: one probe per range at each
+# edge (documentation blocks, and the deprecated 6to4 anycast block). 203.0.113.7 (the stand-in
+# public IP) is not probed here: coturn maps it to the relay's private address, which is allowed
+# before any deny range; Group 5's relay-to-relay check asserts that.
+for edge_peer in 192.0.2.1 192.0.2.255 198.51.100.1 198.51.100.255 203.0.113.1 203.0.113.255 \
+  192.88.99.1 192.88.99.255; do
+  expect "range edge $edge_peer refused" forbidden "$(run_client 600 "$edge_peer")"
+done
+
 restart_or_exit
 echo "== Group 3: neighbours of the denied ranges are allowed =="
 for neighbour_peer in 11.0.0.1 100.128.0.1 172.32.0.1 198.20.0.1 1.1.1.1; do
