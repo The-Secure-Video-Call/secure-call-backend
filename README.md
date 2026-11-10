@@ -6,8 +6,8 @@ end-to-end encrypted connection messages it cannot read, and never sees audio or
 The architecture and security design are in the web app's
 [PLAN.md](https://github.com/The-Secure-Video-Call/secure-call/blob/main/PLAN.md).
 
-> Status: M0 (repository and tooling). The WebSocket endpoint validates messages and answers
-> `ping`; rooms and relaying arrive in M1.
+> Status: M0–M4 complete. The signaling server and coturn TURN relay run in production on a
+> Raspberry Pi at `signal.securevideocall.com`.
 
 ## Stack
 
