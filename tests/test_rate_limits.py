@@ -1,6 +1,8 @@
 import asyncio
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import pytest
 from channels.routing import URLRouter
@@ -10,27 +12,29 @@ from django.test import override_settings
 
 from config.asgi import application
 from signaling import consumers
-from signaling.client_address import ClientAddressMiddleware
+from signaling.client_address import IPV6_PREFIX_LENGTH, ClientAddressMiddleware, group_client_ip
 from signaling.consumers import CLOSE_RATE_LIMITED
 from signaling.rate_limits import (
+    CLIENT_TIERS,
     JOIN_WINDOW_SECONDS,
     MAX_CONNECTIONS_PER_CLIENT,
     MAX_CONNECTIONS_TOTAL,
     MAX_JOINS_PER_WINDOW,
     MAX_TURN_CREDENTIALS_PER_WINDOW,
     MESSAGE_BURST_SIZE,
+    TURN_CREDENTIAL_WINDOW_SECONDS,
+    ClientKeys,
+    ClientTier,
     ConnectionLimiter,
     SlidingWindowLimiter,
+    TieredConnectionLimiter,
+    TieredSlidingWindowLimiter,
     TokenBucket,
     client_key_for_ip,
-    coarse_client_key_for_ip,
-    new_coarse_connection_limiter,
-    new_coarse_join_limiter,
-    new_coarse_turn_credential_limiter,
+    client_keys_for_ip,
     new_connection_limiter,
     new_join_limiter,
     new_turn_credential_limiter,
-    try_acquire_coarse_then_fine,
 )
 from signaling.rooms import room_registry
 from signaling.routing import websocket_urlpatterns
@@ -39,6 +43,7 @@ PATH = "/ws/signal/"
 PROXY_IP = "192.168.1.10"
 CLIENT_IP = "203.0.113.7"
 OTHER_CLIENT_IP = "203.0.113.8"
+IPV6_CLIENT_IP = "2001:db8:1:1::5"
 SECRET = "s" * 40
 TURN_URLS = ["turn:turn.example.com:3478"]
 RATE_LIMITED = {"v": 1, "type": "error", "code": "rate-limited"}
@@ -89,7 +94,7 @@ def join_clock(monkeypatch: pytest.MonkeyPatch) -> FakeClock:
     monkeypatch.setattr(
         consumers,
         "join_limiter",
-        SlidingWindowLimiter(MAX_JOINS_PER_WINDOW, JOIN_WINDOW_SECONDS, clock=clock),
+        TieredSlidingWindowLimiter(MAX_JOINS_PER_WINDOW, JOIN_WINDOW_SECONDS, clock=clock),
     )
     return clock
 
@@ -149,6 +154,21 @@ def test_idle_clients_expire_from_the_map() -> None:
     limiter.try_acquire(client_key_for_ip(CLIENT_IP))
 
     assert limiter.tracked_client_count() == 1
+
+
+def test_eviction_removes_the_least_recently_active_key() -> None:
+    limiter = SlidingWindowLimiter(5, 60.0, max_tracked_clients=2, clock=FakeClock())
+    first_key, second_key, third_key = (
+        client_key_for_ip(ip) for ip in ("10.0.0.1", "10.0.0.2", "10.0.0.3")
+    )
+    assert limiter.try_acquire(first_key)
+    assert limiter.try_acquire(second_key)
+    assert limiter.try_acquire(first_key)  # now the most recently active
+
+    assert limiter.try_acquire(third_key)  # the map is full: one key must go
+
+    assert list(limiter.event_times_by_client_key) == [first_key, third_key]
+    assert len(limiter.event_times_by_client_key[first_key]) == 2  # kept with its counts
 
 
 def test_counter_keys_are_hmacs_not_raw_addresses() -> None:
@@ -303,11 +323,13 @@ async def test_credential_cap_leaves_joined_without_turn_and_the_call_works(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = FakeClock()
-    monkeypatch.setattr(consumers, "join_limiter", SlidingWindowLimiter(1000, 60.0, clock=clock))
+    monkeypatch.setattr(
+        consumers, "join_limiter", TieredSlidingWindowLimiter(1000, 60.0, clock=clock)
+    )
     monkeypatch.setattr(
         consumers,
         "turn_credential_limiter",
-        SlidingWindowLimiter(MAX_TURN_CREDENTIALS_PER_WINDOW, 3600.0, clock=clock),
+        TieredSlidingWindowLimiter(MAX_TURN_CREDENTIALS_PER_WINDOW, 3600.0, clock=clock),
     )
     for number in range(MAX_TURN_CREDENTIALS_PER_WINDOW):
         client, answer = await join_once(number)
@@ -398,11 +420,28 @@ def _client_for(
     return client
 
 
+def sliding_window_limits_by_tier(
+    limiter: TieredSlidingWindowLimiter,
+) -> list[tuple[int, float, int]]:
+    """(cap, window, most keys kept) of every tier, coarsest first."""
+    return [
+        (tier_limiter.max_events, tier_limiter.window_seconds, tier_limiter.max_tracked_clients)
+        for tier_limiter in limiter.limiters
+    ]
+
+
 def test_new_limiters_use_the_documented_limits() -> None:
-    assert new_join_limiter().max_events == 20
-    assert new_join_limiter().window_seconds == 60.0
-    assert new_turn_credential_limiter().max_events == 120
-    assert new_turn_credential_limiter().window_seconds == 3600.0
+    # /48, /56 and /64: 16, 4 and 1 times the caps, all with the same window.
+    assert sliding_window_limits_by_tier(new_join_limiter()) == [
+        (320, 60.0, 500),
+        (80, 60.0, 1_000),
+        (20, 60.0, 10_000),
+    ]
+    assert sliding_window_limits_by_tier(new_turn_credential_limiter()) == [
+        (1_920, 3600.0, 500),
+        (480, 3600.0, 1_000),
+        (120, 3600.0, 10_000),
+    ]
 
 
 # --- Connection caps and the join timeout ----------------------------------------------------
@@ -412,16 +451,34 @@ CAP_TOTAL = 5
 PONG = {"v": 1, "type": "pong"}
 
 
+# Both peers are tested wherever a slot must be given back: IPv6 takes a slot in all three tiers.
+# The second value is the number of slots each tier (/48, /56, /64) holds while it is connected.
+PEERS = [
+    pytest.param(CLIENT_IP, [0, 0, 1], id="ipv4"),
+    pytest.param(IPV6_CLIENT_IP, [1, 1, 1], id="ipv6"),
+]
+
+
 @pytest.fixture
-def small_connection_limiter(monkeypatch: pytest.MonkeyPatch) -> ConnectionLimiter:
-    limiter = ConnectionLimiter(CAP_PER_CLIENT, CAP_TOTAL)
+def small_connection_limiter(monkeypatch: pytest.MonkeyPatch) -> TieredConnectionLimiter:
+    limiter = TieredConnectionLimiter(CAP_PER_CLIENT, CAP_TOTAL)
     monkeypatch.setattr(consumers, "connection_limiter", limiter)
     return limiter
 
 
-def assert_no_connections_counted(limiter: ConnectionLimiter) -> None:
-    assert limiter.total_connection_count == 0
-    assert limiter.connection_count_by_client_key == {}
+def connection_counts_by_tier(limiter: TieredConnectionLimiter) -> list[int]:
+    return [tier_limiter.total_connection_count for tier_limiter in limiter.limiters]
+
+
+def connection_counts_by_tier_and_key(limiter: TieredConnectionLimiter) -> list[dict[bytes, int]]:
+    return [dict(tier_limiter.connection_count_by_client_key) for tier_limiter in limiter.limiters]
+
+
+def assert_no_connections_counted(limiter: ConnectionLimiter | TieredConnectionLimiter) -> None:
+    tier_limiters = limiter.limiters if isinstance(limiter, TieredConnectionLimiter) else [limiter]
+    for tier_limiter in tier_limiters:
+        assert tier_limiter.total_connection_count == 0
+        assert tier_limiter.connection_count_by_client_key == {}
 
 
 async def open_connected_client(peer_ip: str = CLIENT_IP) -> WebsocketCommunicator:
@@ -477,12 +534,16 @@ def test_connection_limiter_map_stays_bounded_by_the_global_cap() -> None:
 
 def test_new_connection_limiter_uses_the_documented_caps() -> None:
     assert (MAX_CONNECTIONS_PER_CLIENT, MAX_CONNECTIONS_TOTAL) == (20, 500)
-    assert new_connection_limiter().max_per_client == 20
-    assert new_connection_limiter().max_total == 500
+    # Only the /64 (and IPv4) tier has the total cap: every connection is counted there.
+    caps_by_tier = [
+        (tier_limiter.max_per_client, tier_limiter.max_total)
+        for tier_limiter in new_connection_limiter().limiters
+    ]
+    assert caps_by_tier == [(320, None), (80, None), (20, 500)]
 
 
 async def test_connection_over_the_client_cap_is_refused_and_other_ip_is_not(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter,
 ) -> None:
     accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
 
@@ -499,7 +560,7 @@ async def test_connection_over_the_client_cap_is_refused_and_other_ip_is_not(
 
 
 async def test_global_cap_refuses_even_a_new_ip(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter,
 ) -> None:
     accepted = [
         await open_connected_client(f"203.0.113.{number}") for number in range(10, 10 + CAP_TOTAL)
@@ -516,21 +577,24 @@ async def test_global_cap_refuses_even_a_new_ip(
     assert_no_connections_counted(small_connection_limiter)
 
 
+@pytest.mark.parametrize(("peer_ip", "slots_by_tier"), PEERS)
 async def test_slot_is_released_on_normal_disconnect(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter, peer_ip: str, slots_by_tier: list[int]
 ) -> None:
-    client, _ = await join_once(1)
-    assert small_connection_limiter.total_connection_count == 1
+    client, _ = await join_once(1, peer_ip)
+    assert connection_counts_by_tier(small_connection_limiter) == slots_by_tier
 
     await client.disconnect()
 
     assert_no_connections_counted(small_connection_limiter)
 
 
+@pytest.mark.parametrize(("peer_ip", "slots_by_tier"), PEERS)
 async def test_slot_is_released_when_the_server_closes_a_bad_connection(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter, peer_ip: str, slots_by_tier: list[int]
 ) -> None:
-    client = await open_connected_client()
+    client = await open_connected_client(peer_ip)
+    assert connection_counts_by_tier(small_connection_limiter) == slots_by_tier
     await client.send_to(text_data="{not json")
     await client.receive_output()  # the close
     await client.wait()
@@ -538,11 +602,12 @@ async def test_slot_is_released_when_the_server_closes_a_bad_connection(
     assert_no_connections_counted(small_connection_limiter)
 
 
+@pytest.mark.parametrize(("peer_ip", "slots_by_tier"), PEERS)
 async def test_slot_is_released_when_the_application_task_is_cancelled(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter, peer_ip: str, slots_by_tier: list[int]
 ) -> None:
-    client = await open_connected_client()
-    assert small_connection_limiter.total_connection_count == 1
+    client = await open_connected_client(peer_ip)
+    assert connection_counts_by_tier(small_connection_limiter) == slots_by_tier
 
     client.future.cancel()  # an abnormal end: no websocket.disconnect is ever delivered
     await let_server_notice_close()
@@ -550,25 +615,41 @@ async def test_slot_is_released_when_the_application_task_is_cancelled(
     assert_no_connections_counted(small_connection_limiter)
 
 
+@pytest.mark.parametrize(("peer_ip", "slots_by_tier"), PEERS)
 async def test_slot_is_released_when_connect_fails_halfway(
-    small_connection_limiter: ConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+    small_connection_limiter: TieredConnectionLimiter,
+    monkeypatch: pytest.MonkeyPatch,
+    peer_ip: str,
+    slots_by_tier: list[int],
 ) -> None:
+    slots_while_accepting: list[list[int]] = []
+
     async def failing_accept(self: object, subprotocol: str | None = None) -> None:
+        slots_while_accepting.append(connection_counts_by_tier(small_connection_limiter))
         raise RuntimeError("accept failed")
 
     monkeypatch.setattr(consumers.SignalingConsumer, "accept", failing_accept)
 
     with pytest.raises(RuntimeError):
-        await open_client().connect()
+        await open_client(peer_ip).connect()
 
+    assert slots_while_accepting == [slots_by_tier]  # the slots were taken before it failed
     assert_no_connections_counted(small_connection_limiter)
 
 
+# Many clients, in different IPv4 addresses or in different IPv6 /48s, /56s and /64s.
+CYCLING_PEER_ADDRESSES = [
+    pytest.param(lambda number: f"203.0.113.{number % 7}", id="ipv4"),
+    pytest.param(lambda number: f"2001:db8:{number % 3}:{number % 7:x}00::5", id="ipv6"),
+]
+
+
+@pytest.mark.parametrize("address_for_number", CYCLING_PEER_ADDRESSES)
 async def test_counters_return_to_zero_after_many_cycles(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter, address_for_number: Callable[[int], str]
 ) -> None:
     for number in range(60):
-        client = await open_connected_client(f"203.0.113.{number % 7}")
+        client = await open_connected_client(address_for_number(number))
         if number % 3 == 0:
             await client.send_to(text_data="{not json")
             await client.receive_output()
@@ -578,13 +659,36 @@ async def test_counters_return_to_zero_after_many_cycles(
             await let_server_notice_close()
         else:
             await client.disconnect()
-        assert small_connection_limiter.total_connection_count == 0
+        assert connection_counts_by_tier(small_connection_limiter) == [0, 0, 0]
 
     assert_no_connections_counted(small_connection_limiter)
 
 
+@pytest.mark.parametrize(("peer_ip", "slots_by_tier"), PEERS)
+async def test_closing_one_connection_gives_back_exactly_one_slot_per_tier(
+    small_connection_limiter: TieredConnectionLimiter, peer_ip: str, slots_by_tier: list[int]
+) -> None:
+    accepted = [await open_connected_client(peer_ip) for _ in range(CAP_PER_CLIENT)]
+    full = [CAP_PER_CLIENT * slots for slots in slots_by_tier]
+    assert connection_counts_by_tier(small_connection_limiter) == full
+
+    await accepted[0].disconnect()  # disconnect() and __call__'s finally both run
+
+    # Given back once, not twice: a double release would let two more connections in.
+    assert connection_counts_by_tier(small_connection_limiter) == [
+        (CAP_PER_CLIENT - 1) * slots for slots in slots_by_tier
+    ]
+    replacement = await open_connected_client(peer_ip)
+    await replacement.send_to(text_data=PING)
+    assert json.loads(await replacement.receive_from()) == PONG
+    await assert_refused_with_rate_limited(await open_connected_client(peer_ip))
+    for client in [*accepted[1:], replacement]:
+        await client.disconnect()
+    assert_no_connections_counted(small_connection_limiter)
+
+
 async def test_spoofed_forwarded_for_from_an_untrusted_peer_does_not_change_bucket(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter,
 ) -> None:
     accepted = []
     for number in range(CAP_PER_CLIENT):
@@ -597,13 +701,13 @@ async def test_spoofed_forwarded_for_from_an_untrusted_peer_does_not_change_buck
     await spoofing_client.connect()
     await assert_refused_with_rate_limited(spoofing_client)
 
-    assert len(small_connection_limiter.connection_count_by_client_key) == 1
+    assert len(small_connection_limiter.limiters[-1].connection_count_by_client_key) == 1
     for client in accepted:
         await client.disconnect()
 
 
 async def test_refused_connection_cannot_join_a_room(
-    small_connection_limiter: ConnectionLimiter,
+    small_connection_limiter: TieredConnectionLimiter,
 ) -> None:
     accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
     refused = await open_connected_client()
@@ -618,7 +722,7 @@ async def test_refused_connection_cannot_join_a_room(
 
 
 async def test_refusal_logs_and_sends_no_ip_address(
-    small_connection_limiter: ConnectionLimiter, caplog: pytest.LogCaptureFixture
+    small_connection_limiter: TieredConnectionLimiter, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.DEBUG)
     accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
@@ -631,13 +735,18 @@ async def test_refusal_logs_and_sends_no_ip_address(
         await client.disconnect()
 
 
+@pytest.mark.parametrize(("peer_ip", "slots_by_tier"), PEERS)
 async def test_connection_that_never_joins_is_closed(
-    small_connection_limiter: ConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+    small_connection_limiter: TieredConnectionLimiter,
+    monkeypatch: pytest.MonkeyPatch,
+    peer_ip: str,
+    slots_by_tier: list[int],
 ) -> None:
     monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.1)
-    client = await open_connected_client()
+    client = await open_connected_client(peer_ip)
     await client.send_to(text_data=PING)  # keeping it alive does not count as joining
     assert json.loads(await client.receive_from()) == PONG
+    assert connection_counts_by_tier(small_connection_limiter) == slots_by_tier
 
     assert await client.receive_output() == {
         "type": "websocket.close",
@@ -648,7 +757,7 @@ async def test_connection_that_never_joins_is_closed(
 
 
 async def test_connection_that_joins_in_time_stays_open(
-    small_connection_limiter: ConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+    small_connection_limiter: TieredConnectionLimiter, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.2)
     client, answer = await join_once(2)
@@ -661,255 +770,478 @@ async def test_connection_that_joins_in_time_stays_open(
     await client.disconnect()
 
 
-# --- IPv6 /48 (coarse) limits ----------------------------------------------------------------
+# --- IPv6 tiers: /48, /56 and /64 ------------------------------------------------------------
 
-# Three /64s in one /48, and a /64 in another /48.
-SAME_48_FIRST_64 = "2001:db8:1:1::5"
-SAME_48_SECOND_64 = "2001:db8:1:2::5"
-SAME_48_THIRD_64 = "2001:db8:1:3::5"
-OTHER_48 = "2001:db8:2:1::5"
-
-CoarseLimiters = tuple[SlidingWindowLimiter, SlidingWindowLimiter, ConnectionLimiter]
+OTHER_48_IP = "2001:db8:2:1::5"
 
 
-def test_coarse_key_is_shared_inside_a_slash_48_and_differs_from_the_fine_key() -> None:
-    first = coarse_client_key_for_ip("2001:db8:1:1::")
-    assert first == coarse_client_key_for_ip("2001:db8:1:2::")
-    assert first != coarse_client_key_for_ip("2001:db8:2:1::")
-    assert first != client_key_for_ip("2001:db8:1:1::")
-    assert coarse_client_key_for_ip(CLIENT_IP) is None  # IPv4 is counted once
-    assert coarse_client_key_for_ip("unknown") is None
+@dataclass(frozen=True)
+class TierCase:
+    """Clients that share the prefix of one tier but are in different prefixes of every finer
+    tier, so that tier alone can refuse them; and a neighbour in another prefix of that tier
+    (sharing every coarser one), which it must not refuse."""
+
+    tier_index: int
+    address_for_number: Callable[[int], str]
+    neighbour_address: str
+
+    @property
+    def clients_allowed_at_base_cap_1(self) -> int:
+        return CLIENT_TIERS[self.tier_index].cap_factor
 
 
-def test_coarse_caps_are_four_times_the_fine_caps() -> None:
-    assert new_coarse_join_limiter().max_events == 4 * MAX_JOINS_PER_WINDOW
-    assert new_coarse_turn_credential_limiter().max_events == 4 * MAX_TURN_CREDENTIALS_PER_WINDOW
-    assert new_coarse_connection_limiter().max_per_client == 4 * MAX_CONNECTIONS_PER_CLIENT
-    assert new_coarse_connection_limiter().max_total == MAX_CONNECTIONS_TOTAL
+TIER_CASES = [
+    # 2001:db8:1::/48, a different /56 each: 2001:db8:1:000::, 2001:db8:1:100::, ...
+    pytest.param(
+        TierCase(0, lambda number: f"2001:db8:1:{number:x}00::5", OTHER_48_IP), id="slash-48"
+    ),
+    # 2001:db8:1:100::/56, a different /64 each: 2001:db8:1:100::, 2001:db8:1:101::, ...
+    pytest.param(
+        TierCase(1, lambda number: f"2001:db8:1:1{number:02x}::5", "2001:db8:1:200::5"),
+        id="slash-56",
+    ),
+    # 2001:db8:1:1::/64, a different address each.
+    pytest.param(
+        TierCase(2, lambda number: f"2001:db8:1:1::{number + 1:x}", "2001:db8:1:2::5"),
+        id="slash-64",
+    ),
+]
+COARSE_TIER_CASES = TIER_CASES[:2]
 
 
-def test_give_back_undoes_the_newest_event_and_drops_an_empty_key() -> None:
-    limiter = SlidingWindowLimiter(3, 60.0, clock=FakeClock())
-    key = client_key_for_ip(CLIENT_IP)
-    assert limiter.try_acquire(key)
-    limiter.give_back(key)
-    assert limiter.tracked_client_count() == 0
-    limiter.give_back(key)  # unknown key: nothing happens
-    assert limiter.try_acquire(key)
-    assert limiter.try_acquire(key)
-    limiter.give_back(key)
-    assert [limiter.try_acquire(key) for _ in range(3)] == [True, True, False]
+def client_keys_of_address(address: str) -> ClientKeys:
+    """The keys the consumer uses for a client connecting from `address`."""
+    return client_keys_for_ip(group_client_ip(address))
 
 
-def test_coarse_refusal_never_touches_the_fine_limiter() -> None:
+def event_counts_by_tier(limiter: TieredSlidingWindowLimiter) -> list[list[tuple[bytes, int]]]:
+    """Every tier's keys in map order (least recently active first) with their event counts."""
+    return [
+        [
+            (client_key, len(event_times))
+            for client_key, event_times in tier.event_times_by_client_key.items()
+        ]
+        for tier in limiter.limiters
+    ]
+
+
+async def assert_connected_then_refused_on_join(client: WebsocketCommunicator, number: int) -> None:
+    await client.send_to(text_data=PING)
+    assert json.loads(await client.receive_from()) == PONG  # connected, not refused at connect
+    await client.send_to(text_data=join_text(number))
+    assert json.loads(await client.receive_from()) == RATE_LIMITED
+    assert await client.receive_output() == {"type": "websocket.close", "code": CLOSE_RATE_LIMITED}
+    await client.disconnect()
+
+
+def test_client_tiers_are_slash_48_slash_56_and_slash_64_coarsest_first() -> None:
+    tiers = [
+        (tier.ipv6_prefix_length, tier.cap_factor, tier.max_tracked_clients)
+        for tier in CLIENT_TIERS
+    ]
+    # One /56 gets a quarter of its /48, one /64 a quarter of its /56.
+    assert tiers == [(48, 16, 500), (56, 4, 1_000), (64, 1, 10_000)]
+    assert CLIENT_TIERS[-1].ipv6_prefix_length == IPV6_PREFIX_LENGTH  # client_address.py's group
+
+
+def test_client_keys_are_one_hmac_per_tier_and_ipv4_has_only_the_finest() -> None:
+    slash_48_key, slash_56_key, slash_64_key = client_keys_for_ip("2001:db8:1:1::")
+    assert slash_64_key == client_key_for_ip("2001:db8:1:1::")
+    for key in (slash_48_key, slash_56_key, slash_64_key):
+        assert isinstance(key, bytes)
+        assert len(key) == 32
+        assert b"2001" not in key
+    # 2001:db8:1:: is the text of its /48, its /56 and its /64: still three different keys.
+    assert len(set(client_keys_for_ip("2001:db8:1::"))) == 3
+
+    same_slash_56 = client_keys_for_ip("2001:db8:1:ff::")
+    assert same_slash_56[:2] == (slash_48_key, slash_56_key)
+    assert same_slash_56[2] != slash_64_key
+    same_slash_48 = client_keys_for_ip("2001:db8:1:100::")
+    assert same_slash_48[0] == slash_48_key
+    assert same_slash_48[1] != slash_56_key
+    other_slash_48 = client_keys_for_ip("2001:db8:2:1::")
+    assert set(other_slash_48).isdisjoint({slash_48_key, slash_56_key, slash_64_key})
+
+    # IPv4 and "unknown" are counted once, by the finest tier.
+    assert client_keys_for_ip(CLIENT_IP) == (None, None, client_key_for_ip(CLIENT_IP))
+    assert client_keys_for_ip("unknown") == (None, None, client_key_for_ip("unknown"))
+
+
+@pytest.mark.parametrize("case", TIER_CASES)
+def test_tier_case_addresses_share_only_their_own_tier(case: TierCase) -> None:
+    """Checks the test data above: otherwise a tier test could pass for the wrong tier."""
+    count = case.clients_allowed_at_base_cap_1 + 1
+    keys_by_client = [client_keys_of_address(case.address_for_number(n)) for n in range(count)]
+    neighbour_keys = client_keys_of_address(case.neighbour_address)
+    for tier_index in range(len(CLIENT_TIERS)):
+        distinct_keys = {client_keys[tier_index] for client_keys in keys_by_client}
+        assert len(distinct_keys) == (1 if tier_index <= case.tier_index else count)
+        shares_with_neighbour = neighbour_keys[tier_index] == keys_by_client[0][tier_index]
+        assert shares_with_neighbour == (tier_index < case.tier_index)
+
+
+def test_can_acquire_counts_nothing_and_adds_moves_or_evicts_no_key() -> None:
     clock = FakeClock()
-    fine = SlidingWindowLimiter(5, 60.0, max_tracked_clients=2, clock=clock)
-    coarse = SlidingWindowLimiter(2, 60.0, clock=clock)
-    fine_key = client_key_for_ip("2001:db8:1:1::")
-    other_fine_key = client_key_for_ip("2001:db8:1:2::")
-    coarse_key = coarse_client_key_for_ip("2001:db8:1:1::")
-    assert coarse_key is not None
+    limiter = SlidingWindowLimiter(1, 60.0, max_tracked_clients=2, clock=clock)
+    first_key, second_key, new_key = (
+        client_key_for_ip(ip) for ip in ("10.0.0.1", "10.0.0.2", "10.0.0.3")
+    )
+    assert limiter.try_acquire(first_key)
+    assert limiter.try_acquire(second_key)
 
-    assert try_acquire_coarse_then_fine(fine, coarse, fine_key, coarse_key)
-    assert try_acquire_coarse_then_fine(fine, coarse, other_fine_key, coarse_key)
-    # The /48 is at its cap: fresh /64s are refused without inserting (or evicting) fine entries.
-    for number in range(20):
-        fresh_fine_key = client_key_for_ip(f"2001:db8:1:{number + 16:x}::")
-        assert not try_acquire_coarse_then_fine(fine, coarse, fresh_fine_key, coarse_key)
+    assert not limiter.can_acquire(first_key, clock.now)
+    assert limiter.can_acquire(new_key, clock.now)  # the map is full, yet nothing is evicted
 
-    assert set(fine.event_times_by_client_key) == {fine_key, other_fine_key}
-    assert len(coarse.event_times_by_client_key[coarse_key]) == 2
+    assert list(limiter.event_times_by_client_key) == [first_key, second_key]  # order kept
+    assert [len(times) for times in limiter.event_times_by_client_key.values()] == [1, 1]
 
 
-def test_fine_refusal_gives_the_coarse_charge_back() -> None:
+@pytest.mark.parametrize("case", TIER_CASES)
+def test_refusal_by_any_tier_charges_no_tier(case: TierCase) -> None:
+    limiter = TieredSlidingWindowLimiter(1, 60.0, clock=FakeClock())
+    allowed = case.clients_allowed_at_base_cap_1
+    for number in range(allowed):
+        assert limiter.try_acquire(client_keys_of_address(case.address_for_number(number)))
+    counts_before_refusal = event_counts_by_tier(limiter)
+
+    for number in range(allowed, allowed + 5):
+        assert not limiter.try_acquire(client_keys_of_address(case.address_for_number(number)))
+
+    assert event_counts_by_tier(limiter) == counts_before_refusal  # same keys, order and counts
+
+
+def test_refusal_by_a_coarse_tier_adds_moves_or_evicts_no_entry() -> None:
+    # Small maps, so an insert would have to evict: /48 x2 (10 keys), /56 x2 (10), /64 x1 (3).
+    tiers = (ClientTier(48, 2, 10), ClientTier(56, 2, 10), ClientTier(64, 1, 3))
+    limiter = TieredSlidingWindowLimiter(1, 60.0, tiers=tiers, clock=FakeClock())
+
+    def keys_of(address: str) -> ClientKeys:
+        return client_keys_for_ip(group_client_ip(address), tiers)
+
+    assert limiter.try_acquire(keys_of("2001:db8:1:100::5"))
+    assert limiter.try_acquire(keys_of("2001:db8:1:200::5"))  # 2001:db8:1::/48 is now full
+    assert limiter.try_acquire(keys_of(OTHER_48_IP))  # newer than it, so later in the /48 map
+    counts_before_refusal = event_counts_by_tier(limiter)
+
+    for number in range(3, 23):  # fresh /56s and /64s of the full /48
+        assert not limiter.try_acquire(keys_of(f"2001:db8:1:{number:x}00::5"))
+
+    # The full /48 was not moved to the recently-active end, and the full /64 map evicted nothing.
+    assert event_counts_by_tier(limiter) == counts_before_refusal
+
+
+def test_refusal_by_the_slash_64_charges_or_moves_no_coarse_entry() -> None:
+    limiter = TieredSlidingWindowLimiter(1, 60.0, clock=FakeClock())
+    keys = client_keys_of_address(IPV6_CLIENT_IP)
+    assert limiter.try_acquire(keys)
+    assert limiter.try_acquire(client_keys_of_address(OTHER_48_IP))  # newer in every map
+    counts_before_refusal = event_counts_by_tier(limiter)
+
+    assert not limiter.try_acquire(keys)  # its /64 is full; its /56 and /48 are not
+
+    # Its /48 and /56 entries keep their counts and stay the least recently active.
+    assert event_counts_by_tier(limiter) == counts_before_refusal
+
+
+def test_ipv4_is_counted_by_the_finest_tier_only() -> None:
+    limiter = TieredSlidingWindowLimiter(2, 60.0, clock=FakeClock())
+    keys = client_keys_for_ip(CLIENT_IP)
+    assert [limiter.try_acquire(keys) for _ in range(3)] == [True, True, False]
+    assert [tier.tracked_client_count() for tier in limiter.limiters] == [0, 0, 1]
+
+
+@pytest.mark.parametrize("case", TIER_CASES)
+def test_each_tier_recovers_after_its_window(case: TierCase) -> None:
     clock = FakeClock()
-    fine = SlidingWindowLimiter(1, 60.0, clock=clock)
-    coarse = SlidingWindowLimiter(5, 60.0, clock=clock)
-    fine_key = client_key_for_ip("2001:db8:1:1::")
-    coarse_key = coarse_client_key_for_ip("2001:db8:1:1::")
-    assert coarse_key is not None
+    limiter = TieredSlidingWindowLimiter(1, JOIN_WINDOW_SECONDS, clock=clock)
+    allowed = case.clients_allowed_at_base_cap_1
+    keys_by_client = [
+        client_keys_of_address(case.address_for_number(number)) for number in range(allowed + 1)
+    ]
+    assert [limiter.try_acquire(keys) for keys in keys_by_client] == [True] * allowed + [False]
 
-    assert try_acquire_coarse_then_fine(fine, coarse, fine_key, coarse_key)
-    assert not try_acquire_coarse_then_fine(fine, coarse, fine_key, coarse_key)
-    assert len(fine.event_times_by_client_key[fine_key]) == 1
-    assert len(coarse.event_times_by_client_key[coarse_key]) == 1
-
-
-def test_ipv4_is_counted_once_by_the_fine_limiter_only() -> None:
-    fine = SlidingWindowLimiter(2, 60.0, clock=FakeClock())
-    coarse = SlidingWindowLimiter(1, 60.0, clock=FakeClock())
-    key = client_key_for_ip(CLIENT_IP)
-    results = [try_acquire_coarse_then_fine(fine, coarse, key, None) for _ in range(3)]
-    assert results == [True, True, False]
-    assert coarse.tracked_client_count() == 0
+    clock.now += JOIN_WINDOW_SECONDS - 1.0
+    assert not limiter.try_acquire(keys_by_client[-1])
+    clock.now += 1.1  # just over the window since the first event
+    assert limiter.try_acquire(keys_by_client[-1])
 
 
 def test_maps_stay_bounded_under_many_distinct_prefixes() -> None:
-    coarse = SlidingWindowLimiter(5, 60.0, max_tracked_clients=50, clock=FakeClock())
-    fine = SlidingWindowLimiter(5, 60.0, max_tracked_clients=50, clock=FakeClock())
+    tiers = (ClientTier(48, 16, 5), ClientTier(56, 4, 10), ClientTier(64, 1, 50))
+    limiter = TieredSlidingWindowLimiter(5, 60.0, tiers=tiers, clock=FakeClock())
     for number in range(500):
-        client_ip = f"2001:db8:{number:x}:1::"
-        try_acquire_coarse_then_fine(
-            fine, coarse, client_key_for_ip(client_ip), coarse_client_key_for_ip(client_ip)
+        client_ip = group_client_ip(f"2001:db8:{number:x}:1::5")
+        assert limiter.try_acquire(client_keys_for_ip(client_ip, tiers))
+        tracked_counts = [tier.tracked_client_count() for tier in limiter.limiters]
+        assert all(
+            count <= tier.max_tracked_clients
+            for count, tier in zip(tracked_counts, tiers, strict=True)
         )
-    assert coarse.tracked_client_count() == 50
-    assert fine.tracked_client_count() == 50
+    assert [tier.tracked_client_count() for tier in limiter.limiters] == [5, 10, 50]
 
 
-def test_many_slash_64s_of_one_slash_48_cannot_evict_its_coarse_entry() -> None:
-    coarse = SlidingWindowLimiter(1000, 60.0, max_tracked_clients=50, clock=FakeClock())
-    fine = SlidingWindowLimiter(1000, 60.0, max_tracked_clients=50, clock=FakeClock())
-    for number in range(500):
-        client_ip = f"2001:db8:1:{number:x}::"
-        try_acquire_coarse_then_fine(
-            fine, coarse, client_key_for_ip(client_ip), coarse_client_key_for_ip(client_ip)
-        )
-    assert coarse.tracked_client_count() == 1
-    (coarse_event_times,) = coarse.event_times_by_client_key.values()
-    assert len(coarse_event_times) == 500  # one entry: nothing was evicted or reset
+def test_many_slash_64s_of_one_slash_48_cannot_evict_its_coarse_entries() -> None:
+    tiers = (ClientTier(48, 1, 50), ClientTier(56, 1, 50), ClientTier(64, 1, 50))
+    limiter = TieredSlidingWindowLimiter(1000, 60.0, tiers=tiers, clock=FakeClock())
+    for number in range(500):  # 500 /64s in two /56s (2001:db8:1::/56 and 2001:db8:1:100::/56)
+        client_ip = group_client_ip(f"2001:db8:1:{number:x}::5")
+        assert limiter.try_acquire(client_keys_for_ip(client_ip, tiers))
+    slash_48_counts, slash_56_counts, slash_64_counts = event_counts_by_tier(limiter)
+    assert [count for _, count in slash_48_counts] == [500]  # one entry: nothing evicted or reset
+    assert [count for _, count in slash_56_counts] == [256, 244]
+    assert len(slash_64_counts) == 50
 
 
-@pytest.fixture
-def small_coarse_limiters(monkeypatch: pytest.MonkeyPatch) -> CoarseLimiters:
-    """Joins, TURN credentials and connections: 2 each per /48. The /64 caps stay high."""
-    clock = FakeClock()
-    coarse_join = SlidingWindowLimiter(2, 60.0, clock=clock)
-    coarse_turn = SlidingWindowLimiter(2, 3600.0, clock=clock)
-    coarse_connections = ConnectionLimiter(2, MAX_CONNECTIONS_TOTAL)
-    monkeypatch.setattr(consumers, "coarse_join_limiter", coarse_join)
-    monkeypatch.setattr(consumers, "coarse_turn_credential_limiter", coarse_turn)
-    monkeypatch.setattr(consumers, "coarse_connection_limiter", coarse_connections)
-    return coarse_join, coarse_turn, coarse_connections
+def test_tiered_connection_limiter_takes_and_gives_back_every_tier_together() -> None:
+    limiter = TieredConnectionLimiter(1, 3)
+    ipv6_keys = client_keys_of_address(IPV6_CLIENT_IP)
+    assert limiter.try_acquire(ipv6_keys)
+    assert limiter.try_acquire(client_keys_for_ip(CLIENT_IP))
+    assert connection_counts_by_tier(limiter) == [1, 1, 2]
+    assert limiter.total_connection_count == 2
+
+    assert not limiter.try_acquire(ipv6_keys)  # its /64 is full: no tier takes a slot
+    assert connection_counts_by_tier(limiter) == [1, 1, 2]
+
+    limiter.release(ipv6_keys)
+    limiter.release(client_keys_for_ip(CLIENT_IP))
+    assert_no_connections_counted(limiter)
 
 
-async def test_two_slash_64s_share_the_join_cap_of_their_slash_48_and_another_48_is_free(
-    small_coarse_limiters: CoarseLimiters, caplog: pytest.LogCaptureFixture
+def test_tiered_connection_total_cap_is_enforced_by_the_finest_tier() -> None:
+    limiter = TieredConnectionLimiter(5, 2)
+    assert limiter.try_acquire(client_keys_of_address("2001:db8:1:1::5"))
+    assert limiter.try_acquire(client_keys_of_address("2001:db8:2:1::5"))
+    third_keys = client_keys_of_address("2001:db8:3:1::5")
+
+    # Refused by the global cap of 2, though its own /48, /56 and /64 hold no connection.
+    assert not limiter.try_acquire(third_keys)
+
+    assert connection_counts_by_tier(limiter) == [2, 2, 2]
+    assert all(
+        third_keys[index] not in limiter.limiters[index].connection_count_by_client_key
+        for index in range(3)
+    )
+
+
+# --- IPv6 tiers through the consumer ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("case", TIER_CASES)
+async def test_each_tier_refuses_joins_over_its_cap(
+    case: TierCase, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    # A base cap of 1 join: the /64 allows 1, the /56 4 and the /48 16 per window.
+    join_limiter = TieredSlidingWindowLimiter(1, JOIN_WINDOW_SECONDS, clock=FakeClock())
+    monkeypatch.setattr(consumers, "join_limiter", join_limiter)
     caplog.set_level(logging.DEBUG)
-    first, first_answer = await join_once(1, SAME_48_FIRST_64)
-    second, second_answer = await join_once(2, SAME_48_SECOND_64)
-    third, third_answer = await join_once(3, SAME_48_THIRD_64)  # a third /64: the /48 cap is 2
-    other, other_answer = await join_once(4, OTHER_48)
+    allowed = case.clients_allowed_at_base_cap_1
+    for number in range(allowed):
+        client, answer = await join_once(number, case.address_for_number(number))
+        assert answer["type"] == "joined"
+        await client.disconnect()  # so no connection cap plays a part
+    counts_before_refusal = event_counts_by_tier(join_limiter)
 
-    assert first_answer["type"] == second_answer["type"] == "joined"
-    assert third_answer == RATE_LIMITED
-    assert other_answer["type"] == "joined"
-    for forbidden_text in ("2001:db8", SAME_48_THIRD_64):
-        assert forbidden_text not in caplog.text
-        assert forbidden_text not in json.dumps(third_answer)
-    for client in (first, second, third, other):
-        await client.disconnect()
+    refused = await open_connected_client(case.address_for_number(allowed))
+    await assert_connected_then_refused_on_join(refused, 100)
+
+    assert event_counts_by_tier(join_limiter) == counts_before_refusal
+    neighbour, neighbour_answer = await join_once(101, case.neighbour_address)
+    assert neighbour_answer["type"] == "joined"
+    await neighbour.disconnect()
+    assert "2001:db8" not in caplog.text
 
 
-async def test_many_slash_64s_get_no_more_joins_than_the_slash_48_cap(
-    small_coarse_limiters: CoarseLimiters,
+@pytest.mark.parametrize("case", COARSE_TIER_CASES)
+async def test_join_refused_by_a_coarse_tier_charges_no_finer_tier(
+    case: TierCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    clients = []
-    answer_types = []
-    for number in range(10):
-        client, answer = await join_once(number, f"2001:db8:1:{number:x}::5")
-        clients.append(client)
-        answer_types.append(answer["type"])
-    assert answer_types.count("joined") == 2
-    for client in clients:
+    join_limiter = TieredSlidingWindowLimiter(1, JOIN_WINDOW_SECONDS, clock=FakeClock())
+    monkeypatch.setattr(consumers, "join_limiter", join_limiter)
+    allowed = case.clients_allowed_at_base_cap_1
+    for number in range(allowed):
+        client, _ = await join_once(number, case.address_for_number(number))
         await client.disconnect()
+
+    refused_address = case.address_for_number(allowed)
+    refused = await open_connected_client(refused_address)
+    await assert_connected_then_refused_on_join(refused, 100)
+
+    refused_keys = client_keys_of_address(refused_address)
+    for tier_index in range(case.tier_index + 1, len(CLIENT_TIERS)):
+        finer_tier = join_limiter.limiters[tier_index]
+        assert refused_keys[tier_index] not in finer_tier.event_times_by_client_key
+        assert finer_tier.tracked_client_count() == allowed
 
 
 @override_settings(TURN_SHARED_SECRET=SECRET, TURN_URLS=TURN_URLS)
-async def test_many_slash_64s_get_no_more_credentials_than_the_slash_48_cap(
-    small_coarse_limiters: CoarseLimiters, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("case", TIER_CASES)
+async def test_each_tier_withholds_turn_credentials_over_its_cap(
+    case: TierCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Joins are unlimited here, so only credentials are capped (2 per /48).
-    monkeypatch.setattr(consumers, "coarse_join_limiter", SlidingWindowLimiter(1000, 60.0))
-    clients = []
-    has_turn = []
-    for number in range(6):
-        client, answer = await join_once(number, f"2001:db8:1:{number:x}::5")
-        clients.append(client)
-        has_turn.append("turn" in answer)
-    assert has_turn == [True, True, False, False, False, False]
-    other, other_answer = await join_once(50, OTHER_48)
-    assert "turn" in other_answer
-    for client in [*clients, other]:
+    # A base cap of 1 credential: the /64 gets 1, the /56 4 and the /48 16 per window. Joins
+    # keep their real caps, which these few joins stay under.
+    credential_limiter = TieredSlidingWindowLimiter(
+        1, TURN_CREDENTIAL_WINDOW_SECONDS, clock=FakeClock()
+    )
+    monkeypatch.setattr(consumers, "turn_credential_limiter", credential_limiter)
+    allowed = case.clients_allowed_at_base_cap_1
+    for number in range(allowed):
+        client, answer = await join_once(number, case.address_for_number(number))
+        assert answer["type"] == "joined"
+        assert "turn" in answer
         await client.disconnect()
+    counts_before_refusal = event_counts_by_tier(credential_limiter)
+
+    refused, refused_answer = await join_once(100, case.address_for_number(allowed))
+
+    assert refused_answer["type"] == "joined"  # the join still works...
+    assert "turn" not in refused_answer  # ...without a relay
+    assert event_counts_by_tier(credential_limiter) == counts_before_refusal
+    await refused.disconnect()
+    neighbour, neighbour_answer = await join_once(101, case.neighbour_address)
+    assert neighbour_answer["type"] == "joined"
+    assert "turn" in neighbour_answer
+    await neighbour.disconnect()
 
 
 @override_settings(TURN_SHARED_SECRET=SECRET, TURN_URLS=TURN_URLS)
-async def test_refused_coarse_credential_gives_the_fine_credential_back(
-    small_coarse_limiters: CoarseLimiters, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("case", COARSE_TIER_CASES)
+async def test_credential_refused_by_a_coarse_tier_charges_no_finer_tier(
+    case: TierCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fine_credentials = SlidingWindowLimiter(1000, 3600.0)
-    monkeypatch.setattr(consumers, "turn_credential_limiter", fine_credentials)
-    monkeypatch.setattr(consumers, "coarse_join_limiter", SlidingWindowLimiter(1000, 60.0))
-    clients = [(await join_once(number, SAME_48_FIRST_64))[0] for number in range(4)]
-    (fine_event_times,) = fine_credentials.event_times_by_client_key.values()
-    assert len(fine_event_times) == 2  # only the two credentials actually issued are charged
-    for client in clients:
+    credential_limiter = TieredSlidingWindowLimiter(
+        1, TURN_CREDENTIAL_WINDOW_SECONDS, clock=FakeClock()
+    )
+    monkeypatch.setattr(consumers, "turn_credential_limiter", credential_limiter)
+    allowed = case.clients_allowed_at_base_cap_1
+    for number in range(allowed):
+        client, _ = await join_once(number, case.address_for_number(number))
         await client.disconnect()
 
+    refused_address = case.address_for_number(allowed)
+    refused, refused_answer = await join_once(100, refused_address)
+    assert refused_answer["type"] == "joined"
+    assert "turn" not in refused_answer
+    await refused.disconnect()
 
-async def test_refused_coarse_join_gives_the_fine_join_back(
-    small_coarse_limiters: CoarseLimiters, monkeypatch: pytest.MonkeyPatch
+    refused_keys = client_keys_of_address(refused_address)
+    for tier_index in range(case.tier_index + 1, len(CLIENT_TIERS)):
+        finer_tier = credential_limiter.limiters[tier_index]
+        assert refused_keys[tier_index] not in finer_tier.event_times_by_client_key
+        assert finer_tier.tracked_client_count() == allowed
+
+
+@pytest.mark.parametrize("case", TIER_CASES)
+async def test_each_tier_refuses_connections_over_its_cap(
+    case: TierCase, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    fine_joins = SlidingWindowLimiter(1000, 60.0)
-    monkeypatch.setattr(consumers, "join_limiter", fine_joins)
-    clients = [(await join_once(number, SAME_48_FIRST_64))[0] for number in range(4)]
-    (fine_event_times,) = fine_joins.event_times_by_client_key.values()
-    assert len(fine_event_times) == 2
-    for client in clients:
-        await client.disconnect()
-
-
-async def test_connections_from_many_slash_64s_share_the_slash_48_connection_cap(
-    small_coarse_limiters: CoarseLimiters,
-) -> None:
-    _, _, coarse_connections = small_coarse_limiters
+    # A base cap of 1 connection: the /64 holds 1, the /56 4 and the /48 16 at once.
+    connection_limiter = TieredConnectionLimiter(1, MAX_CONNECTIONS_TOTAL)
+    monkeypatch.setattr(consumers, "connection_limiter", connection_limiter)
+    allowed = case.clients_allowed_at_base_cap_1
     accepted = [
-        await open_connected_client(SAME_48_FIRST_64),
-        await open_connected_client(SAME_48_SECOND_64),
+        await open_connected_client(case.address_for_number(number)) for number in range(allowed)
     ]
-    await assert_refused_with_rate_limited(await open_connected_client(SAME_48_THIRD_64))
-    other = await open_connected_client(OTHER_48)
-    await other.send_to(text_data=PING)
-    assert json.loads(await other.receive_from()) == PONG
+    slots_before_refusal = connection_counts_by_tier_and_key(connection_limiter)
 
-    # The refused connection gave its /64 slot back, so nothing leaks.
-    assert consumers.connection_limiter.total_connection_count == 3
-    assert coarse_connections.total_connection_count == 3
-    for client in [*accepted, other]:
+    refused = open_client(case.address_for_number(allowed))
+    connected, _ = await refused.connect()
+    assert connected  # accepted, then told `rate-limited` and closed
+    # Right after connect() returns, before the close is read: it holds no slot in any tier.
+    assert connection_limiter.total_connection_count == allowed
+    assert connection_counts_by_tier_and_key(connection_limiter) == slots_before_refusal
+    await assert_refused_with_rate_limited(refused)
+    assert connection_counts_by_tier_and_key(connection_limiter) == slots_before_refusal
+
+    neighbour = await open_connected_client(case.neighbour_address)
+    await neighbour.send_to(text_data=PING)
+    assert json.loads(await neighbour.receive_from()) == PONG
+    for client in [*accepted, neighbour]:
         await client.disconnect()
-    assert_no_connections_counted(consumers.connection_limiter)
-    assert_no_connections_counted(coarse_connections)
+    assert_no_connections_counted(connection_limiter)
 
 
-async def test_ipv4_clients_never_touch_the_coarse_limiters(
-    small_coarse_limiters: CoarseLimiters,
+async def test_ipv4_clients_never_touch_the_coarse_tiers(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    coarse_join, coarse_turn, coarse_connections = small_coarse_limiters
+    join_limiter = TieredSlidingWindowLimiter(5, JOIN_WINDOW_SECONDS, clock=FakeClock())
+    monkeypatch.setattr(consumers, "join_limiter", join_limiter)
     clients = []
-    for number in range(5):  # more than the coarse cap of 2
+    for number in range(5):
         client, answer = await join_once(number)
         assert answer["type"] == "joined"
         clients.append(client)
-    assert coarse_join.tracked_client_count() == 0
-    assert coarse_turn.tracked_client_count() == 0
-    assert_no_connections_counted(coarse_connections)
+    assert [tier.tracked_client_count() for tier in join_limiter.limiters] == [0, 0, 1]
+    assert connection_counts_by_tier(consumers.connection_limiter) == [0, 0, 5]
     for client in clients:
         await client.disconnect()
 
 
-async def test_forged_forwarded_for_from_an_untrusted_peer_does_not_pick_the_slash_48(
-    small_coarse_limiters: CoarseLimiters,
+async def test_forged_forwarded_for_from_an_untrusted_peer_does_not_pick_the_prefixes(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # No proxy is trusted, so the forged header is ignored and the peer's own /48 is counted.
-    clients = []
-    answer_types = []
-    for number in range(4):
-        client, answer = await join_once(number, SAME_48_FIRST_64, forwarded_for=OTHER_48)
-        clients.append(client)
-        answer_types.append(answer["type"])
-    assert answer_types.count("joined") == 2
-    other, other_answer = await join_once(9, OTHER_48)
-    assert other_answer["type"] == "joined"  # the forged /48 was never charged
-    for client in [*clients, other]:
-        await client.disconnect()
+    # No proxy is trusted, so the forged header is ignored and the peer's own prefixes count.
+    join_limiter = TieredSlidingWindowLimiter(1, JOIN_WINDOW_SECONDS, clock=FakeClock())
+    monkeypatch.setattr(consumers, "join_limiter", join_limiter)
+    client, answer = await join_once(1, IPV6_CLIENT_IP, forwarded_for=OTHER_48_IP)
+    assert answer["type"] == "joined"
+    await client.disconnect()
+
+    refused = open_client(IPV6_CLIENT_IP, forwarded_for="2001:db8:3:1::5")
+    await refused.connect()
+    await assert_connected_then_refused_on_join(refused, 2)
+
+    other, other_answer = await join_once(3, OTHER_48_IP)
+    assert other_answer["type"] == "joined"  # the forged prefixes were never charged
+    await other.disconnect()
+
+
+@pytest.mark.parametrize("proxy_ip", [PROXY_IP, "2001:db8:ffff::10"])
+async def test_behind_a_trusted_proxy_every_tier_counts_the_rightmost_entry(
+    proxy_ip: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted_application = _application_trusting(monkeypatch, proxy_ip)
+    real_ip = "2001:db8:a:1::5"  # /48 A, added by the proxy
+    forged_ip = "2001:db8:b:1::5"  # /48 B, sent by the client
+    client = _client_for(trusted_application, proxy_ip, f"{forged_ip}, {real_ip}")
+    await client.connect()
+    await client.send_to(text_data=join_text(1))
+    assert json.loads(await client.receive_from())["type"] == "joined"
+
+    # Every tier holds A's key only: not B's, and not the proxy's.
+    real_keys = client_keys_of_address(real_ip)
+    joins_by_tier = [
+        list(tier.event_times_by_client_key) for tier in consumers.join_limiter.limiters
+    ]
+    assert joins_by_tier == [[key] for key in real_keys]
+    assert connection_counts_by_tier_and_key(consumers.connection_limiter) == [
+        {key: 1} for key in real_keys
+    ]
+    await client.disconnect()
+
+
+# 203.0.113.7 (CLIENT_IP) inside each kind of transition address.
+TRANSITION_ADDRESSES_OF_CLIENT_IP = [
+    pytest.param("2002:cb00:7107::1", id="6to4"),
+    pytest.param("2001:0:4136:e378:8000:63bf:34ff:8ef8", id="teredo"),
+    pytest.param("64:ff9b::203.0.113.7", id="nat64"),
+]
+
+
+@pytest.mark.parametrize("transition_ip", TRANSITION_ADDRESSES_OF_CLIENT_IP)
+async def test_transition_address_shares_the_bucket_of_its_ipv4(
+    transition_ip: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    join_limiter = TieredSlidingWindowLimiter(1, JOIN_WINDOW_SECONDS, clock=FakeClock())
+    monkeypatch.setattr(consumers, "join_limiter", join_limiter)
+    ipv4_client, ipv4_answer = await join_once(1, CLIENT_IP)
+    assert ipv4_answer["type"] == "joined"
+    await ipv4_client.disconnect()
+
+    transition_client = await open_connected_client(transition_ip)
+    await assert_connected_then_refused_on_join(transition_client, 2)
+
+    # Counted as IPv4: once, by the finest tier, with no /48 or /56 of its own.
+    assert [tier.tracked_client_count() for tier in join_limiter.limiters] == [0, 0, 1]

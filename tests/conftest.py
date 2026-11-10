@@ -2,9 +2,6 @@ import pytest
 
 from signaling import consumers
 from signaling.rate_limits import (
-    new_coarse_connection_limiter,
-    new_coarse_join_limiter,
-    new_coarse_turn_credential_limiter,
     new_connection_limiter,
     new_join_limiter,
     new_turn_credential_limiter,
@@ -17,8 +14,3 @@ def fresh_rate_limiters(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(consumers, "join_limiter", new_join_limiter())
     monkeypatch.setattr(consumers, "turn_credential_limiter", new_turn_credential_limiter())
     monkeypatch.setattr(consumers, "connection_limiter", new_connection_limiter())
-    monkeypatch.setattr(consumers, "coarse_join_limiter", new_coarse_join_limiter())
-    monkeypatch.setattr(
-        consumers, "coarse_turn_credential_limiter", new_coarse_turn_credential_limiter()
-    )
-    monkeypatch.setattr(consumers, "coarse_connection_limiter", new_coarse_connection_limiter())
