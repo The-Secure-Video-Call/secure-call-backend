@@ -52,9 +52,9 @@ REFUSED_PEERS = [
 Credentials = tuple[bytes, bytes, bytes, bytes]
 
 
-def xor_peer_address(peer: str, transaction_id: bytes) -> bytes:
+def xor_peer_address(peer: str, transaction_id: bytes, port: int = 9) -> bytes:
     address = ipaddress.ip_address(peer)
-    port_field = struct.pack("!H", 9 ^ (MAGIC_COOKIE >> 16))
+    port_field = struct.pack("!H", port ^ (MAGIC_COOKIE >> 16))
     cookie = struct.pack("!I", MAGIC_COOKIE)
     if address.version == 4:
         masked = bytes(a ^ b for a, b in zip(address.packed, cookie, strict=True))

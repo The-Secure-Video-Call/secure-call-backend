@@ -70,9 +70,11 @@ the bandwidth quota). It checks that:
   (`11.0.0.1`, `100.128.0.1`, `172.32.0.1`, `198.20.0.1`, `1.1.1.1`) are allowed;
 - a raw STUN probe (`coturn/address_family_probe.py`) gets `440` for an IPv6 relay request, and
   `403` or `443` from CreatePermission for 7 IPv6 and IPv4-mapped peers on an IPv4 allocation
-  (with a public IPv4 peer as a control that must succeed). It also gets `403` for the test's
-  stand-in public IP (`--denied-peer-ip`, as on the Pi) and for the relay's own IP;
-- turnserver is pid 1 with `CapEff` 0 and `NoNewPrivs` 1;
+  (with a public IPv4 peer as a control that must succeed). CreatePermission for the stand-in
+  public IP and for the relay's own IP is printed but not asserted (see "Our own addresses");
+- a second raw STUN probe (`coturn/relay_reachability_probe.py`) checks where packets go (see
+  "Our own addresses");
+- turnserver is pid 1 and not root (`Uid` and `Gid` non-zero), with `CapEff` 0 and `NoNewPrivs` 1;
 - logs contain no username or peer IP, the config enables no `verbose`, `syslog` or
   `log-binding`, no log files exist in the container, and the CLI port is closed.
 
@@ -84,6 +86,39 @@ mapped forms of the private ranges. No `denied-peer-ip` range may start at `0.0.
 (the ranges start at `0.0.0.1` and `::ffff:0.0.0.1`), because an "any" address as the lower
 bound matches every peer: removing `denied-peer-ip=::` is what made public peers work in CI
 run 42690621732.
+
+### Our own addresses
+
+CI run 42770315949 showed that CreatePermission for the stand-in public IP (also passed as
+`--denied-peer-ip`) and for the relay's own IP returns success. That is deliberate in coturn: two
+clients relaying through the same server must reach each other's relay addresses, and in privacy
+mode both people use this relay. A permission is not data, so `relay_reachability_probe.py` tests
+where packets go:
+
+- **Relay to relay must work:** allocation A permits B's relayed address (the public form), sends,
+  and B must receive it; then the same from B to A.
+- **Nothing else may be reached through our own addresses:** UDP listeners on the relay IP
+  (port 40001) and on `127.0.0.1` (port 40002), outside the relay port range, must receive nothing
+  when an allocation sends to the public IP, the relay IP and loopback (after trying to create
+  permissions). A self-check first proves the listeners can receive.
+
+If the listeners ever receive something, coturn forwards to a non-relay port on its own address
+(on the Pi: the Pi's or the router's own UDP services). That needs another control, such as a
+firewall rule on the Pi, not a weaker config. Result: pending the next CI run. `--denied-peer-ip`
+for the public IP stays until that run shows whether it blocks relay-to-relay or nothing at all;
+this section will then say which. The flag is defence in depth, not the control: the control is
+coturn's rewrite of the public IP to the relay IP. The loopback listener passes either way (nothing
+received); if the deny list refuses the permission, the output says so and it is not a hairpin
+test. Not covered yet: a packet that really leaves for the WAN address (it would need the
+stand-in address added to the runner's loopback). If a firewall rule is ever needed, a dedicated
+uid instead of the shared 65534 would make an owner match precise.
+
+turnserver must be able to read the mounted config: keep `coturn/turnserver.conf` world-readable
+(`chmod 644`) on the Pi, or it fails at startup as a non-root user.
+
+turnserver runs as `65534:65534` (`user:` in compose, `--user` in the test): with
+`entrypoint: ['turnserver']` the image's own switch to an unprivileged user is skipped, and CI run
+42770315949 showed `CapEff 0x400`, a root process.
 
 ### IPv6
 

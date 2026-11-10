@@ -187,7 +187,7 @@ cleanup
 # below also covers a nonce rotation; the Pi keeps the config's default).
 docker run -d --name "$container_name" --network host --read-only \
   --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges:true \
-  --ulimit core=0 \
+  --ulimit core=0 --user 65534:65534 \
   --tmpfs /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /var/log:size=1m,mode=1777,noexec,nosuid,nodev \
@@ -224,14 +224,19 @@ startup_banner="$(docker logs "$container_name" 2>&1 | strip_log_prefix | sort -
 # turnserver is pid 1 (entrypoint) and must run with no effective capabilities: the file
 # capability NET_BIND_SERVICE is not granted under no-new-privileges. A compromised turnserver on
 # the host network could otherwise bind ports below 1024 (53, 67, ...) on the home LAN.
-process_status="$(docker exec -u 0 "$container_name" sh -c 'cat /proc/1/comm; grep -E "^(CapEff|NoNewPrivs):" /proc/1/status' 2>&1)"
+process_status="$(docker exec -u 0 "$container_name" sh -c 'cat /proc/1/comm; grep -E "^(Uid|Gid|CapEff|NoNewPrivs):" /proc/1/status' 2>&1)"
+echo "turnserver process (pid 1):"; sed 's/^/    /' <<<"$process_status"
+# Uid and Gid are "real effective saved filesystem": none may be 0 (turnserver never runs as root;
+# --user 65534:65534 is set because --entrypoint turnserver skips the image's switch of user).
 if [ "$(sed -n '1p' <<<"$process_status")" = "turnserver" ] \
+  && grep -Eq '^Uid:([[:space:]]+[1-9][0-9]*){4}$' <<<"$process_status" \
+  && grep -Eq '^Gid:([[:space:]]+[1-9][0-9]*){4}$' <<<"$process_status" \
   && grep -Eq '^CapEff:[[:space:]]+0+$' <<<"$process_status" \
   && grep -Eq '^NoNewPrivs:[[:space:]]+1$' <<<"$process_status"; then
-  echo "PASS: turnserver is pid 1 with CapEff 0 and NoNewPrivs 1"
+  echo "PASS: turnserver is pid 1, not root (Uid/Gid non-zero), with CapEff 0 and NoNewPrivs 1"
 else
-  echo "FAIL: turnserver is not pid 1 with CapEff 0 and NoNewPrivs 1:"
-  echo "$process_status" | head -n 5
+  echo "FAIL: turnserver is not pid 1 as a non-root user with CapEff 0 and NoNewPrivs 1:"
+  echo "$process_status" | head -n 6
   failures=$((failures + 1))
 fi
 
@@ -281,14 +286,42 @@ expect_probe() {
 # 440 Address Family not Supported: the relay has no IPv6 address. Control: a public IPv4 peer works.
 expect_probe "ipv6 relay request" "error 440"
 expect_probe "permission $public_peer" "success"
+# The public IP (also --denied-peer-ip) and the relay's own IP: CI showed coturn answers
+# CreatePermission with success for both, because it exempts its own addresses from the deny list
+# (two clients on the same relay must reach each other's relay addresses). A permission is not
+# data, so these two are informational here; Group 5 checks where packets really go.
+grep -E "^PROBE permission ($test_public_ip|$relay_ip):" <<<"$address_family_output" | sed 's/^/NOTE (informational): /'
 # 403 Forbidden (deny list) or 443 Peer Address Family Mismatch (IPv6 peer on an IPv4 relay).
-# 403 for the home's public IP (explicit --denied-peer-ip, not only coturn's rewrite of the
-# external IP to the relay IP: a hairpin to the router's own services) and for the relay's own IP.
-expect_probe "permission $test_public_ip" "error 403"
-expect_probe "permission $relay_ip" "error 403"
 for ipv6_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
   expect_probe "permission $ipv6_peer" "error (403|443)"
 done
+
+restart_or_exit
+echo "== Group 5: relay-to-relay works, our own addresses reach nothing else (raw STUN) =="
+read -r reach_user_a reach_pass_a < <(make_credential 600)
+read -r reach_user_b reach_pass_b < <(make_credential 600)
+echo "127.0.0.1" >>"$peers_file"
+reachability_output="$(python3 "$here/relay_reachability_probe.py" "$reach_user_a" "$reach_pass_a" \
+  "$reach_user_b" "$reach_pass_b" "$test_public_ip" "$relay_ip" 2>&1)"
+reachability_exit_code=$?
+echo "$reachability_output"
+expect_reachability() {
+  if [ "$reachability_exit_code" -eq 0 ] && grep -Eq "^PROBE $1: $2\$" <<<"$reachability_output"; then
+    echo "PASS: $1 -> $2"
+  else
+    echo "FAIL: $1 (wanted $2; probe exit code $reachability_exit_code)"; failures=$((failures + 1))
+  fi
+}
+# Privacy mode on both sides: each allocation reaches the other's relayed address.
+expect_reachability "relay A->B" "delivered"
+expect_reachability "relay B->A" "delivered"
+# The hairpin / self-reach case: the listeners on the relay's own IP and on loopback (ports outside
+# the relay range) receive nothing. If either says RECEIVED, coturn forwards to a non-relay port on
+# its own address: stop, do not weaken anything, and report it with this output.
+# The relay-IP listener only counts when the permission succeeded (coturn drops a Send without one).
+# The loopback listener may also pass because the deny list refused the permission (printed).
+expect_reachability "listener $relay_ip:40001" "nothing received \(permission success\)"
+expect_reachability "listener 127.0.0.1:40002" "nothing received \(.*\)"
 
 # Refresh-after-expiry probe (result recorded in README.md for #26, informational, not asserted):
 # allocate with a credential that expires 5 s later, wait 25 s (longer than the test-only

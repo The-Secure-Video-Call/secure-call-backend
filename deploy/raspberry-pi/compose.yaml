@@ -88,6 +88,11 @@ services:
     # No core dumps: a crash must not write memory (which holds the secret) to disk.
     ulimits:
       core: 0
+    # Never root: with `entrypoint: turnserver` the image's own switch to an unprivileged user is
+    # skipped (CI run 42770315949 showed CapEff 0x400, i.e. root), so the user is set here
+    # (65534 = nobody). Keep identical to the --user flag in coturn/test-coturn.sh, which asserts
+    # that turnserver's Uid and Gid are not 0 and that CapEff is 0.
+    user: '65534:65534'
     # Start turnserver directly as pid 1, so the image's shell entrypoint never expands the
     # secret. Found through PATH, so it works wherever the image keeps the binary.
     entrypoint: ['turnserver']
@@ -100,9 +105,10 @@ services:
       # Replacing the image's default command drops its external-ip detection; behind a
       # home NAT the relay must advertise the public IP: "<public-ip>/<pi-lan-ip>".
       - '--external-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}/${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
-      # The home's public IP is also denied as a peer, explicitly. Otherwise only coturn's
-      # rewrite of the external IP to the relay IP protects the router: a wrong TURN_PUBLIC_IP
-      # would let peers at the real WAN IP be relayed (hairpin NAT) to the router's own services.
+      # The home's public IP is also denied as a peer: defence in depth only. CI showed coturn
+      # still answers CreatePermission for it with success (it exempts its own addresses); the
+      # real control is coturn's rewrite of the public IP to the relay IP, and the
+      # relay-reachability test checks where packets go. The config file must be world-readable.
       - '--denied-peer-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}'
       # Relays only on the Pi's LAN IPv4 (the second half of --external-ip), never on IPv6.
       - '--relay-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
