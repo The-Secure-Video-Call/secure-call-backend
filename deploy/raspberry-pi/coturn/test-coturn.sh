@@ -353,8 +353,9 @@ done
 restart_or_exit
 echo "== Group 2: range edges are denied =="
 # 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24 and 192.88.99.0/24: one probe per range at each
-# edge. All are documentation or retired blocks. 203.0.113.7 (the stand-in public IP) is not
-# probed here: coturn exempts its own external IP (Group 4 and 5 cover it).
+# edge (documentation blocks, and the deprecated 6to4 anycast block). 203.0.113.7 (the stand-in
+# public IP) is not probed here: coturn maps it to the relay's private address, which is allowed
+# before any deny range; Group 5's relay-to-relay check asserts that.
 for edge_peer in 0.0.0.1 100.127.255.255 172.31.255.255 198.19.0.1 192.0.0.1 240.0.0.1 255.255.255.255 \
   192.0.2.1 192.0.2.255 198.51.100.1 198.51.100.255 203.0.113.1 203.0.113.255 192.88.99.1 192.88.99.255; do
   expect "range edge $edge_peer refused" forbidden "$(run_client 600 "$edge_peer")"

@@ -23,8 +23,9 @@ The Pi's LAN IP (192.168/16 or 10/8) and the bridge gateway (172.16/12) are cove
 deny ranges. **Accepted by design:** sending to another port on coturn's own container address can
 only reach coturn itself, because nothing else runs in that container.
 
-**Limits:** the deny ranges cover RFC 1918 and CGNAT space only; if the home LAN or Docker's
-address pools use other space, nothing denies it. The subnet `172.30.200.0/29` must not overlap
+**Limits:** the deny ranges cover RFC 1918, CGNAT and the other IANA special-purpose IPv4 blocks
+listed in `coturn/turnserver.conf`; if the home LAN or Docker's address pools use public address
+space, nothing denies it. The subnet `172.30.200.0/29` must not overlap
 another Docker network. The deny list constrains peers requested through the TURN protocol, not
 code running inside a compromised container: that could still reach the Pi's services through the
 gateway `172.30.200.1`, which is why the container has no capabilities, no-new-privileges and a
@@ -38,6 +39,12 @@ back. The first start, and every change to the Dockerfile, needs `docker compose
 coturn`. `update.sh` only runs `pull backend` and `up -d backend`, so it never builds or restarts
 coturn (and, as `--build` is not used, never rebuilds it): upgrading coturn is a manual
 `docker compose up -d --build coturn` after changing the digest in the Dockerfile.
+
+**Changing only `coturn/turnserver.conf`** (for example the deny list): the file is bind-mounted,
+not built into the image, and coturn reads it only at start. `--build` then changes nothing and
+compose does not recreate the container. After `git pull`, run
+`docker compose up -d --force-recreate coturn` (or `docker compose restart coturn`) when no call
+is running.
 
 **Pi time sync:** the REST credentials carry a Unix expiry time, so coturn and the backend need a
 correct clock, including right after a reboot (a Pi has no battery clock). Enable
@@ -159,7 +166,8 @@ the bandwidth quota). It checks that:
 - 8 private, loopback, link-local, multicast and unspecified IPv4 peers get
   `channel bind: error 403 (Forbidden IP)`;
 - the edges of each denied range (`0.0.0.1`, `100.127.255.255`, `172.31.255.255`, `198.19.0.1`,
-  `192.0.0.1`, `240.0.0.1`, `255.255.255.255`) get the same refusal, and their neighbours
+  `192.0.0.1`, `240.0.0.1`, `255.255.255.255`, and `.1` and `.255` of `192.0.2.0/24`,
+  `198.51.100.0/24`, `203.0.113.0/24` and `192.88.99.0/24`) get the same refusal, and their neighbours
   (`11.0.0.1`, `100.128.0.1`, `172.32.0.1`, `198.20.0.1`, `1.1.1.1`) are allowed;
 - a raw STUN probe (`coturn/address_family_probe.py`) gets `440` for an IPv6 relay request, and
   `403` or `443` from CreatePermission for 7 IPv6 and IPv4-mapped peers on an IPv4 allocation
