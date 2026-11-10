@@ -67,6 +67,28 @@ burst of 100 messages refilled at 20 per second. Over a join or message limit th
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.
 
+## Security headers
+
+Every HTTP response (`/healthz`, errors and redirects included) carries:
+
+| Header | Value | Set by |
+|---|---|---|
+| `Strict-Transport-Security` | `max-age=31536000; includeSubDomains` (once) | Django settings |
+| `X-Content-Type-Options` | `nosniff` | Django settings |
+| `Referrer-Policy` | `no-referrer` | Django settings |
+| `Cross-Origin-Opener-Policy` | `same-origin` | Django settings |
+| `X-Frame-Options` | `DENY` | Django settings |
+| `Content-Security-Policy` | `default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'` | `signaling/response_headers.py` |
+| `Permissions-Policy` | `camera=(), microphone=(), geolocation=(), display-capture=()` | `signaling/response_headers.py` |
+| `Cross-Origin-Resource-Policy` | `same-origin` | `signaling/response_headers.py` |
+
+Not covered: responses Daphne or the proxy produce before Django runs (for example a malformed
+HTTP request) and the WebSocket handshake rejections from the Origin check. The `Server` header
+comes from Nginx Proxy Manager, not from this app; hiding version details there (for example
+`server_tokens off`) is the owner's setting.
+
+Check the live headers with `curl -sI https://signal.securevideocall.com/healthz`.
+
 ## Database (PostgreSQL)
 
 The database is connected now but holds nothing yet. It is reserved for future user accounts and
