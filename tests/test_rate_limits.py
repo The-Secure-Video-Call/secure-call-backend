@@ -770,6 +770,66 @@ async def test_connection_that_joins_in_time_stays_open(
     await client.disconnect()
 
 
+# --- Sockets that leave a room ----------------------------------------------------------------
+
+JOIN_TEXT = json.dumps({"v": 1, "type": "join", "roomId": "L" * 22})
+LEAVE_TEXT = json.dumps({"v": 1, "type": "leave"})
+
+
+async def join_then_leave(client: WebsocketCommunicator) -> None:
+    await client.send_to(text_data=JOIN_TEXT)
+    assert json.loads(await client.receive_from())["type"] == "joined"
+    await client.send_to(text_data=LEAVE_TEXT)
+
+
+async def test_socket_that_leaves_and_idles_is_closed(
+    small_connection_limiter: TieredConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.2)
+    client = await open_connected_client()
+    await join_then_leave(client)
+    await client.send_to(text_data=PING)  # answering pings does not keep it open
+    assert json.loads(await client.receive_from()) == PONG
+
+    assert await client.receive_output() == {
+        "type": "websocket.close",
+        "code": consumers.CLOSE_POLICY_VIOLATION,
+    }
+    await client.disconnect()
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_socket_that_leaves_and_joins_again_in_time_stays_open(
+    small_connection_limiter: TieredConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.3)
+    client = await open_connected_client()
+    await join_then_leave(client)
+    await client.send_to(text_data=JOIN_TEXT)
+    assert json.loads(await client.receive_from())["type"] == "joined"
+
+    await asyncio.sleep(0.6)  # past the timeout: joining again cancelled it
+    await client.send_to(text_data=PING)
+    assert json.loads(await client.receive_from()) == PONG
+    await client.disconnect()
+
+
+async def test_socket_is_closed_when_it_joins_again_only_after_the_timeout(
+    small_connection_limiter: TieredConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.1)
+    client = await open_connected_client()
+    await join_then_leave(client)
+    await asyncio.sleep(0.3)
+
+    assert await client.receive_output() == {
+        "type": "websocket.close",
+        "code": consumers.CLOSE_POLICY_VIOLATION,
+    }
+    await client.disconnect()
+    assert_no_connections_counted(small_connection_limiter)
+
+
 # --- IPv6 tiers: /48, /56 and /64 ------------------------------------------------------------
 
 OTHER_48_IP = "2001:db8:2:1::5"

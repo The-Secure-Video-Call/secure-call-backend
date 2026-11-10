@@ -73,7 +73,12 @@ and closes with application code `4029`.
 
 Open connections are capped at 20 per client and 500 in total (per process); over a cap the socket
 is accepted, sent `error rate-limited` and closed with `4029`. A connection that sends no `join`
-within 10 s is closed with `4008`.
+within 10 s is closed with `4008`; the same applies for 10 s after a `leave` (the client may
+`join` again in that time). A socket's total lifetime is capped by Daphne's `--websocket_timeout`,
+set in the `Dockerfile` to 14700 s (4 h room limit + 5 min; Daphne's default is 24 h), after which
+it is closed. The cap counts from when the socket opened, not from when a room was joined, so a
+client that leaves and joins a new room on the same socket can be closed (code `1000`) before that
+room's own 4 h are up, and should reconnect.
 
 IPv6 clients are also counted by their /56 and their /48, with 4 and 16 times the caps:
 

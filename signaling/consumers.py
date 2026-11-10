@@ -9,8 +9,9 @@ Security rules (PLAN.md 3.5):
 - bad connections are closed with application codes, because Daphne (Autobahn) only lets an
   application send 1000 or 3000-4999 (anything else raises and skips `disconnect`):
   4003 unsupported data (a binary frame), 4008 policy violation (a malformed or invalid message,
-  or no `join` within JOIN_TIMEOUT_SECONDS), 4009 message too big, 4029 rate limited (too many
-  joins, messages or open connections; `error rate-limited` is sent first; see rate_limits.py).
+  or no `join` within JOIN_TIMEOUT_SECONDS of connecting or of a `leave`), 4009 message too big,
+  4029 rate limited (too many joins, messages or open connections; `error rate-limited` is sent
+  first; see rate_limits.py).
   1000 stays the normal close (`room-full`, `room-expired`);
 - open connections are capped per client and in total. Over a cap the socket is accepted, sent
   `error rate-limited` and closed with 4029 rather than refused at the handshake: the web client
@@ -111,6 +112,12 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.close(code=CLOSE_RATE_LIMITED)
             return
+        self.start_join_timeout()
+
+    def start_join_timeout(self) -> None:
+        """Close the socket with 4008 unless it joins a room within JOIN_TIMEOUT_SECONDS."""
+        self.cancel_join_timeout()
+        self.join_attempted = False
         self.join_timeout_task = asyncio.create_task(self.close_if_not_joined())
 
     def release_connection_slot(self) -> None:
@@ -166,6 +173,9 @@ class SignalingConsumer(AsyncWebsocketConsumer):
                 await self.send_message(ErrorMessage(code="bad-message"))
             else:
                 await self.leave_room()
+                # Out of a room, the socket gets the same short window as a new one, so it
+                # cannot sit idle (ping/pong keeps it alive) until Daphne's websocket timeout.
+                self.start_join_timeout()
 
     async def join_room(self, room_id: str) -> None:
         if self.room_id is not None:
