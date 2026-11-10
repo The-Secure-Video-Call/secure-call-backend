@@ -107,13 +107,22 @@ puts a file capability on the `turnserver` binary, and the kernel refuses to sta
 Checked in CI (an earlier run, before the allow-list and `cap_drop`): the dated log file has 2 startup lines and no test username or
 peer IP; `/dev/shm/mongoc-1` holds only binary counters; `/var/tmp/turnserver.pid` is the pid.
 
+**coturn's console output is discarded** (`logging: driver: none` in `compose.yaml`). Even with
+logging off, coturn prints the TURN username of every failed login to its console (for example
+internet scanners trying random logins), and Docker would otherwise save that on the Pi's disk.
+So `docker compose logs coturn` shows nothing. To debug a coturn that will not start, set the
+driver to `json-file` temporarily, look, and set it back.
+
 The test inspects the container (as root, before each restart and at the end): a log file on the
 real filesystem fails, and a file on the tmpfs mounts is printed (masked) and fails if it contains
-a test username or peer IP. `docker logs` may contain only the line `[INFO: ]log file opened:
-/var/log/<name>`, `System cpu num is <n>`, `System enable num is <n>`, and `Black listing: <range>`
-(only when the range is a `denied-peer-ip` line parsed from `turnserver.conf`); any other line fails, so any
-`WARNING` or `ERROR` fails. Startup errors are therefore not visible in `docker logs`; to
-debug, temporarily run coturn by hand with a different config.
+a test username or peer IP. The test container keeps Docker's default logs only so it can check
+what coturn prints:
+- coturn's startup banner (captured before any client connects, so it holds no user data) has no
+  `WARNING` or `ERROR` line, and coturn loaded exactly the `denied-peer-ip` ranges of `turnserver.conf`;
+- after all the test traffic, the only lines beyond the banner are allocation counters and the
+  failed-login lines for the test's own deliberate failures (wrong password, expired login);
+- the username of a login that worked never appears;
+- `compose.yaml` keeps coturn's console output discarded.
 
 Follow-up (not done): the `NET_BIND_SERVICE` capability exists only because of the file capability on
 `turnserver`. A small derived image that runs `setcap -r` on the binary would allow `cap_drop: ALL` plus

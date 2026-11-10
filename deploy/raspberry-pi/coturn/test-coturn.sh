@@ -12,10 +12,12 @@ container_name="coturn-test"
 failures=0
 
 usernames_file="$(mktemp)"
+# Usernames of the deliberate failures (wrong password, expired): coturn may log these.
+failed_login_usernames_file="$(mktemp)"
 peers_file="$(mktemp)"
 denied_ranges_file="$(mktemp)"
 
-cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file" "$peers_file" "$denied_ranges_file"; }
+cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file" "$failed_login_usernames_file" "$peers_file" "$denied_ranges_file"; }
 trap cleanup EXIT
 
 # $1 = seconds until the credential expires (negative = already expired). Prints
@@ -37,6 +39,7 @@ run_client() {
   read -r username password < <(make_credential "$1")
   echo "$2" >>"$peers_file"
   if [ -n "${3-}" ]; then password="$3"; fi
+  if [ -n "${3-}" ] || [ "$1" -lt 0 ]; then echo "$username" >>"$failed_login_usernames_file"; fi
   local client_output client_exit_code
   client_output="$(docker exec "$container_name" timeout 20 turnutils_uclient -v -u "$username" -w "$password" -e "$2" -n 1 -m 1 127.0.0.1 2>&1)"
   client_exit_code=$?
@@ -281,19 +284,38 @@ if [ "$listed_ranges" != "$(cat "$denied_ranges_file")" ]; then
   failures=$((failures + 1))
 fi
 server_logs="$(docker logs "$container_name" 2>&1)"
-# The one runtime line coturn 4.6.3 prints even with logging off is an allocation counter (no
-# username, no address), so exactly that pattern is allowed too.
-new_log_lines="$(strip_log_prefix <<<"$server_logs" | grep -v '^[[:space:]]*$' | grep -v -x -F -f <(printf '%s\n' "$startup_banner") \
-  | grep -v -x -E 'DEBUG: Global turn allocation count (incremented|decremented), now [0-9]+' || true)"
+# Besides the banner, coturn 4.6.3 prints two kinds of runtime lines with logging off:
+#   - an allocation counter (no username, no address);
+#   - "check_stun_auth: Cannot find credentials of user <name>" for a failed login.
+# On the Pi, compose.yaml discards coturn's console output (logging driver "none"), so neither
+# reaches the disk; this test container keeps Docker's default logs only to inspect them. A
+# failed-login line is accepted here only for the test's own deliberate failures, and the
+# username of a login that worked must never appear anywhere.
+if ! awk '/^  coturn:/{in_coturn=1; next} /^  [a-z]/{in_coturn=0} in_coturn && /^ +driver: none$/{found=1} END{exit !found}' "$here/../compose.yaml"; then
+  echo "FAIL: compose.yaml does not discard coturn's console output (logging driver none)"
+  failures=$((failures + 1))
+fi
+new_log_lines=""
+while IFS= read -r log_line; do
+  [ -z "${log_line//[[:space:]]/}" ] && continue
+  grep -Fxq -e "$log_line" <<<"$startup_banner" && continue
+  [[ "$log_line" =~ ^DEBUG:\ Global\ turn\ allocation\ count\ (incremented|decremented),\ now\ [0-9]+$ ]] && continue
+  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ check_stun_auth:\ Cannot\ find\ credentials\ of\ user\ \<(.+)\>$ ]] \
+    && grep -Fxq -e "${BASH_REMATCH[1]}" "$failed_login_usernames_file"; then
+    continue
+  fi
+  new_log_lines+="$log_line"$'\n'
+done < <(strip_log_prefix <<<"$server_logs")
+valid_usernames="$(grep -v -x -F -f "$failed_login_usernames_file" "$usernames_file" || true)"
 if [ -n "$new_log_lines" ]; then
   echo "FAIL: coturn logged lines beyond its startup banner during the test (values masked):"
-  printf '%s\n' "$new_log_lines" | head -n 10 | mask_values
+  printf '%s' "$new_log_lines" | head -n 10 | mask_values
   failures=$((failures + 1))
-elif grep -Fwq -f "$usernames_file" <<<"$server_logs"; then
-  echo "FAIL: coturn logs contain a test username (values masked)"
+elif [ -n "$valid_usernames" ] && grep -Fwq -f <(printf '%s\n' "$valid_usernames") <<<"$server_logs"; then
+  echo "FAIL: coturn logs contain the username of a login that worked (values masked)"
   failures=$((failures + 1))
 else
-  echo "PASS: docker logs hold only coturn's startup banner ($(wc -l <"$denied_ranges_file" | tr -d ' ') deny ranges, all from the config), no username, no session or peer line, no WARNING or ERROR"
+  echo "PASS: docker logs hold only coturn's startup banner ($(wc -l <"$denied_ranges_file" | tr -d ' ') deny ranges, all from the config), allocation counters and the deliberate failed logins; no other username, no session or peer line, no WARNING; compose discards coturn's console output"
 fi
 
 # Logging must stay off by configuration, not only by luck: no verbose, syslog or log-binding

@@ -98,13 +98,14 @@ services:
       # every interface. Keep identical to coturn/test-coturn.sh.
       - '--listening-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
       - '--listening-ip=127.0.0.1'
-    # Docker keeps stdout on disk; keep little of it. (The secret is visible in
-    # `docker inspect` and the process list on the Pi; keep the Pi's users trusted.)
+    # coturn's console output is discarded, never written to the Pi's disk: coturn prints the
+    # TURN username on every failed login (for example internet scanners trying random logins),
+    # and PLAN.md section 3 says usernames are never logged. To debug a coturn that will not
+    # start, switch this to json-file temporarily and switch it back afterwards.
+    # (The secret is visible in `docker inspect` and the process list on the Pi; keep the Pi's
+    # users trusted.)
     logging:
-      driver: json-file
-      options:
-        max-size: '1m'
-        max-file: '2'
+      driver: none
     volumes:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
 
