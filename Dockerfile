@@ -32,4 +32,6 @@ EXPOSE 8000
 # -v 0 so its access log (which records visitor IP addresses) is off. A WebSocket ping goes out
 # every 10 s and a client that has not answered 20 s later is dropped (worst case about 30 s),
 # which runs the consumer's disconnect so the peer gets peer-left and the seat is freed.
-CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; exec daphne -v 0 --ping-interval 10 --ping-timeout 20 -b 0.0.0.0 -p 8000 config.asgi:application"]
+# --websocket_timeout caps a socket's total lifetime at 14700 s (4 h room limit + 5 min);
+# Daphne's default is 24 h. The consumer also closes a socket that is out of a room for 10 s.
+CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; exec daphne -v 0 --ping-interval 10 --ping-timeout 20 --websocket_timeout 14700 -b 0.0.0.0 -p 8000 config.asgi:application"]
