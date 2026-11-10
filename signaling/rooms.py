@@ -14,6 +14,7 @@ creates a new room (no list of old room IDs is kept).
 import asyncio
 import contextlib
 import hashlib
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Final, Literal
@@ -59,6 +60,9 @@ class _Room:
     channel_names: list[str] = field(default_factory=list)
     waiting_alone_timer: asyncio.Task[None] | None = None
     total_lifetime_timer: asyncio.Task[None] | None = None
+    # When the total-lifetime limit closes the room, on the monotonic clock that asyncio's timer
+    # also uses (so wall-clock steps, for example NTP after boot, cannot skew it).
+    closes_at_monotonic_time: float = 0.0
 
 
 class RoomRegistry:
@@ -74,12 +78,14 @@ class RoomRegistry:
         waiting_alone_limit_seconds: float = WAITING_ALONE_LIMIT_SECONDS,
         total_lifetime_limit_seconds: float = TOTAL_LIFETIME_LIMIT_SECONDS,
         notify_room_expired: NotifyRoomExpired = send_room_expired_to_channels,
+        monotonic_clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._rooms_by_room_id: dict[str, _Room] = {}
         self._lock = asyncio.Lock()
         self._waiting_alone_limit_seconds = waiting_alone_limit_seconds
         self._total_lifetime_limit_seconds = total_lifetime_limit_seconds
         self._notify_room_expired = notify_room_expired
+        self._monotonic_clock = monotonic_clock
 
     async def add_member(
         self,
@@ -95,7 +101,10 @@ class RoomRegistry:
         async with self._lock:
             room = self._rooms_by_room_id.get(room_id)
             if room is None:
-                room = _Room()
+                room = _Room(
+                    closes_at_monotonic_time=self._monotonic_clock()
+                    + self._total_lifetime_limit_seconds
+                )
                 self._rooms_by_room_id[room_id] = room
                 room.total_lifetime_timer = asyncio.create_task(
                     self._expire_after(
@@ -129,6 +138,13 @@ class RoomRegistry:
     def is_member(self, room_id: str, channel_name: str) -> bool:
         room = self._rooms_by_room_id.get(room_id)
         return room is not None and channel_name in room.channel_names
+
+    def remaining_lifetime_seconds(self, room_id: str) -> float | None:
+        """Seconds until the total-lifetime limit closes the room, or None if it is gone."""
+        room = self._rooms_by_room_id.get(room_id)
+        if room is None:
+            return None
+        return room.closes_at_monotonic_time - self._monotonic_clock()
 
     def room_count(self) -> int:
         return len(self._rooms_by_room_id)

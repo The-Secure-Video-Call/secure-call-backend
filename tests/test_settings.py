@@ -127,6 +127,7 @@ def test_bad_turn_settings_stop_startup_without_echoing_the_secret() -> None:
         {"TURN_URLS": "turn:a,turn:b,turn:c,turn:d,turn:e"},
         {"TURN_CREDENTIAL_TTL_SECONDS": "0"},
         {"TURN_CREDENTIAL_TTL_SECONDS": "31536000"},
+        {"TURN_CREDENTIAL_TTL_SECONDS": "14401"},
         {"TURN_CREDENTIAL_TTL_SECONDS": "soon"},
     ]
     for bad_env in bad_envs:
@@ -144,3 +145,15 @@ def test_refuses_database_without_password_in_production() -> None:
 
     assert result.returncode != 0
     assert "POSTGRES_PASSWORD must be set" in result.stderr
+
+
+def test_turn_ttl_cap_matches_the_room_lifetime_limit() -> None:
+    # An override can make credentials shorter, never longer than a room can live.
+    result = load_settings(
+        {"DJANGO_SECRET_KEY": "k" * 60, "TURN_CREDENTIAL_TTL_SECONDS": "14400"},
+        "import config.settings as s; "
+        "print(s.MAX_TURN_CREDENTIAL_TTL_SECONDS, s.TURN_CREDENTIAL_TTL_SECONDS)",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.split() == [str(TOTAL_LIFETIME_LIMIT_SECONDS)] * 2

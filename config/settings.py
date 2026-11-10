@@ -124,7 +124,10 @@ SIGNALING_MAX_MESSAGE_BYTES = 64 * 1024
 # comes from the environment only and is never logged or sent to clients.
 TURN_SHARED_SECRET = os.environ.get("TURN_SHARED_SECRET", "")
 TURN_URLS = env_list("TURN_URLS", default=[])
-MAX_TURN_CREDENTIAL_TTL_SECONDS = 24 * 3600  # "short-lived": never more than a day
+# Never longer than a room can live (signaling.rooms.TOTAL_LIFETIME_LIMIT_SECONDS, 4 h); the
+# consumer also shortens each credential to the time its room has left. tests/test_settings.py
+# keeps the values equal (this module cannot import signaling.rooms, which imports Channels).
+MAX_TURN_CREDENTIAL_TTL_SECONDS = 4 * 60 * 60
 # Default: as long as a room can live (signaling.rooms.TOTAL_LIFETIME_LIMIT_SECONDS, 4 h), so a
 # credential never expires mid-call. coturn renews an existing allocation after expiry, but a
 # new allocation (an ICE restart after a network change) needs a valid credential, and in
@@ -137,7 +140,9 @@ try:
 except ValueError:
     raise ImproperlyConfigured("TURN_CREDENTIAL_TTL_SECONDS must be a whole number.") from None
 if not 1 <= TURN_CREDENTIAL_TTL_SECONDS <= MAX_TURN_CREDENTIAL_TTL_SECONDS:
-    raise ImproperlyConfigured("TURN_CREDENTIAL_TTL_SECONDS must be between 1 and 86400.")
+    raise ImproperlyConfigured(
+        f"TURN_CREDENTIAL_TTL_SECONDS must be between 1 and {MAX_TURN_CREDENTIAL_TTL_SECONDS}."
+    )
 if TURN_URLS and not (
     len(TURN_URLS) <= 4 and all(url.startswith(("turn:", "turns:")) for url in TURN_URLS)
 ):
