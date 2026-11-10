@@ -1,6 +1,7 @@
 """Probe: does the relay refuse IPv6 relays and IPv6 / IPv4-mapped peers with specific errors?
 
-Usage: address_family_probe.py USERNAME PASSWORD [EXTRA_PEER ...]    (server: 127.0.0.1:3478)
+Usage: address_family_probe.py USERNAME PASSWORD [EXTRA_PEER ...]
+(server: $TURN_SERVER_HOST, default 127.0.0.1, port 3478)
 
 1. Allocate asking for an IPv6 relay (REQUESTED-ADDRESS-FAMILY = IPv6).
 2. Allocate an IPv4 relay, then CreatePermission for a public IPv4 peer (control: must succeed),
@@ -126,7 +127,7 @@ def main(arguments: list[str]) -> int:
     username = arguments[0].encode()
     password = arguments[1].encode()
     extra_peers = arguments[2:]
-    server_host = "127.0.0.1"
+    server_host = os.environ.get("TURN_SERVER_HOST", "127.0.0.1")
     transport = encode_attribute(ATTR_REQUESTED_TRANSPORT, struct.pack("!B3x", UDP_PROTOCOL_NUMBER))
     results: list[str] = []
 

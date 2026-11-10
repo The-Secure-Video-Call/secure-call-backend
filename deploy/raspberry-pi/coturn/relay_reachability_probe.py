@@ -1,20 +1,24 @@
 """Probe: where do packets sent through the relay actually go?
 
-Usage: relay_reachability_probe.py USER_A PASSWORD_A USER_B PASSWORD_B PUBLIC_IP RELAY_IP
-(server: 127.0.0.1:3478; PUBLIC_IP and RELAY_IP are the --external-ip pair the server runs with)
+Usage: relay_reachability_probe.py USER_A PASSWORD_A USER_B PASSWORD_B \\
+           PUBLIC_IP HOST_LAN_IP GATEWAY_IP
+(server: $TURN_SERVER_HOST, default 127.0.0.1, port 3478. PUBLIC_IP is the public half of the
+--external-ip pair; HOST_LAN_IP and GATEWAY_IP are addresses of the Docker HOST: the runner's LAN
+IPv4 and the bridge gateway, on the Pi the Pi's own addresses.)
 
-coturn exempts its own addresses from the deny list (two clients on the same relay must reach
-each other), so a CreatePermission to them succeeds. A permission is not data. This probe checks
-the data:
+coturn runs on its own Docker bridge network, so its "own addresses" are the container's, where
+only coturn listens. coturn exempts its own addresses from the deny list (two clients on the same
+relay must reach each other), so a CreatePermission to them succeeds. A permission is not data.
+This probe checks the data:
 
 1. Relay to relay (must work, the "both people use our relay" case): allocation A creates a
    permission for allocation B's XOR-RELAYED-ADDRESS, sends data, and B must receive it. Then the
    same in the other direction.
-2. Nothing else may be reached through our own addresses: UDP listeners on RELAY_IP:40001 and
-   127.0.0.1:40002 (ports outside the relay range) must receive NOTHING when allocation A sends
-   to PUBLIC_IP:40001, RELAY_IP:40001 and 127.0.0.1:40002 (after trying to create permissions;
-   a Send without a permission is dropped, so each verdict names the permission outcome).
-   A self-check first proves the listeners can receive.
+2. The Docker host must not be reachable through the relay: UDP listeners on HOST_LAN_IP:40001
+   and GATEWAY_IP:40002 (ports outside the relay range) must receive NOTHING when allocation A
+   sends to them directly, or to PUBLIC_IP:40001 / PUBLIC_IP:40002 (which coturn rewrites to its
+   own container address). Each verdict names the permission outcome. A self-check first proves
+   the listeners can receive.
 
 Prints one line per check: "PROBE <label>: <outcome>". Exits with status 2 (nothing on stdout)
 if the probe itself could not run. Standard library only.
@@ -52,9 +56,9 @@ SEND_INDICATION = 0x0016
 DATA_INDICATION = 0x0017
 ATTR_XOR_RELAYED_ADDRESS = 0x0016
 ATTR_DATA = 0x0013
-RELAY_LISTENER_PORT = 40001  # not 5353 (mDNS, may be taken); outside the relay range 49160-49200
-LOOPBACK_LISTENER_PORT = 40002
-SERVER_HOST = "127.0.0.1"
+HOST_LAN_LISTENER_PORT = 40001  # outside the relay range 49160-49200
+GATEWAY_LISTENER_PORT = 40002
+SERVER_HOST = os.environ.get("TURN_SERVER_HOST", "127.0.0.1")
 
 Relayed = tuple[str, int]
 
@@ -118,11 +122,11 @@ def drain(listener: socket.socket, wait_seconds: float) -> list[bytes]:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 6:
+    if len(arguments) != 7:
         print(__doc__, file=sys.stderr)
         return 2
     user_a, password_a, user_b, password_b = (argument.encode() for argument in arguments[:4])
-    public_ip, relay_ip = arguments[4], arguments[5]
+    public_ip, host_lan_ip, gateway_ip = arguments[4], arguments[5], arguments[6]
     results: list[str] = []
 
     # 1. Relay to relay, both directions.
@@ -145,26 +149,28 @@ def main(arguments: list[str]) -> int:
         f"PROBE relay B->A: {'delivered' if got_by_a == b'relay-b-to-a' else 'NOT delivered'}"
     )
 
-    # 2. Our own addresses must not reach anything but relay ports.
-    relay_listener = listener_on(relay_ip, RELAY_LISTENER_PORT)
-    loopback_listener = listener_on("127.0.0.1", LOOPBACK_LISTENER_PORT)
+    # 2. The Docker host must not be reachable through the relay.
+    # Bound to 0.0.0.0, like a typical service on the Pi, so it receives on every host address.
+    host_lan_listener = listener_on("0.0.0.0", HOST_LAN_LISTENER_PORT)  # noqa: S104
+    gateway_listener = listener_on("0.0.0.0", GATEWAY_LISTENER_PORT)  # noqa: S104
     sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sender.sendto(b"self-check", (relay_ip, RELAY_LISTENER_PORT))
-    sender.sendto(b"self-check", ("127.0.0.1", LOOPBACK_LISTENER_PORT))
-    self_check_ok = drain(relay_listener, 2) == [b"self-check"]
-    self_check_ok = drain(loopback_listener, 2) == [b"self-check"] and self_check_ok
+    sender.sendto(b"self-check", (host_lan_ip, HOST_LAN_LISTENER_PORT))
+    sender.sendto(b"self-check", (gateway_ip, GATEWAY_LISTENER_PORT))
+    self_check_ok = drain(host_lan_listener, 2) == [b"self-check"]
+    self_check_ok = drain(gateway_listener, 2) == [b"self-check"] and self_check_ok
     if not self_check_ok:
         raise ProbeError("the listeners cannot receive a direct datagram")
     sender.close()
     targets = [
-        (public_ip, RELAY_LISTENER_PORT),
-        (relay_ip, RELAY_LISTENER_PORT),
-        ("127.0.0.1", LOOPBACK_LISTENER_PORT),
+        (host_lan_ip, HOST_LAN_LISTENER_PORT),
+        (gateway_ip, GATEWAY_LISTENER_PORT),
+        (public_ip, HOST_LAN_LISTENER_PORT),
+        (public_ip, GATEWAY_LISTENER_PORT),
     ]
     permission_by_ip: dict[str, str] = {}
     for target_ip in dict.fromkeys(ip for ip, _port in targets):
-        # The permission may succeed or be refused. coturn drops a Send without a permission, so
-        # a listener verdict only counts as a hairpin test when the permission succeeded.
+        # The permission may succeed or be refused (the host's addresses are in the deny ranges).
+        # coturn drops a Send without a permission, so the verdict names the permission outcome.
         outcome = create_permission(server_a, target_ip, credentials_a)
         if outcome == "error 438":
             raise ProbeError("stale nonce while creating a permission")
@@ -174,19 +180,19 @@ def main(arguments: list[str]) -> int:
         send_indication(server_a, target_ip, target_port, b"hairpin-test")
     time.sleep(2)
     for label_ip, label_port, listener in (
-        (relay_ip, RELAY_LISTENER_PORT, relay_listener),
-        ("127.0.0.1", LOOPBACK_LISTENER_PORT, loopback_listener),
+        (host_lan_ip, HOST_LAN_LISTENER_PORT, host_lan_listener),
+        (gateway_ip, GATEWAY_LISTENER_PORT, gateway_listener),
     ):
         received = drain(listener, 0.5)
-        permission = permission_by_ip[label_ip]
         if received:
             verdict = f"RECEIVED {len(received)}"
-        elif permission == "success":
-            verdict = "nothing received (permission success)"
         else:
-            verdict = f"nothing received (permission refused: {permission}, not a hairpin test)"
+            verdict = (
+                f"nothing received (permission to the host address: {permission_by_ip[label_ip]}; "
+                f"permission to the public address: {permission_by_ip[public_ip]})"
+            )
         results.append(f"PROBE listener {label_ip}:{label_port}: {verdict}")
-    for open_socket in (server_a, server_b, relay_listener, loopback_listener):
+    for open_socket in (server_a, server_b, host_lan_listener, gateway_listener):
         open_socket.close()
 
     print("\n".join(results))

@@ -6,9 +6,15 @@
 set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-image="$(sed -n 's|^ *image: \(coturn/coturn:[^ ]*\).*|\1|p' "$here/../compose.yaml" | head -n1)"
+image="secure-call-coturn:test"
 test_secret="ci-only-test-secret-not-used-anywhere"
 container_name="coturn-test"
+# Same network as compose.yaml: its own bridge, a small subnet inside 172.16.0.0/12 (denied as a
+# peer), coturn at a fixed address. The gateway is the Docker host (the runner here, the Pi there).
+network_name="coturn-test-net"
+network_subnet="172.30.200.0/29"
+gateway_ip="172.30.200.1"
+container_ip="172.30.200.2"
 # Stands in for the home's public IP: the Pi passes --external-ip=<public>/<relay> and
 # --denied-peer-ip=<public> (compose.yaml), so a peer at the public IP is refused explicitly.
 test_public_ip="203.0.113.7"
@@ -20,7 +26,7 @@ failed_login_usernames_file="$(mktemp)"
 peers_file="$(mktemp)"
 denied_ranges_file="$(mktemp)"
 
-cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file" "$failed_login_usernames_file" "$peers_file" "$denied_ranges_file"; }
+cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; docker network rm "$network_name" >/dev/null 2>&1; rm -f "$usernames_file" "$failed_login_usernames_file" "$peers_file" "$denied_ranges_file"; }
 trap cleanup EXIT
 
 # $1 = seconds until the credential expires (negative = already expired). Prints
@@ -107,7 +113,7 @@ expect() {
 wait_for_turn_port() {
   local attempt
   for attempt in $(seq 1 20); do
-    (exec 3<>/dev/tcp/127.0.0.1/3478) 2>/dev/null && return 0
+    (exec 3<>/dev/tcp/"$container_ip"/3478) 2>/dev/null && return 0
     sleep 1
   done
   return 1
@@ -170,23 +176,31 @@ restart_coturn() {
   docker restart "$container_name" >/dev/null && wait_for_turn_port
 }
 
-# The Pi passes --relay-ip=$TURN_RELAY_IP (its LAN IPv4); the test uses the runner's own IPv4.
-relay_ip="$(hostname -I | tr ' ' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')"
-relay_ip="${relay_ip:-127.0.0.1}"
-# Same as compose.yaml: listen on the relay IPv4 and loopback only (once, if they are the same).
-listening_ip_flags=(--listening-ip="$relay_ip")
-[ "$relay_ip" != "127.0.0.1" ] && listening_ip_flags+=(--listening-ip=127.0.0.1)
+# The Docker host's own LAN IPv4 (the runner here, the Pi's LAN IP on the Pi). The probes listen on
+# it and on the bridge gateway, and must see nothing arrive through the relay.
+host_lan_ip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -n1)"
+[ -n "$host_lan_ip" ] || host_lan_ip="$(hostname -I | tr ' ' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')"
+if [ -z "$host_lan_ip" ]; then echo "FAIL: no IPv4 address on this host"; exit 1; fi
+# The raw STUN probes talk to coturn at its container address (the host reaches the bridge).
+export TURN_SERVER_HOST="$container_ip"
 
-cleanup
-# Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only, no
-# capabilities except NET_BIND_SERVICE (needed by the image's file capability on turnserver, which
-# no-new-privileges then does not grant, so turnserver runs with an empty effective set), no core
-# dumps, and turnserver as the entrypoint (pid 1), so no shell ever expands the secret.
-# Test-only differences from the Pi: the test secret, a documentation address as the public IP,
-# the runner's relay IP, and --stale-nonce=20 (the nonce rotates after 20 s, so the refresh probe
-# below also covers a nonce rotation; the Pi keeps the config's default).
-docker run -d --name "$container_name" --network host --read-only \
-  --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges:true \
+cleanup # also removes the temp files; they are recreated on first use
+# Peers the test asks for (the log checks look for them): the Docker host's addresses.
+printf '%s\n' "$host_lan_ip" "$gateway_ip" >>"$peers_file"
+echo "== Build the derived image (coturn/Dockerfile) =="
+docker build -q -t "$image" "$here" || { echo "FAIL: docker build"; exit 1; }
+docker network create --driver bridge --subnet "$network_subnet" --gateway "$gateway_ip" "$network_name" >/dev/null \
+  || { echo "FAIL: could not create the docker network"; exit 1; }
+# Same hardening as compose.yaml: own bridge network with a fixed address (no host networking),
+# read-only root filesystem, small tmpfs mounts only, no capabilities at all (the derived image has
+# no file capability on turnserver), no-new-privileges, no core dumps, and turnserver as the
+# entrypoint (pid 1), so no shell ever expands the secret. Ports are not published here: the
+# clients and probes reach the container on the bridge.
+# Test-only differences from the Pi: the test secret, a documentation address as the public IP, and
+# --stale-nonce=20 (the nonce rotates after 20 s, so the refresh probe below also covers a nonce
+# rotation; the Pi keeps the config's default).
+docker run -d --name "$container_name" --network "$network_name" --ip "$container_ip" --read-only \
+  --cap-drop ALL --security-opt no-new-privileges:true \
   --ulimit core=0 --user 65534:65534 \
   --tmpfs /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /tmp:size=1m,mode=1777,noexec,nosuid,nodev \
@@ -194,8 +208,9 @@ docker run -d --name "$container_name" --network host --read-only \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   --entrypoint turnserver \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
-  --external-ip="$test_public_ip/$relay_ip" --denied-peer-ip="$test_public_ip" \
-  --relay-ip="$relay_ip" "${listening_ip_flags[@]}" --stale-nonce=20 >/dev/null || exit 1
+  --external-ip="$test_public_ip/$container_ip" --denied-peer-ip="$test_public_ip" \
+  --relay-ip="$container_ip" --listening-ip="$container_ip" --listening-ip=127.0.0.1 \
+  --stale-nonce=20 >/dev/null || exit 1
 if ! wait_for_turn_port; then
   echo "FAIL: coturn did not start. Diagnostics:"
   echo "-- docker logs:"
@@ -240,6 +255,32 @@ else
   failures=$((failures + 1))
 fi
 
+# The derived image must leave no file capability on turnserver. Two checks, in a throwaway
+# container with no network:
+#  1. getcap / getfattr (whichever the image has) shows no capability on the binary;
+#  2. turnserver still starts as uid 65534 with every capability dropped and WITHOUT
+#     no-new-privileges: with a file capability present the kernel refuses to exec it then.
+file_capability_report="$(docker run --rm --network none --user 0 --entrypoint sh "$image" -c \
+  'p="$(command -v turnserver)"; ls -l "$p"; if command -v getcap >/dev/null; then echo "getcap: [$(getcap "$p")]"; \
+   elif command -v getfattr >/dev/null; then echo "getfattr: [$(getfattr -d -m security.capability "$p" 2>&1 | grep -c security.capability)]"; \
+   else echo "NO_TOOL"; fi' 2>&1)"
+echo "turnserver file capability report:"; sed 's/^/    /' <<<"$file_capability_report"
+if grep -Eq '^getcap: \[\]$|^getfattr: \[0\]$|^NO_TOOL$' <<<"$file_capability_report" \
+  && ! grep -Eq 'cap_|getfattr: \[[1-9]' <<<"$file_capability_report"; then
+  echo "PASS: turnserver has no file capability (or no tool to show one; the exec check below decides)"
+else
+  echo "FAIL: turnserver still has a file capability"; failures=$((failures + 1))
+fi
+exec_check_output="$(docker run --rm --network none --user 65534:65534 --cap-drop ALL --entrypoint turnserver "$image" -h 2>&1)"
+if grep -Eqi 'coturn|turnserver' <<<"$exec_check_output" \
+  && ! grep -Eqi 'operation not permitted|permission denied|exec format|cannot execute' <<<"$exec_check_output"; then
+  echo "PASS: turnserver starts as uid 65534 with all capabilities dropped and no no-new-privileges"
+else
+  echo "FAIL: turnserver does not start as uid 65534 with all capabilities dropped (file capability left?)"
+  echo "$exec_check_output" | head -n 5
+  failures=$((failures + 1))
+fi
+
 # bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
 # well under that, and coturn is restarted (fresh state) between groups.
 restart_or_exit() { restart_coturn || { echo "FAIL: coturn did not restart"; exit 1; }; }
@@ -273,7 +314,7 @@ read -r probe_user probe_pass < <(make_credential 600)
 # Not -I: the probe imports refresh_after_expiry.py from its own folder (repo code, not user input).
 printf '%s\n' "$test_public_ip" ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1 >>"$peers_file"
 # Extra IPv4 peers for the probe: the "home public IP" (--denied-peer-ip) and the relay's own address.
-address_family_output="$(python3 "$here/address_family_probe.py" "$probe_user" "$probe_pass" "$test_public_ip" "$relay_ip" 2>&1)"
+address_family_output="$(python3 "$here/address_family_probe.py" "$probe_user" "$probe_pass" "$test_public_ip" "$container_ip" "$gateway_ip" "$host_lan_ip" 2>&1)"
 echo "$address_family_output"
 # $1 = label as printed by the probe, $2 = regex the outcome must match
 expect_probe() {
@@ -290,19 +331,23 @@ expect_probe "permission $public_peer" "success"
 # CreatePermission with success for both, because it exempts its own addresses from the deny list
 # (two clients on the same relay must reach each other's relay addresses). A permission is not
 # data, so these two are informational here; Group 5 checks where packets really go.
-grep -E "^PROBE permission ($test_public_ip|$relay_ip):" <<<"$address_family_output" | sed 's/^/NOTE (informational): /'
+grep -E "^PROBE permission ($test_public_ip|$container_ip):" <<<"$address_family_output" | sed 's/^/NOTE (informational): /'
+# The Docker host's addresses are not coturn's own: the bridge gateway is inside 172.16.0.0/12 and
+# must be refused with 403. The host's LAN address is printed (a CI runner could in theory have a
+# public one, so it is not asserted; Group 5 checks that nothing arrives either way).
+expect_probe "permission $gateway_ip" "error 403"
+grep -E "^PROBE permission $host_lan_ip:" <<<"$address_family_output" | sed 's/^/NOTE (informational): /'
 # 403 Forbidden (deny list) or 443 Peer Address Family Mismatch (IPv6 peer on an IPv4 relay).
 for ipv6_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
   expect_probe "permission $ipv6_peer" "error (403|443)"
 done
 
 restart_or_exit
-echo "== Group 5: relay-to-relay works, our own addresses reach nothing else (raw STUN) =="
+echo "== Group 5: relay-to-relay works, the Docker host is not reachable through the relay (raw STUN) =="
 read -r reach_user_a reach_pass_a < <(make_credential 600)
 read -r reach_user_b reach_pass_b < <(make_credential 600)
-echo "127.0.0.1" >>"$peers_file"
 reachability_output="$(python3 "$here/relay_reachability_probe.py" "$reach_user_a" "$reach_pass_a" \
-  "$reach_user_b" "$reach_pass_b" "$test_public_ip" "$relay_ip" 2>&1)"
+  "$reach_user_b" "$reach_pass_b" "$test_public_ip" "$host_lan_ip" "$gateway_ip" 2>&1)"
 reachability_exit_code=$?
 echo "$reachability_output"
 expect_reachability() {
@@ -315,25 +360,26 @@ expect_reachability() {
 # Privacy mode on both sides: each allocation reaches the other's relayed address.
 expect_reachability "relay A->B" "delivered"
 expect_reachability "relay B->A" "delivered"
-# The hairpin / self-reach case: the listeners on the relay's own IP and on loopback (ports outside
-# the relay range) receive nothing. If either says RECEIVED, coturn forwards to a non-relay port on
-# its own address: stop, do not weaken anything, and report it with this output.
-# The relay-IP listener only counts when the permission succeeded (coturn drops a Send without one).
-# The loopback listener may also pass because the deny list refused the permission (printed).
-expect_reachability "listener $relay_ip:40001" "nothing received \(permission success\)"
-expect_reachability "listener 127.0.0.1:40002" "nothing received \(.*\)"
+# The Docker host (the runner's LAN IPv4 and the bridge gateway) is not reachable: listeners on
+# non-relay ports there receive nothing when an allocation sends to them directly, or to the public
+# IP (which coturn rewrites to its own container address, where only coturn listens). If either
+# says RECEIVED, stop, do not weaken anything, and report it with this output. The host addresses
+# are in the deny ranges, so their permissions are normally refused (printed). Sending to another
+# port on coturn's own container address can only reach coturn itself: accepted by design.
+expect_reachability "listener $host_lan_ip:40001" "nothing received \(.*\)"
+expect_reachability "listener $gateway_ip:40002" "nothing received \(.*\)"
 
 # Refresh-after-expiry probe (result recorded in README.md for #26, informational, not asserted):
 # allocate with a credential that expires 5 s later, wait 25 s (longer than the test-only
 # --stale-nonce=20, so the server has rotated the nonce), then send a Refresh for that allocation.
-# It runs BEFORE the log checks below, so its traffic is checked too. The server runs with host
-# networking, so the probe on the runner reaches it on 127.0.0.1. Restart first, so the probe
+# It runs BEFORE the log checks below, so its traffic is checked too. The probe reaches the server
+# on its container address on the bridge. Restart first, so the probe
 # starts from fresh state and shares no quota with the other checks.
 if ! restart_coturn; then
   echo "FAIL: coturn did not restart"; failures=$((failures + 1))
 fi
 read -r short_user short_pass < <(make_credential 5)
-probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 25 2>&1)"
+probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 25 "$container_ip" 2>&1)"
 if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then
   grep -E '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"
   grep -E '^\(' <<<"$probe_output" # notes: nonce rotation seen or not, error code if refused
@@ -405,7 +451,7 @@ while IFS= read -r log_line; do
   if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]]; then
     denied_peer="${BASH_REMATCH[1]}"
     denied_range="$(sed -E 's/^([^-]+)-\1$/\1/' <<<"${BASH_REMATCH[2]}")"
-    if { grep -Fxq -e "$denied_peer" "$peers_file" || [ "$denied_peer" = "$relay_ip" ]; } \
+    if { grep -Fxq -e "$denied_peer" "$peers_file" || [ "$denied_peer" = "$container_ip" ]; } \
       && grep -Fxq -e "$denied_range" "$denied_ranges_file"; then
       continue
     fi
@@ -448,7 +494,7 @@ fi
 inspect_log_files "end of run"
 
 # The admin CLI must be off.
-if (exec 3<>/dev/tcp/127.0.0.1/5766) 2>/dev/null; then
+if (exec 3<>/dev/tcp/"$container_ip"/5766) 2>/dev/null; then
   echo "FAIL: CLI port 5766 is open"; failures=$((failures + 1))
 else
   echo "PASS: CLI port 5766 closed"

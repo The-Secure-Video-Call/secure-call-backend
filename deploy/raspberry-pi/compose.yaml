@@ -52,49 +52,57 @@ services:
     networks:
       - internal
 
-  # TURN relay for calls across NATs (PLAN.md 3.5). Host networking because the relay port
-  # range and Docker NAT do not mix. Router forwards: see README.md "TURN". The config
-  # denies every private, loopback and link-local peer; never loosen it.
+  # TURN relay for calls across NATs (PLAN.md 3.5). Router forwards: see README.md "TURN". The
+  # config denies every private, loopback and link-local peer; never loosen it.
+  #
+  # coturn runs on its OWN bridge network ("turn", fixed subnet inside 172.16.0.0/12, which the
+  # config denies as a peer), not on the host network. coturn exempts its own addresses from the
+  # deny list (two clients on one relay must reach each other's relay addresses), so on the host
+  # network "its own address" would be the Pi itself, and any UDP service on the Pi would be
+  # reachable from the internet with a TURN login (CI run 48e8d0b). In its own network the only
+  # thing at coturn's own address is coturn. The Pi's LAN address (192.168/16, 10/8) and the
+  # bridge gateway (172.16/12) are covered by the normal deny ranges.
   coturn:
-    # Pinned by version and digest (the digest `docker pull coturn/coturn:4.6.3` reported in CI;
-    # compare with `docker buildx imagetools inspect coturn/coturn:4.6.3`).
-    image: coturn/coturn:4.6.3@sha256:71c3c990283385567f11794ee692e3a47b66fd9b0bb39e42afbe776e331dd888
+    # Built from coturn/Dockerfile: the pinned upstream image (version and digest are in that
+    # file) with the file capability removed from turnserver. `docker compose up -d --build coturn`.
+    build: ./coturn
+    image: secure-call-coturn:local
     container_name: secure-call-coturn
     restart: unless-stopped
-    network_mode: host
+    networks:
+      turn:
+        ipv4_address: 172.30.200.2
+    # Published on the Pi's LAN address only, never on 0.0.0.0. The router forwards stay the same.
+    ports:
+      - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:3478:3478/udp'
+      - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:3478:3478/tcp'
+      - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:49160-49200:49160-49200/udp'
     # Nothing coturn writes can reach the Pi's disk: read-only root filesystem, and small
-    # in-memory mounts (world-writable, as the image runs coturn as an unprivileged user) for the
+    # in-memory mounts (world-writable, as coturn runs as an unprivileged user) for the
     # places it may try to write logs to. Their contents vanish when the container stops.
     read_only: true
     tmpfs:
       - /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev
       - /tmp:size=1m,mode=1777,noexec,nosuid,nodev
       - /var/log:size=1m,mode=1777,noexec,nosuid,nodev
-    # Drop everything except NET_BIND_SERVICE, and set no-new-privileges. The image runs coturn
-    # as an unprivileged user and puts the file capability CAP_NET_BIND_SERVICE=+ep on the
-    # turnserver binary. With all capabilities dropped (not even in the bounding set) the kernel
-    # refuses to exec it (CI run 42757878869). Keeping the capability in the bounding set lets
-    # it start, and no-new-privileges then means the file capability is NOT granted: turnserver
-    # runs with an empty effective set (the test asserts CapEff 0). coturn shares the host
-    # network, so an active NET_BIND_SERVICE would let a compromised turnserver bind ports such
-    # as 53 or 67 on the home LAN. Keep these flags identical to the docker run flags in
-    # coturn/test-coturn.sh.
+    # No capabilities at all, and no-new-privileges. The upstream image puts the file capability
+    # CAP_NET_BIND_SERVICE=+ep on turnserver, which made the container need `cap_add` (CI runs
+    # 42757878869, 48e8d0b: Docker grants cap_add to the non-root process too, CapEff 0x400).
+    # The derived image removes that file capability, so nothing is added back. Keep these flags
+    # identical to the docker run flags in coturn/test-coturn.sh.
     cap_drop:
       - ALL
-    cap_add:
-      - NET_BIND_SERVICE
     security_opt:
       - no-new-privileges:true
     # No core dumps: a crash must not write memory (which holds the secret) to disk.
     ulimits:
       core: 0
-    # Never root: with `entrypoint: turnserver` the image's own switch to an unprivileged user is
-    # skipped (CI run 42770315949 showed CapEff 0x400, i.e. root), so the user is set here
-    # (65534 = nobody). Keep identical to the --user flag in coturn/test-coturn.sh, which asserts
-    # that turnserver's Uid and Gid are not 0 and that CapEff is 0.
+    # Never root (65534 = nobody; the Dockerfile sets the same). Keep identical to the --user flag
+    # in coturn/test-coturn.sh, which asserts that turnserver's Uid and Gid are not 0 and that
+    # CapEff is 0.
     user: '65534:65534'
-    # Start turnserver directly as pid 1, so the image's shell entrypoint never expands the
-    # secret. Found through PATH, so it works wherever the image keeps the binary.
+    # Start turnserver directly as pid 1, so no shell ever expands the secret (the Dockerfile sets
+    # the same entrypoint). Found through PATH.
     entrypoint: ['turnserver']
     # The secret comes from .env (compose substitution), never from a file in the repo.
     # No env_file here: coturn must not receive the backend's other secrets.
@@ -102,19 +110,19 @@ services:
       - '-c'
       - '/etc/coturn/turnserver.conf'
       - '--static-auth-secret=${TURN_SHARED_SECRET:?Set TURN_SHARED_SECRET in .env}'
-      # Replacing the image's default command drops its external-ip detection; behind a
-      # home NAT the relay must advertise the public IP: "<public-ip>/<pi-lan-ip>".
-      - '--external-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}/${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
-      # The home's public IP is also denied as a peer: defence in depth only. CI showed coturn
-      # still answers CreatePermission for it with success (it exempts its own addresses); the
-      # real control is coturn's rewrite of the public IP to the relay IP, and the
-      # relay-reachability test checks where packets go. The config file must be world-readable.
+      # Behind the home NAT (and Docker's) the relay must advertise the public IP:
+      # "<public-ip>/<container address>". 172.30.200.2 is this container's fixed address.
+      - '--external-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}/172.30.200.2'
+      # The home's public IP is also denied as a peer: defence in depth only. coturn still answers
+      # CreatePermission for it with success (it exempts its own addresses), and relay-to-relay
+      # through the public address works with this flag set (CI run 48e8d0b), so it breaks
+      # nothing. The config file must be world-readable.
       - '--denied-peer-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}'
-      # Relays only on the Pi's LAN IPv4 (the second half of --external-ip), never on IPv6.
-      - '--relay-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
-      # Listen only on the Pi's LAN IPv4 (where the router forwards 3478) and loopback, not on
-      # every interface. Keep identical to coturn/test-coturn.sh.
-      - '--listening-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
+      # Relays only on the container's IPv4, never on IPv6.
+      - '--relay-ip=172.30.200.2'
+      # Listen only on the container address and loopback. Keep identical to
+      # coturn/test-coturn.sh.
+      - '--listening-ip=172.30.200.2'
       - '--listening-ip=127.0.0.1'
     # coturn's console output is discarded, never written to the Pi's disk: coturn prints the
     # TURN username on every failed login (for example internet scanners trying random logins),
@@ -129,6 +137,16 @@ services:
 
 networks:
   internal: {}
+  # coturn only. A fixed small subnet inside 172.16.0.0/12 (denied as a peer by turnserver.conf),
+  # no IPv6. 172.30.200.1 is the gateway (the Pi), 172.30.200.2 is coturn. Keep identical to the
+  # network the test creates in coturn/test-coturn.sh.
+  turn:
+    driver: bridge
+    enable_ipv6: false
+    ipam:
+      config:
+        - subnet: 172.30.200.0/29
+          gateway: 172.30.200.1
 
 volumes:
   pgdata:
