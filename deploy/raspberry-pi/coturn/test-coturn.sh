@@ -284,9 +284,11 @@ if [ "$listed_ranges" != "$(cat "$denied_ranges_file")" ]; then
   failures=$((failures + 1))
 fi
 server_logs="$(docker logs "$container_name" 2>&1)"
-# Besides the banner, coturn 4.6.3 prints two kinds of runtime lines with logging off:
+# Besides the banner, coturn 4.6.3 prints these runtime lines with logging off:
 #   - an allocation counter (no username, no address);
-#   - "check_stun_auth: Cannot find credentials of user <name>" for a failed login.
+#   - "check_stun_auth: Cannot find credentials of user <name>" for a failed login;
+#   - "A peer IP <ip> denied in the range: <range>" when the deny list refuses a peer;
+#   - "Terminating on signal 15" when it stops.
 # On the Pi, compose.yaml discards coturn's console output (logging driver "none"), so neither
 # reaches the disk; this test container keeps Docker's default logs only to inspect them. A
 # failed-login line is accepted here only for the test's own deliberate failures, and the
@@ -304,6 +306,14 @@ while IFS= read -r log_line; do
     && grep -Fxq -e "${BASH_REMATCH[1]}" "$failed_login_usernames_file"; then
     continue
   fi
+  # coturn refusing a peer the test deliberately asked for, in one of our configured deny ranges.
+  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]] \
+    && grep -Fxq -e "${BASH_REMATCH[1]}" "$peers_file" \
+    && grep -Fxq -e "$(sed -E 's/^([^-]+)-\1$/\1/' <<<"${BASH_REMATCH[2]}")" "$denied_ranges_file"; then
+    continue
+  fi
+  # coturn stopping when the test restarts it between groups.
+  [ "$log_line" = "INFO: Terminating on signal 15" ] && continue
   new_log_lines+="$log_line"$'\n'
 done < <(strip_log_prefix <<<"$server_logs")
 valid_usernames="$(grep -v -x -F -f "$failed_login_usernames_file" "$usernames_file" || true)"
