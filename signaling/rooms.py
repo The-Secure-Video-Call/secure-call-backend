@@ -26,8 +26,9 @@ MAX_MEMBERS_PER_ROOM: Final = 2
 WAITING_ALONE_LIMIT_SECONDS: Final = 10 * 60
 TOTAL_LIFETIME_LIMIT_SECONDS: Final = 4 * 60 * 60
 # TURN credentials one room may be given over its life: 2 members plus reconnects (the web client
-# reconnects with backoff and every join gets fresh credentials). Not a per-client limit: rooms
-# are free to create, so a script that creates rooms is not stopped (see README.md).
+# reconnects with backoff and every join gets fresh credentials). A guard against runaway
+# reconnects only: the count dies with the room (no old room IDs are kept), so leaving and
+# rejoining, or creating rooms, is not stopped. Shared by both members (see README.md).
 MAX_TURN_CREDENTIALS_PER_ROOM: Final = 20
 
 Role = Literal["first", "second"]

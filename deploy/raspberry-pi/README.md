@@ -113,9 +113,13 @@ rate) is reached with fewer allocations per credential. What brakes the number o
 
 - the backend's cap of 120 credentials per client IP per hour (`signaling/rate_limits.py`). It
   cannot be lower, because many people share one address, so 7 is well inside it;
-- the backend's cap of 20 credentials per room over its life (`signaling/rooms.py`), which stops
-  one room being used as an endless credential source. Rooms are free to create, so **a script
-  that creates rooms is not stopped by it**.
+- the backend's cap of 20 credentials per room (`signaling/rooms.py`), which stops a reconnect
+  loop in one occupied room from being an endless credential source. The count lives only while
+  the room exists (we keep no list of old room IDs), so **it resets when the room empties: one
+  client that leaves and rejoins the same ID, or a script that creates rooms, is not stopped by
+  it.** It is a guard against runaway reconnects, not a defence against a hostile client. Also
+  note it is shared by both members: one of them reconnecting 20 times leaves the room without
+  a relay until it ends (privacy-mode calls then fail closed).
 
 So **one client can still fill the relay.** The impact is availability only: media stays
 DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full, privacy-mode
