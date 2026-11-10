@@ -307,13 +307,14 @@ while IFS= read -r log_line; do
     && grep -Fxq -e "${BASH_REMATCH[1]}" "$failed_login_usernames_file"; then
     continue
   fi
-  # coturn refusing a peer the test deliberately asked for, in one of our configured deny ranges
-  # or the multicast range that no-multicast-peers adds (224.0.0.1 is a test peer).
+  # coturn refusing, in one of our configured deny ranges, a peer the test deliberately asked
+  # for, or the relay's own address (the runner's LAN IPv4 here, the Pi's on the Pi): the test
+  # traffic makes coturn try to relay towards it, and the deny list correctly refuses that.
   if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]]; then
     denied_peer="${BASH_REMATCH[1]}"
     denied_range="$(sed -E 's/^([^-]+)-\1$/\1/' <<<"${BASH_REMATCH[2]}")"
-    if grep -Fxq -e "$denied_peer" "$peers_file" \
-      && { grep -Fxq -e "$denied_range" "$denied_ranges_file" || [ "$denied_range" = "224.0.0.0-239.255.255.255" ]; }; then
+    if { grep -Fxq -e "$denied_peer" "$peers_file" || [ "$denied_peer" = "$relay_ip" ]; } \
+      && grep -Fxq -e "$denied_range" "$denied_ranges_file"; then
       continue
     fi
     # Deny lines only ever name the test's own synthetic peers and deny ranges, never a real
