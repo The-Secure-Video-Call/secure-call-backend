@@ -70,19 +70,27 @@ services:
       - /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev
       - /tmp:size=1m,mode=1777,noexec,nosuid,nodev
       - /var/log:size=1m,mode=1777,noexec,nosuid,nodev
-    # Drop everything except NET_BIND_SERVICE. The image runs coturn as an unprivileged user and
-    # puts the file capability CAP_NET_BIND_SERVICE=+ep on the turnserver binary; with all
-    # capabilities dropped the kernel refuses to exec it. Keep these flags identical to the
-    # docker run flags in coturn/test-coturn.sh.
-    # no-new-privileges is deliberately NOT set: CI run 42757878869 showed drop ALL + NNP does not
-    # start, and with NNP an unprivileged process cannot gain a file capability on exec (likely
-    # cause; the test prints the file capability when startup fails). Residual risk is low: the
-    # bounding set holds only NET_BIND_SERVICE, so a setuid binary could not gain anything else.
-    # A derived image running `setcap -r` on turnserver would allow NNP with no capabilities.
+    # Drop everything except NET_BIND_SERVICE, and set no-new-privileges. The image runs coturn
+    # as an unprivileged user and puts the file capability CAP_NET_BIND_SERVICE=+ep on the
+    # turnserver binary. With all capabilities dropped (not even in the bounding set) the kernel
+    # refuses to exec it (CI run 42757878869). Keeping the capability in the bounding set lets
+    # it start, and no-new-privileges then means the file capability is NOT granted: turnserver
+    # runs with an empty effective set (the test asserts CapEff 0). coturn shares the host
+    # network, so an active NET_BIND_SERVICE would let a compromised turnserver bind ports such
+    # as 53 or 67 on the home LAN. Keep these flags identical to the docker run flags in
+    # coturn/test-coturn.sh.
     cap_drop:
       - ALL
     cap_add:
       - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+    # No core dumps: a crash must not write memory (which holds the secret) to disk.
+    ulimits:
+      core: 0
+    # Start turnserver directly as pid 1, so the image's shell entrypoint never expands the
+    # secret. Found through PATH, so it works wherever the image keeps the binary.
+    entrypoint: ['turnserver']
     # The secret comes from .env (compose substitution), never from a file in the repo.
     # No env_file here: coturn must not receive the backend's other secrets.
     command:
@@ -91,8 +99,12 @@ services:
       - '--static-auth-secret=${TURN_SHARED_SECRET:?Set TURN_SHARED_SECRET in .env}'
       # Replacing the image's default command drops its external-ip detection; behind a
       # home NAT the relay must advertise the public IP: "<public-ip>/<pi-lan-ip>".
-      - '--external-ip=${TURN_EXTERNAL_IP:?Set TURN_EXTERNAL_IP in .env}'
-      # Relays only on the Pi's LAN IPv4 (the second half of TURN_EXTERNAL_IP), never on IPv6.
+      - '--external-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}/${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
+      # The home's public IP is also denied as a peer, explicitly. Otherwise only coturn's
+      # rewrite of the external IP to the relay IP protects the router: a wrong TURN_PUBLIC_IP
+      # would let peers at the real WAN IP be relayed (hairpin NAT) to the router's own services.
+      - '--denied-peer-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}'
+      # Relays only on the Pi's LAN IPv4 (the second half of --external-ip), never on IPv6.
       - '--relay-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
       # Listen only on the Pi's LAN IPv4 (where the router forwards 3478) and loopback, not on
       # every interface. Keep identical to coturn/test-coturn.sh.

@@ -9,6 +9,9 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 image="$(sed -n 's|^ *image: \(coturn/coturn:[^ ]*\).*|\1|p' "$here/../compose.yaml" | head -n1)"
 test_secret="ci-only-test-secret-not-used-anywhere"
 container_name="coturn-test"
+# Stands in for the home's public IP: the Pi passes --external-ip=<public>/<relay> and
+# --denied-peer-ip=<public> (compose.yaml), so a peer at the public IP is refused explicitly.
+test_public_ip="203.0.113.7"
 failures=0
 
 usernames_file="$(mktemp)"
@@ -22,7 +25,7 @@ trap cleanup EXIT
 
 # $1 = seconds until the credential expires (negative = already expired). Prints
 # "username password" (coturn REST credential, PLAN.md 3.5). Every call gets its own random
-# username, so user-quota=12 never interferes between checks.
+# username, so user-quota=6 never interferes between checks.
 make_credential() {
   local username password
   username="$(( $(date +%s) + $1 )):$(openssl rand -hex 6)"
@@ -175,15 +178,24 @@ listening_ip_flags=(--listening-ip="$relay_ip")
 [ "$relay_ip" != "127.0.0.1" ] && listening_ip_flags+=(--listening-ip=127.0.0.1)
 
 cleanup
-# Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only.
+# Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only, no
+# capabilities except NET_BIND_SERVICE (needed by the image's file capability on turnserver, which
+# no-new-privileges then does not grant, so turnserver runs with an empty effective set), no core
+# dumps, and turnserver as the entrypoint (pid 1), so no shell ever expands the secret.
+# Test-only differences from the Pi: the test secret, a documentation address as the public IP,
+# the runner's relay IP, and --stale-nonce=20 (the nonce rotates after 20 s, so the refresh probe
+# below also covers a nonce rotation; the Pi keeps the config's default).
 docker run -d --name "$container_name" --network host --read-only \
-  --cap-drop ALL --cap-add NET_BIND_SERVICE \
+  --cap-drop ALL --cap-add NET_BIND_SERVICE --security-opt no-new-privileges:true \
+  --ulimit core=0 \
   --tmpfs /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /var/log:size=1m,mode=1777,noexec,nosuid,nodev \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
+  --entrypoint turnserver \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
-  --external-ip=127.0.0.1 --relay-ip="$relay_ip" "${listening_ip_flags[@]}" >/dev/null || exit 1
+  --external-ip="$test_public_ip/$relay_ip" --denied-peer-ip="$test_public_ip" \
+  --relay-ip="$relay_ip" "${listening_ip_flags[@]}" --stale-nonce=20 >/dev/null || exit 1
 if ! wait_for_turn_port; then
   echo "FAIL: coturn did not start. Diagnostics:"
   echo "-- docker logs:"
@@ -194,7 +206,7 @@ if ! wait_for_turn_port; then
   for turnserver_path in /usr/bin/turnserver /usr/local/bin/turnserver; do
     # getcap may be missing from the image; fall back to getfattr, then to python3's getxattr.
     docker run --rm --network none --entrypoint sh "$image" -c \
-      "ls -l $turnserver_path; if command -v getcap >/dev/null; then getcap $turnserver_path; \
+      "command -v turnserver; ls -l $turnserver_path; if command -v getcap >/dev/null; then getcap $turnserver_path; \
        elif command -v getfattr >/dev/null; then getfattr -d -m - $turnserver_path; \
        else echo 'no getcap or getfattr in the image'; fi" 2>&1 \
       | mask_values | sed "s|$test_secret|<SECRET>|g; s|^|  |"
@@ -208,6 +220,20 @@ fi
 strip_log_prefix() { sed -E 's/^[0-9]+: \([0-9]+\): //'; }
 sleep 2 # let the banner finish printing after the port opens
 startup_banner="$(docker logs "$container_name" 2>&1 | strip_log_prefix | sort -u)"
+
+# turnserver is pid 1 (entrypoint) and must run with no effective capabilities: the file
+# capability NET_BIND_SERVICE is not granted under no-new-privileges. A compromised turnserver on
+# the host network could otherwise bind ports below 1024 (53, 67, ...) on the home LAN.
+process_status="$(docker exec -u 0 "$container_name" sh -c 'cat /proc/1/comm; grep -E "^(CapEff|NoNewPrivs):" /proc/1/status' 2>&1)"
+if [ "$(sed -n '1p' <<<"$process_status")" = "turnserver" ] \
+  && grep -Eq '^CapEff:[[:space:]]+0+$' <<<"$process_status" \
+  && grep -Eq '^NoNewPrivs:[[:space:]]+1$' <<<"$process_status"; then
+  echo "PASS: turnserver is pid 1 with CapEff 0 and NoNewPrivs 1"
+else
+  echo "FAIL: turnserver is not pid 1 with CapEff 0 and NoNewPrivs 1:"
+  echo "$process_status" | head -n 5
+  failures=$((failures + 1))
+fi
 
 # bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
 # well under that, and coturn is restarted (fresh state) between groups.
@@ -240,8 +266,9 @@ restart_or_exit
 echo "== Group 4: IPv6 relay request and IPv6 / IPv4-mapped peers (raw STUN) =="
 read -r probe_user probe_pass < <(make_credential 600)
 # Not -I: the probe imports refresh_after_expiry.py from its own folder (repo code, not user input).
-printf '%s\n' ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1 >>"$peers_file"
-address_family_output="$(python3 "$here/address_family_probe.py" "$probe_user" "$probe_pass" 2>&1)"
+printf '%s\n' "$test_public_ip" ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1 >>"$peers_file"
+# Extra IPv4 peers for the probe: the "home public IP" (--denied-peer-ip) and the relay's own address.
+address_family_output="$(python3 "$here/address_family_probe.py" "$probe_user" "$probe_pass" "$test_public_ip" "$relay_ip" 2>&1)"
 echo "$address_family_output"
 # $1 = label as printed by the probe, $2 = regex the outcome must match
 expect_probe() {
@@ -255,9 +282,38 @@ expect_probe() {
 expect_probe "ipv6 relay request" "error 440"
 expect_probe "permission $public_peer" "success"
 # 403 Forbidden (deny list) or 443 Peer Address Family Mismatch (IPv6 peer on an IPv4 relay).
+# 403 for the home's public IP (explicit --denied-peer-ip, not only coturn's rewrite of the
+# external IP to the relay IP: a hairpin to the router's own services) and for the relay's own IP.
+expect_probe "permission $test_public_ip" "error 403"
+expect_probe "permission $relay_ip" "error 403"
 for ipv6_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
   expect_probe "permission $ipv6_peer" "error (403|443)"
 done
+
+# Refresh-after-expiry probe (result recorded in README.md for #26, informational, not asserted):
+# allocate with a credential that expires 5 s later, wait 25 s (longer than the test-only
+# --stale-nonce=20, so the server has rotated the nonce), then send a Refresh for that allocation.
+# It runs BEFORE the log checks below, so its traffic is checked too. The server runs with host
+# networking, so the probe on the runner reaches it on 127.0.0.1. Restart first, so the probe
+# starts from fresh state and shares no quota with the other checks.
+if ! restart_coturn; then
+  echo "FAIL: coturn did not restart"; failures=$((failures + 1))
+fi
+read -r short_user short_pass < <(make_credential 5)
+probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 25 2>&1)"
+if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then
+  grep -E '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"
+  grep -E '^\(' <<<"$probe_output" # notes: nonce rotation seen or not, error code if refused
+  # A refused refresh may make coturn print "Cannot find credentials of user" for this username,
+  # like the deliberate failed logins; accept that line for it (the Pi discards console output).
+  if grep -Fxq 'REFRESH AFTER EXPIRY: refused' <<<"$probe_output"; then
+    echo "$short_user" >>"$failed_login_usernames_file"
+  fi
+else
+  echo "FAIL: refresh-after-expiry probe did not produce a result"
+  echo "$probe_output" | tail -n 5
+  failures=$((failures + 1))
+fi
 
 # The server logs must not contain any username or test peer IP. Logging is off in the config, but
 # coturn 4.6.3 still prints a startup banner (captured above, before any client connected, so it
@@ -270,6 +326,9 @@ grep -E '^denied-peer-ip=' "$here/turnserver.conf" | cut -d= -f2- | sort -u >"$d
 if [ ! -s "$denied_ranges_file" ]; then
   echo "FAIL: no denied-peer-ip ranges found in turnserver.conf"; failures=$((failures + 1))
 fi
+# Plus the one deny range of the command line (--denied-peer-ip=<public IP>, as compose.yaml does).
+{ cat "$denied_ranges_file"; echo "$test_public_ip"; } | sort -u >"$denied_ranges_file.new" \
+  && mv "$denied_ranges_file.new" "$denied_ranges_file"
 if grep -Eq '(^|: )(WARNING|ERROR)' <<<"$startup_banner"; then
   echo "FAIL: coturn's startup banner has a WARNING or ERROR line (values masked):"
   grep -E '(^|: )(WARNING|ERROR)' <<<"$startup_banner" | head -n 10 | mask_values
@@ -360,23 +419,6 @@ if (exec 3<>/dev/tcp/127.0.0.1/5766) 2>/dev/null; then
   echo "FAIL: CLI port 5766 is open"; failures=$((failures + 1))
 else
   echo "PASS: CLI port 5766 closed"
-fi
-
-# Refresh-after-expiry probe (result recorded in README.md for #26, not asserted): allocate
-# with a credential that expires 5 s later, wait 10 s, then send a Refresh for that allocation.
-# The server runs with host networking, so the probe on the runner reaches it on 127.0.0.1.
-# Restart first, so the probe starts from fresh state and shares no quota with the other checks.
-if ! restart_coturn; then
-  echo "FAIL: coturn did not restart"; failures=$((failures + 1))
-fi
-read -r short_user short_pass < <(make_credential 5)
-probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 10 2>&1)"
-if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then
-  grep -E '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"
-else
-  echo "FAIL: refresh-after-expiry probe did not produce a result"
-  echo "$probe_output" | tail -n 5
-  failures=$((failures + 1))
 fi
 
 if [ "$failures" -eq 0 ]; then

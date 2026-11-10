@@ -1,10 +1,11 @@
 """Probe: does the relay refuse IPv6 relays and IPv6 / IPv4-mapped peers with specific errors?
 
-Usage: address_family_probe.py USERNAME PASSWORD [SERVER_HOST]
+Usage: address_family_probe.py USERNAME PASSWORD [EXTRA_PEER ...]    (server: 127.0.0.1:3478)
 
 1. Allocate asking for an IPv6 relay (REQUESTED-ADDRESS-FAMILY = IPv6).
-2. Allocate an IPv4 relay, then CreatePermission for a public IPv4 peer (control: must succeed)
-   and for IPv6 and IPv4-mapped IPv6 peers (must be refused).
+2. Allocate an IPv4 relay, then CreatePermission for a public IPv4 peer (control: must succeed),
+   for each EXTRA_PEER (the caller expects a refusal) and for IPv6 and IPv4-mapped IPv6 peers
+   (must be refused).
 Prints one line per check: "PROBE <label>: success" or "PROBE <label>: error <code>".
 Exits with status 2 (nothing on stdout) if the probe itself could not run. Standard library only.
 """
@@ -119,12 +120,13 @@ def new_socket(server_host: str) -> socket.socket:
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) not in (2, 3):
+    if len(arguments) < 2:
         print(__doc__, file=sys.stderr)
         return 2
     username = arguments[0].encode()
     password = arguments[1].encode()
-    server_host = arguments[2] if len(arguments) == 3 else "127.0.0.1"
+    extra_peers = arguments[2:]
+    server_host = "127.0.0.1"
     transport = encode_attribute(ATTR_REQUESTED_TRANSPORT, struct.pack("!B3x", UDP_PROTOCOL_NUMBER))
     results: list[str] = []
 
@@ -152,7 +154,7 @@ def main(arguments: list[str]) -> int:
     results.append(
         f"PROBE permission {PUBLIC_PEER}: {create_permission(server, PUBLIC_PEER, credentials)}"
     )
-    for peer in REFUSED_PEERS:
+    for peer in [*extra_peers, *REFUSED_PEERS]:
         results.append(f"PROBE permission {peer}: {create_permission(server, peer, credentials)}")
     server.close()
 

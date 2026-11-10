@@ -132,14 +132,20 @@ def main(arguments: list[str]) -> int:
     # 3. Wait until the credential has expired, then refresh the same allocation.
     time.sleep(wait_seconds)
     lifetime = encode_attribute(ATTR_LIFETIME, struct.pack("!I", 600))
+    # With the test-only --stale-nonce=20 and a wait longer than that, the first Refresh gets 438
+    # (stale nonce); the retry with the new nonce is the one that shows whether the expired
+    # credential is still accepted.
+    nonce_rotated = False
     for _attempt in range(2):
         message_type, attributes = exchange(
             server, build_request(REFRESH_REQUEST, lifetime, (username, realm, nonce, password))
         )
         if error_code_of(attributes) == STALE_NONCE_ERROR_CODE and ATTR_NONCE in attributes:
             nonce = attributes[ATTR_NONCE]  # the server rotated the nonce; ask again
+            nonce_rotated = True
             continue
         break
+    print(f"(server rotated the nonce before the refresh: {nonce_rotated})", file=sys.stderr)
 
     if message_type == REFRESH_SUCCESS:
         print("REFRESH AFTER EXPIRY: allowed")
