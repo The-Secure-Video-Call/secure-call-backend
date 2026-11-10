@@ -84,6 +84,12 @@ the second half of `TURN_EXTERNAL_IP`), and `turnserver.conf` sets
 IPv6 relay request should be answered with `440`. I found no 4.6.3 option that refuses IPv6
 allocation more directly. The test (`address_family_probe.py`) checks the `440` and the
 refusals of IPv6 and mapped peers; if 4.6.3 answers differently, CI shows the real code.
+
+coturn also *listens* only on `TURN_RELAY_IP` and `127.0.0.1` (`--listening-ip`), not on every
+interface of the Pi (IPv6, Docker bridges). `no-rfc5780` turns off NAT behaviour discovery,
+which needs two public IPs and is not used by WebRTC, and the pid file lives on the `/var/tmp`
+tmpfs because the root filesystem is read-only. The test fails on any WARNING or ERROR line in
+coturn's startup output, so an option coturn does not understand shows up in CI.
 The IPv6 and mapped deny ranges in `turnserver.conf` stay as defence in depth.
 
 ### Logging

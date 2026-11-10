@@ -167,6 +167,9 @@ restart_coturn() {
 # The Pi passes --relay-ip=$TURN_RELAY_IP (its LAN IPv4); the test uses the runner's own IPv4.
 relay_ip="$(hostname -I | tr ' ' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')"
 relay_ip="${relay_ip:-127.0.0.1}"
+# Same as compose.yaml: listen on the relay IPv4 and loopback only (once, if they are the same).
+listening_ip_flags=(--listening-ip="$relay_ip")
+[ "$relay_ip" != "127.0.0.1" ] && listening_ip_flags+=(--listening-ip=127.0.0.1)
 
 cleanup
 # Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only.
@@ -177,7 +180,7 @@ docker run -d --name "$container_name" --network host --read-only \
   --tmpfs /var/log:size=1m,mode=1777,noexec,nosuid,nodev \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
-  --external-ip=127.0.0.1 --relay-ip="$relay_ip" >/dev/null || exit 1
+  --external-ip=127.0.0.1 --relay-ip="$relay_ip" "${listening_ip_flags[@]}" >/dev/null || exit 1
 if ! wait_for_turn_port; then
   echo "FAIL: coturn did not start. Diagnostics:"
   echo "-- docker logs:"
@@ -278,7 +281,10 @@ if [ "$listed_ranges" != "$(cat "$denied_ranges_file")" ]; then
   failures=$((failures + 1))
 fi
 server_logs="$(docker logs "$container_name" 2>&1)"
-new_log_lines="$(strip_log_prefix <<<"$server_logs" | grep -v '^[[:space:]]*$' | grep -v -x -F -f <(printf '%s\n' "$startup_banner") || true)"
+# The one runtime line coturn 4.6.3 prints even with logging off is an allocation counter (no
+# username, no address), so exactly that pattern is allowed too.
+new_log_lines="$(strip_log_prefix <<<"$server_logs" | grep -v '^[[:space:]]*$' | grep -v -x -F -f <(printf '%s\n' "$startup_banner") \
+  | grep -v -x -E 'DEBUG: Global turn allocation count (incremented|decremented), now [0-9]+' || true)"
 if [ -n "$new_log_lines" ]; then
   echo "FAIL: coturn logged lines beyond its startup banner during the test (values masked):"
   printf '%s\n' "$new_log_lines" | head -n 10 | mask_values

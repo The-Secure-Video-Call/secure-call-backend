@@ -94,6 +94,10 @@ services:
       - '--external-ip=${TURN_EXTERNAL_IP:?Set TURN_EXTERNAL_IP in .env}'
       # Relays only on the Pi's LAN IPv4 (the second half of TURN_EXTERNAL_IP), never on IPv6.
       - '--relay-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
+      # Listen only on the Pi's LAN IPv4 (where the router forwards 3478) and loopback, not on
+      # every interface. Keep identical to coturn/test-coturn.sh.
+      - '--listening-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
+      - '--listening-ip=127.0.0.1'
     # Docker keeps stdout on disk; keep little of it. (The secret is visible in
     # `docker inspect` and the process list on the Pi; keep the Pi's users trusted.)
     logging:
