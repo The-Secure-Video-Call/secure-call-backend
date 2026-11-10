@@ -50,9 +50,13 @@ def build_request(
     message_type: int,
     attributes: bytes,
     credentials: tuple[bytes, bytes, bytes, bytes] | None,
+    transaction_id: bytes | None = None,
 ) -> bytes:
-    """credentials = (username, realm, nonce, password); adds USERNAME/REALM/NONCE/integrity."""
-    transaction_id = os.urandom(12)
+    """credentials = (username, realm, nonce, password); adds USERNAME/REALM/NONCE/integrity.
+
+    Pass transaction_id when an attribute (XOR-PEER-ADDRESS for IPv6) is derived from it."""
+    if transaction_id is None:
+        transaction_id = os.urandom(12)
     body = attributes
     if credentials is not None:
         username, realm, nonce, password = credentials

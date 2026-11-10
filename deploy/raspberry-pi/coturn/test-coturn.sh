@@ -34,7 +34,11 @@ run_client() {
   local username password
   read -r username password < <(make_credential "$1")
   if [ -n "${3-}" ]; then password="$3"; fi
-  docker exec "$container_name" timeout 20 turnutils_uclient -v -u "$username" -w "$password" -e "$2" -n 1 -m 1 127.0.0.1 2>&1
+  local client_output client_exit_code
+  client_output="$(docker exec "$container_name" timeout 20 turnutils_uclient -v -u "$username" -w "$password" -e "$2" -n 1 -m 1 127.0.0.1 2>&1)"
+  client_exit_code=$?
+  # The exit code travels with the output, so expect() can reject a timeout or a crash.
+  printf '%s\nCLIENT_EXIT_CODE=%s\n' "$client_output" "$client_exit_code"
 }
 
 # $1 label, $2 bound|forbidden|no_allocation, $3 client output
@@ -43,17 +47,22 @@ run_client() {
 #   peer allowed:           "channel bind: success"
 #   peer denied by config:  "channel bind: error 403 (Forbidden IP)"
 # bound         = allocation worked AND the channel bind to the peer succeeded
-# forbidden     = allocation worked AND the channel bind was refused with 403 (never a success)
-# no_allocation = no relay address was ever granted (bad or expired credential)
-# family_mismatch = the client could not get a relay of the peer's address family ("relay addr
-#               cannot be received"): the relay is IPv4-only, so an IPv6 peer is never relayed.
-#               Accepted as "refused" for IPv6 peers (containing ':') only. "unclear" always fails.
-# $4 = peer ip (optional)
+# forbidden     = allocation worked AND the channel bind was refused with
+#               "error 403 (Forbidden IP)" (never a success, never another 403)
+# no_allocation = no relay address was granted AND the output shows a 4xx error line (positive
+#               evidence of a refusal, e.g. 401 for a bad or expired credential)
+# Anything else ("unclear") fails. IPv6 and IPv4-mapped peers are not tested here: the client
+# only gets IPv4 relays; address_family_probe.py checks them with specific error codes.
 expect() {
-  local label="$1" want="$2" output="$3" peer="${4-}" got
-  # An unreachable container or a client crash must never count as a result.
-  if grep -Eqi 'Error response from daemon|No such container|is not running' <<<"$output"; then
-    echo "FAIL: $label (container or client not usable)"; failures=$((failures + 1)); return
+  local label="$1" want="$2" output="$3" got exit_code
+  # An unreachable container, a timeout or a client crash must never count as a result.
+  exit_code="$(sed -n 's/^CLIENT_EXIT_CODE=//p' <<<"$output" | tail -n 1)"
+  if [ -z "$exit_code" ] \
+    || grep -Eqi 'OCI runtime exec failed|Error response from daemon|No such container|is not running' <<<"$output" \
+    || [[ "$exit_code" =~ ^(124|125|126|127|1[3-4][0-9])$ ]]; then
+    echo "FAIL: $label (container or client not usable, exit code '${exit_code}')"
+    echo "$output" | tail -n 15
+    failures=$((failures + 1)); return
   fi
   # bound: a relay address was granted, the server sent no error (the 401 challenge that starts
   # every long-term-credential exchange is not an error), and either a bind/permission success
@@ -64,18 +73,13 @@ expect() {
     && { grep -Fq 'channel bind: success' <<<"$output" \
       || { grep -Eq 'tot_send_msgs=[1-9]' <<<"$output" && grep -Eq 'total send dropped 0([^0-9]|$)' <<<"$output"; }; }; then
     got=bound
-  elif grep -Fq 'Received relay addr' <<<"$output" && grep -Fq 'channel bind: error 403' <<<"$output"; then
+  elif grep -Fq 'Received relay addr' <<<"$output" \
+    && grep -Eq 'channel bind: error 403.*Forbidden IP' <<<"$output"; then
     got=forbidden
-  elif grep -Fq 'relay addr cannot be received' <<<"$output"; then
-    got=family_mismatch
-  elif ! grep -Fq 'Received relay addr' <<<"$output"; then
+  elif ! grep -Fq 'Received relay addr' <<<"$output" && grep -Eqi 'error[ :]*4[0-9][0-9]' <<<"$output"; then
     got=no_allocation
   else
     got=unclear
-  fi
-  if [ "$got" = family_mismatch ] && [ "$want" = forbidden ] && [[ "$peer" == *:* ]]; then
-    got=forbidden
-    echo "NOTE: $label: IPv4-only relay, IPv6 peer not relayable (family_mismatch accepted)"
   fi
   if [ "$got" = "$want" ]; then
     echo "PASS: $label"
@@ -99,29 +103,64 @@ wait_for_turn_port() {
 
 restart_coturn() { docker restart "$container_name" >/dev/null && wait_for_turn_port; }
 
+# The Pi passes --relay-ip=$TURN_RELAY_IP (its LAN IPv4); the test uses the runner's own IPv4.
+relay_ip="$(hostname -I | tr ' ' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')"
+relay_ip="${relay_ip:-127.0.0.1}"
+
 cleanup
 docker run -d --name "$container_name" --network host \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
-  "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" --external-ip=127.0.0.1 >/dev/null || exit 1
+  "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
+  --external-ip=127.0.0.1 --relay-ip="$relay_ip" >/dev/null || exit 1
 wait_for_turn_port || { echo "FAIL: coturn did not start"; exit 1; }
-echo "turnutils_uclient address-family options (for reference):"
-docker exec "$container_name" turnutils_uclient -h 2>&1 | grep -E '^ +-[46XY]' || true
+
+# bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
+# well under that, and coturn is restarted (fresh state) between groups.
+restart_or_exit() { restart_coturn || { echo "FAIL: coturn did not restart"; exit 1; }; }
 
 public_peer="8.8.8.8"
 
+echo "== Group 1: credentials and common private peers =="
 expect "valid credential allocates and may relay to a public peer" bound "$(run_client 600 "$public_peer")"
 expect "wrong credential refused" no_allocation "$(run_client 600 "$public_peer" "wrong-password")"
 expect "expired credential refused" no_allocation "$(run_client -60 "$public_peer")"
 for private_peer in 127.0.0.1 192.168.1.10 10.0.0.5 172.16.0.5 169.254.1.1 0.0.0.0 100.64.0.1 \
   224.0.0.1; do
-  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")" "$private_peer"
+  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")"
 done
 
-# bps-capacity / max-bps allows about 37 concurrent allocations (README), and the checks above
-# are close to that, so restart for fresh state before the IPv6 and mapped group.
-restart_coturn || { echo "FAIL: coturn did not restart"; exit 1; }
-for private_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
-  expect "relay to $private_peer refused" forbidden "$(run_client 600 "$private_peer")" "$private_peer"
+restart_or_exit
+echo "== Group 2: range edges are denied =="
+for edge_peer in 0.0.0.1 100.127.255.255 172.31.255.255 198.19.0.1 192.0.0.1 240.0.0.1 255.255.255.255; do
+  expect "range edge $edge_peer refused" forbidden "$(run_client 600 "$edge_peer")"
+done
+
+restart_or_exit
+echo "== Group 3: neighbours of the denied ranges are allowed =="
+for neighbour_peer in 11.0.0.1 100.128.0.1 172.32.0.1 198.20.0.1 1.1.1.1; do
+  expect "neighbour $neighbour_peer allowed" bound "$(run_client 600 "$neighbour_peer")"
+done
+
+restart_or_exit
+echo "== Group 4: IPv6 relay request and IPv6 / IPv4-mapped peers (raw STUN) =="
+read -r probe_user probe_pass < <(make_credential 600)
+# Not -I: the probe imports refresh_after_expiry.py from its own folder (repo code, not user input).
+address_family_output="$(python3 "$here/address_family_probe.py" "$probe_user" "$probe_pass" 2>&1)"
+echo "$address_family_output"
+# $1 = label as printed by the probe, $2 = regex the outcome must match
+expect_probe() {
+  if grep -Eq "^PROBE $1: $2\$" <<<"$address_family_output"; then
+    echo "PASS: $1 -> expected outcome"
+  else
+    echo "FAIL: $1 (wanted $2)"; failures=$((failures + 1))
+  fi
+}
+# 440 Address Family not Supported: the relay has no IPv6 address. Control: a public IPv4 peer works.
+expect_probe "ipv6 relay request" "error 440"
+expect_probe "permission $public_peer" "success"
+# 403 Forbidden (deny list) or 443 Peer Address Family Mismatch (IPv6 peer on an IPv4 relay).
+for ipv6_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1; do
+  expect_probe "permission $ipv6_peer" "error (403|443)"
 done
 
 # The server logs must not contain any username or the peer IP. Logging is off in the config, so
@@ -134,6 +173,33 @@ if grep -Fq -f "$usernames_file" <<<"$server_logs" || grep -Fq "$public_peer" <<
   failures=$((failures + 1))
 else
   echo "PASS: logs contain no username or peer IP"
+fi
+
+# Logging must stay off by configuration, not only by luck: no verbose, syslog or log-binding
+# option in the config (comments ignored) or on the container's command line.
+if grep -Ev '^[[:space:]]*#' "$here/turnserver.conf" \
+  | grep -Eiq '^[[:space:]]*(verbose|syslog|log-binding|Verbose)([[:space:]]|=|$)'; then
+  echo "FAIL: turnserver.conf enables verbose, syslog or log-binding"; failures=$((failures + 1))
+elif grep -Ev '^[[:space:]]*#' "$here/../compose.yaml" | grep -Eq -- "--verbose|--syslog|--log-binding|'-v'|'-V'"; then
+  echo "FAIL: compose.yaml passes a verbose, syslog or log-binding option"; failures=$((failures + 1))
+else
+  echo "PASS: config has no verbose, syslog or log-binding"
+fi
+
+# No log files may exist in the container after the run (regular files written in the last
+# hour that look like logs). A failing docker exec is a failure, not "no files".
+log_files_output="$(docker exec "$container_name" find / -xdev -type f -mmin -60 \
+  \( -name '*.log' -o -name 'turn_*' -o -path '/var/log/*' \) 2>&1)"
+log_files_exit_code=$?
+if [ "$log_files_exit_code" -ne 0 ]; then
+  echo "FAIL: could not search the container for log files (exit $log_files_exit_code)"
+  echo "$log_files_output" | tail -n 5
+  failures=$((failures + 1))
+elif [ -n "$log_files_output" ]; then
+  echo "FAIL: log files exist in the container:"; echo "$log_files_output" | head -n 10
+  failures=$((failures + 1))
+else
+  echo "PASS: no log files in the container"
 fi
 
 # The admin CLI must be off.

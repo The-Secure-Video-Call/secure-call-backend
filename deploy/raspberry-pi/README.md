@@ -19,6 +19,8 @@ Manual steps (owner):
    `TURN_SHARED_SECRET`. Then `docker compose up -d coturn`. The same value goes to the backend
    later (#26). Never commit it.
    Also set `TURN_EXTERNAL_IP` (`<public IP>/<Pi LAN IP>`); without it the relay advertises the LAN address.
+   And set `TURN_RELAY_IP` to the Pi's LAN IPv4 (the second half of `TURN_EXTERNAL_IP`), so relays
+   are IPv4-only (see "IPv6" below). Compose refuses to start without it.
    Note the secret is visible to local users of the Pi via `docker inspect`.
 4. **Backend `TURN_*`:** keep `TURN_SHARED_SECRET`/`TURN_URLS` unset for the backend until
    The-Secure-Video-Call/secure-call#47 is live.
@@ -44,10 +46,25 @@ This is intended; the test restarts coturn between groups of checks so it never 
 
 ### Tests
 
-`coturn/test-coturn.sh` starts the pinned image with this config and a test secret and checks
-that (with a fresh credential per check, so `user-quota` never interferes) a valid credential can bind a public peer (8.8.8.8), that wrong and expired credentials get
-no allocation, and that 15 private, loopback, link-local, multicast and IPv4-mapped peers get
-`403 Forbidden IP`. It needs Docker and is run by CI.
+`coturn/test-coturn.sh` starts the pinned image with this config and a test secret (a fresh
+credential per check, so `user-quota` never interferes; coturn is restarted between groups for
+the bandwidth quota). It checks that:
+
+- a valid credential can relay to a public peer (8.8.8.8);
+- wrong and expired credentials get no allocation, shown by a 4xx error line (a timeout, a client
+  crash or a failed `docker exec` fails the check);
+- 8 private, loopback, link-local, multicast and unspecified IPv4 peers get
+  `channel bind: error 403 (Forbidden IP)`;
+- the edges of each denied range (`0.0.0.1`, `100.127.255.255`, `172.31.255.255`, `198.19.0.1`,
+  `192.0.0.1`, `240.0.0.1`, `255.255.255.255`) get the same refusal, and their neighbours
+  (`11.0.0.1`, `100.128.0.1`, `172.32.0.1`, `198.20.0.1`, `1.1.1.1`) are allowed;
+- a raw STUN probe (`coturn/address_family_probe.py`) gets `440` for an IPv6 relay request, and
+  `403` or `443` from CreatePermission for 7 IPv6 and IPv4-mapped peers on an IPv4 allocation
+  (with a public IPv4 peer as a control that must succeed);
+- logs contain no username or peer IP, the config enables no `verbose`, `syslog` or
+  `log-binding`, no log files exist in the container, and the CLI port is closed.
+
+It needs Docker and is run by CI.
 
 Do not add `denied-peer-ip=::ffff:0.0.0.0-::ffff:255.255.255.255`: coturn matches IPv4 peers
 against the mapped range too, so it refuses every public IPv4 peer. The config denies only the
@@ -58,11 +75,16 @@ run 42690621732.
 
 ### IPv6
 
-This relay is IPv4-only and never relays to IPv6 peers. The test client only gets an IPv4 relay,
-so for IPv6 and IPv4-mapped peers it reports an address-family mismatch
-(`relay addr cannot be received`), which the script accepts as "refused" for IPv6 peers only.
-The IPv6 and mapped deny ranges in `turnserver.conf` are defence in depth and are not exercised
-by the test.
+This relay is IPv4-only. coturn uses host networking, so without a fixed relay address it could
+hand out IPv6 relays, and home devices with global IPv6 addresses are not covered by any deny
+range (their traffic would also come from inside the LAN, past the router's IPv6 firewall).
+So `compose.yaml` passes `--relay-ip=${TURN_RELAY_IP}` (the Pi's LAN IPv4, the same address as
+the second half of `TURN_EXTERNAL_IP`), and `turnserver.conf` sets
+`allocation-default-address-family=ipv4`. Relays then only exist on one IPv4 address, and an
+IPv6 relay request should be answered with `440`. I found no 4.6.3 option that refuses IPv6
+allocation more directly. The test (`address_family_probe.py`) checks the `440` and the
+refusals of IPv6 and mapped peers; if 4.6.3 answers differently, CI shows the real code.
+The IPv6 and mapped deny ranges in `turnserver.conf` stay as defence in depth.
 
 ### Logging
 

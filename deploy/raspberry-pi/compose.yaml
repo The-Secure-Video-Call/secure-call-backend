@@ -71,6 +71,8 @@ services:
       # Replacing the image's default command drops its external-ip detection; behind a
       # home NAT the relay must advertise the public IP: "<public-ip>/<pi-lan-ip>".
       - '--external-ip=${TURN_EXTERNAL_IP:?Set TURN_EXTERNAL_IP in .env}'
+      # Relays only on the Pi's LAN IPv4 (the second half of TURN_EXTERNAL_IP), never on IPv6.
+      - '--relay-ip=${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}'
     # Docker keeps stdout on disk; keep little of it. (The secret is visible in
     # `docker inspect` and the process list on the Pi; keep the Pi's users trusted.)
     logging:
