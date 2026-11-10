@@ -13,8 +13,9 @@ failures=0
 
 usernames_file="$(mktemp)"
 peers_file="$(mktemp)"
+denied_ranges_file="$(mktemp)"
 
-cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file" "$peers_file"; }
+cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file" "$peers_file" "$denied_ranges_file"; }
 trap cleanup EXIT
 
 # $1 = seconds until the credential expires (negative = already expired). Prints
@@ -245,24 +246,53 @@ for ipv6_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192
   expect_probe "permission $ipv6_peer" "error (403|443)"
 done
 
-# The server logs must not contain any username or the peer IP. Logging is off in the config, so
-# they should be empty; if not, show the offending lines with the values masked.
-# coturn 4.6.3 always opens a small dated log file (log-file is only a base name) and announces
-# it on stdout. Only startup lines on this short allow-list are accepted; any other line, and any
-# test username or peer IP anywhere, fails.
-allowed_log_line_pattern='^(INFO: )?log file opened: /var/log/[A-Za-z0-9_.-]+$'
+# The server logs must not contain any username or test peer IP. Logging is off in the config.
+# coturn 4.6.3 prints a few startup lines to stdout anyway. Only these are accepted (whole line,
+# optional "INFO: " prefix):
+#   log file opened: /var/log/<name>   (the dated log file lives on tmpfs, see compose.yaml)
+#   System cpu num is <n> / System enable num is <n>
+#   Black listing: <range>             (only if <range> is a denied-peer-ip line of turnserver.conf)
+# Any other line fails, so any WARNING or ERROR line fails.
+grep -E '^denied-peer-ip=' "$here/turnserver.conf" | cut -d= -f2- >"$denied_ranges_file"
+if [ ! -s "$denied_ranges_file" ]; then
+  echo "FAIL: no denied-peer-ip ranges found in turnserver.conf"; failures=$((failures + 1))
+fi
+allowed_log_line_pattern='^(INFO: )?(log file opened: /var/log/[A-Za-z0-9_.-]+|System cpu num is [0-9]+|System enable num is [0-9]+)$'
 server_logs="$(docker logs "$container_name" 2>&1)"
-unexpected_log_lines="$(grep -Ev -e "$allowed_log_line_pattern" <<<"$server_logs" | grep -v '^[[:space:]]*$')"
+unexpected_log_lines=""
+black_listing_count=0
+other_log_lines=""
+while IFS= read -r log_line; do
+  [ -z "${log_line//[[:space:]]/}" ] && continue
+  stripped_line="${log_line#INFO: }"
+  if [[ "$stripped_line" == "Black listing: "* ]]; then
+    listed_range="${stripped_line#Black listing: }"
+    # A single address may be printed as "a-a"; accept it for an "a" line.
+    if grep -Fxq -e "$listed_range" "$denied_ranges_file" \
+      || { [[ "$listed_range" =~ ^(.+)-(.+)$ ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ] \
+        && grep -Fxq -e "${BASH_REMATCH[1]}" "$denied_ranges_file"; }; then
+      black_listing_count=$((black_listing_count + 1))
+    else
+      unexpected_log_lines+="$log_line"$'\n'
+    fi
+  elif grep -Eq -e "$allowed_log_line_pattern" <<<"$log_line"; then
+    other_log_lines+="$log_line"$'\n'
+  else
+    unexpected_log_lines+="$log_line"$'\n'
+  fi
+done <<<"$server_logs"
 if [ -n "$unexpected_log_lines" ]; then
   echo "FAIL: docker logs contain lines outside the allow-list. Lines (values masked):"
-  echo "$unexpected_log_lines" | head -n 10 | mask_values
+  printf '%s' "$unexpected_log_lines" | head -n 10 | mask_values
   failures=$((failures + 1))
-elif grep -Fwq -f "$usernames_file" -f "$peers_file" <<<"$server_logs"; then
+# Allowed Black listing lines are exact config ranges (they contain edge addresses such as
+# 255.255.255.255 that the test also uses as peers), so only the other lines are scanned for peers.
+elif grep -Fwq -f "$usernames_file" <<<"$server_logs" || grep -Fwq -f "$peers_file" <<<"$other_log_lines"; then
   echo "FAIL: coturn logs contain a username or peer IP. Lines (values masked):"
-  grep -Fw -f "$usernames_file" -f "$peers_file" <<<"$server_logs" | head -n 10 | mask_values
+  { grep -Fw -f "$usernames_file" <<<"$server_logs"; grep -Fw -f "$peers_file" <<<"$other_log_lines"; } | head -n 10 | mask_values
   failures=$((failures + 1))
 else
-  echo "PASS: docker logs hold only allow-listed startup lines, no username or peer IP"
+  echo "PASS: docker logs hold only allow-listed startup lines ($black_listing_count Black listing lines from the config), no username or peer IP, no WARNING or ERROR"
 fi
 
 # Logging must stay off by configuration, not only by luck: no verbose, syslog or log-binding

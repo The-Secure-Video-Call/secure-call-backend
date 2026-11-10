@@ -104,8 +104,15 @@ peer IP; `/dev/shm/mongoc-1` holds only binary counters; `/var/tmp/turnserver.pi
 The test inspects the container (as root, before each restart and at the end): a log file on the
 real filesystem fails, and a file on the tmpfs mounts is printed (masked) and fails if it contains
 a test username or peer IP. `docker logs` may contain only the line `[INFO: ]log file opened:
-/var/log/<name>` (whole-line match); any other line fails. Startup errors are therefore not visible in `docker logs`; to
+/var/log/<name>`, `System cpu num is <n>`, `System enable num is <n>`, and `Black listing: <range>`
+(only when the range is a `denied-peer-ip` line parsed from `turnserver.conf`); any other line fails, so any
+`WARNING` or `ERROR` fails. Startup errors are therefore not visible in `docker logs`; to
 debug, temporarily run coturn by hand with a different config.
+
+Follow-up (not done): the `NET_BIND_SERVICE` capability exists only because of the file capability on
+`turnserver`. A small derived image that runs `setcap -r` on the binary would allow `cap_drop: ALL` plus
+`no-new-privileges`, at the cost of the pinned upstream digest (it would have to be built and pinned in CI).
+`NET_BIND_SERVICE` only allows binding ports below 1024, which is low risk.
 
 ### Refresh after expiry (input for #26)
 
