@@ -8,9 +8,16 @@ Security rules (PLAN.md 3.5):
 - malformed messages close the connection;
 - bad connections are closed with application codes, because Daphne (Autobahn) only lets an
   application send 1000 or 3000-4999 (anything else raises and skips `disconnect`):
-  4003 unsupported data (a binary frame), 4008 policy violation (a malformed or invalid message),
-  4009 message too big, 4029 rate limited (too many joins or messages; `error rate-limited` is
-  sent first; see rate_limits.py). 1000 stays the normal close (`room-full`, `room-expired`);
+  4003 unsupported data (a binary frame), 4008 policy violation (a malformed or invalid message,
+  or no `join` within JOIN_TIMEOUT_SECONDS), 4009 message too big, 4029 rate limited (too many
+  joins, messages or open connections; `error rate-limited` is sent first; see rate_limits.py).
+  1000 stays the normal close (`room-full`, `room-expired`);
+- open connections are capped per client and in total. Over a cap the socket is accepted, sent
+  `error rate-limited` and closed with 4029 rather than refused at the handshake: the web client
+  sees a refused handshake as a plain lost connection and retries at once, while a coded close
+  lets it tell "too many" from a network drop and back off. The slot is released in
+  `__call__`'s `finally`, so every way out (normal or abnormal close, a failed connect,
+  cancellation) frees it;
 - a room holds at most two connections and expires (see rooms.py): members get `room-expired`;
 - `signal` text is relayed to the other member exactly as received. It is validated like every
   message but never stored or logged; message contents and room IDs are never logged.
@@ -19,6 +26,7 @@ Relaying uses one Channels group per room. A group send reaches every member inc
 sender, so each relayed event carries the sender's channel name and the sender skips it.
 """
 
+import asyncio
 import logging
 import math
 import time
@@ -42,8 +50,11 @@ from signaling.protocol import (
     TurnCredentials,
 )
 from signaling.rate_limits import (
+    JOIN_TIMEOUT_SECONDS,
+    ConnectionLimiter,
     TokenBucket,
     client_key_for_ip,
+    new_connection_limiter,
     new_join_limiter,
     new_message_bucket,
     new_turn_credential_limiter,
@@ -60,6 +71,7 @@ CLOSE_RATE_LIMITED = 4029
 # Per client IP, in memory only (tests replace these with ones that use a fake clock).
 join_limiter = new_join_limiter()
 turn_credential_limiter = new_turn_credential_limiter()
+connection_limiter = new_connection_limiter()
 
 
 logger = logging.getLogger(__name__)
@@ -69,14 +81,52 @@ class SignalingConsumer(AsyncWebsocketConsumer):
     room_id: str | None = None
     client_key: bytes
     message_bucket: TokenBucket
+    limiter_holding_slot: ConnectionLimiter | None = None
+    join_attempted = False
+    join_timeout_task: asyncio.Task[None] | None = None
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        # Every way out of the connection passes here, including a connect that fails halfway
+        # and a cancelled task (for which `disconnect` is not called).
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            self.cancel_join_timeout()
+            self.release_connection_slot()
 
     async def connect(self) -> None:
         # Counters are keyed by an HMAC of the client IP (set by ClientAddressMiddleware).
         self.client_key = client_key_for_ip(self.scope.get("client_ip", "unknown"))
         self.message_bucket = new_message_bucket()
+        has_slot = connection_limiter.try_acquire(self.client_key)
+        if has_slot:
+            self.limiter_holding_slot = connection_limiter
         await self.accept()
+        if not has_slot:
+            await self.send_message(ErrorMessage(code="rate-limited"))
+            await self.close(code=CLOSE_RATE_LIMITED)
+            return
+        self.join_timeout_task = asyncio.create_task(self.close_if_not_joined())
+
+    def release_connection_slot(self) -> None:
+        limiter = self.limiter_holding_slot
+        if limiter is not None:
+            self.limiter_holding_slot = None
+            limiter.release(self.client_key)
+
+    def cancel_join_timeout(self) -> None:
+        if self.join_timeout_task is not None:
+            self.join_timeout_task.cancel()
+            self.join_timeout_task = None
+
+    async def close_if_not_joined(self) -> None:
+        await asyncio.sleep(JOIN_TIMEOUT_SECONDS)
+        if not self.join_attempted:
+            await self.close(code=CLOSE_POLICY_VIOLATION)
 
     async def disconnect(self, code: int) -> None:
+        self.cancel_join_timeout()
+        self.release_connection_slot()
         await self.leave_room()
 
     async def receive(self, text_data: str | None = None, bytes_data: bytes | None = None) -> None:
@@ -112,6 +162,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         if self.room_id is not None:
             await self.send_message(ErrorMessage(code="bad-message"))
             return
+        self.join_attempted = True  # a join in progress must not be cut off by the join timeout
         if not join_limiter.try_acquire(self.client_key):
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.close(code=CLOSE_RATE_LIMITED)
