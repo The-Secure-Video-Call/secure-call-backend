@@ -13,3 +13,6 @@ tests
 deploy
 protocol
 *.md
+# Test settings (hard-coded fallback secret key) and the schema export tool are not needed to serve.
+config/settings_test.py
+signaling/export_schema.py
