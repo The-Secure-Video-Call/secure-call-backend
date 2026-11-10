@@ -9,7 +9,7 @@
 #
 # Pinned by version and digest (the digest `docker pull coturn/coturn:4.6.3` reported in CI;
 # compare with `docker buildx imagetools inspect coturn/coturn:4.6.3`).
-FROM coturn/coturn:4.6.3@sha256:71c3c990283385567f11794ee692e3a47b66fd9b0bb39e42afbe776e331dd888
+FROM coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
 
 USER root
 # `setcap -r` if the tool is in the image; otherwise replace the binary with a plain copy (cp does
