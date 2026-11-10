@@ -1,6 +1,7 @@
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from django.test import Client
@@ -74,7 +75,12 @@ def test_check_deploy_still_passes() -> None:
         "DJANGO_ALLOWED_HOSTS": "signal.example.invalid",
         "SIGNALING_ALLOWED_ORIGINS": "https://call.example.invalid",
     }
-    for test_only_variable in ("DJANGO_DEBUG", "DJANGO_SECURE_SSL_REDIRECT"):
+    for test_only_variable in (
+        "DJANGO_DEBUG",
+        "DJANGO_SECURE_SSL_REDIRECT",
+        "POSTGRES_HOST",
+        "REDIS_URL",
+    ):
         production_like_environment.pop(test_only_variable, None)
 
     result = subprocess.run(
@@ -82,6 +88,7 @@ def test_check_deploy_still_passes() -> None:
         capture_output=True,
         text=True,
         check=False,
+        cwd=Path(__file__).resolve().parent.parent,
         env=production_like_environment,
     )
 
