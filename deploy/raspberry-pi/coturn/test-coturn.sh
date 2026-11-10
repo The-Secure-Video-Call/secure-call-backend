@@ -196,6 +196,13 @@ if ! wait_for_turn_port; then
   exit 1
 fi
 
+# coturn prints a startup banner even with logging off. Capture it now, before any client has
+# connected, so it cannot hold user data. At the end, no line outside this banner may appear.
+# coturn prefixes every line with "<seconds>: (<pid>): ", e.g. "0: (1): INFO: ...".
+strip_log_prefix() { sed -E 's/^[0-9]+: \([0-9]+\): //'; }
+sleep 2 # let the banner finish printing after the port opens
+startup_banner="$(docker logs "$container_name" 2>&1 | strip_log_prefix | sort -u)"
+
 # bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
 # well under that, and coturn is restarted (fresh state) between groups.
 restart_or_exit() { restart_coturn || { echo "FAIL: coturn did not restart"; exit 1; }; }
@@ -246,55 +253,41 @@ for ipv6_peer in ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192
   expect_probe "permission $ipv6_peer" "error (403|443)"
 done
 
-# The server logs must not contain any username or test peer IP. Logging is off in the config.
-# coturn 4.6.3 prints a few startup lines to stdout anyway. Only these are accepted (whole line,
-# optional "INFO: " prefix):
-#   log file opened: /var/log/<name>   (the dated log file lives on tmpfs, see compose.yaml)
-#   System cpu num is <n> / System enable num is <n>
-#   Black listing: <range>             (only if <range> is a denied-peer-ip line of turnserver.conf)
-# Any other line fails, so any WARNING or ERROR line fails.
-grep -E '^denied-peer-ip=' "$here/turnserver.conf" | cut -d= -f2- >"$denied_ranges_file"
+# The server logs must not contain any username or test peer IP. Logging is off in the config, but
+# coturn 4.6.3 still prints a startup banner (captured above, before any client connected, so it
+# holds no user data). Rules:
+#   - the banner has no WARNING or ERROR line (for example an option coturn does not understand);
+#   - coturn loaded every denied-peer-ip range of turnserver.conf, and nothing else ("Black listing:");
+#   - after all the test traffic, every log line is a banner line: any session, user, allocation
+#     or peer line coturn printed during the test would be new, and fails.
+grep -E '^denied-peer-ip=' "$here/turnserver.conf" | cut -d= -f2- | sort -u >"$denied_ranges_file"
 if [ ! -s "$denied_ranges_file" ]; then
   echo "FAIL: no denied-peer-ip ranges found in turnserver.conf"; failures=$((failures + 1))
 fi
-allowed_log_line_pattern='^(INFO: )?(log file opened: /var/log/[A-Za-z0-9_.-]+|System cpu num is [0-9]+|System enable num is [0-9]+)$'
-server_logs="$(docker logs "$container_name" 2>&1)"
-unexpected_log_lines=""
-black_listing_count=0
-other_log_lines=""
-while IFS= read -r log_line; do
-  [ -z "${log_line//[[:space:]]/}" ] && continue
-  # coturn prefixes every line with "<seconds>: (<pid>): ", e.g. "0: (1): INFO: ...".
-  stripped_line="$(sed -E 's/^[0-9]+: \([0-9]+\): //' <<<"$log_line")"
-  stripped_line="${stripped_line#INFO: }"
-  if [[ "$stripped_line" == "Black listing: "* ]]; then
-    listed_range="${stripped_line#Black listing: }"
-    # A single address may be printed as "a-a"; accept it for an "a" line.
-    if grep -Fxq -e "$listed_range" "$denied_ranges_file" \
-      || { [[ "$listed_range" =~ ^(.+)-(.+)$ ]] && [ "${BASH_REMATCH[1]}" = "${BASH_REMATCH[2]}" ] \
-        && grep -Fxq -e "${BASH_REMATCH[1]}" "$denied_ranges_file"; }; then
-      black_listing_count=$((black_listing_count + 1))
-    else
-      unexpected_log_lines+="$log_line"$'\n'
-    fi
-  elif grep -Eq -e "$allowed_log_line_pattern" <<<"$stripped_line"; then
-    other_log_lines+="$log_line"$'\n'
-  else
-    unexpected_log_lines+="$log_line"$'\n'
-  fi
-done <<<"$server_logs"
-if [ -n "$unexpected_log_lines" ]; then
-  echo "FAIL: docker logs contain lines outside the allow-list. Lines (values masked):"
-  printf '%s' "$unexpected_log_lines" | head -n 10 | mask_values
+if grep -Eq '(^|: )(WARNING|ERROR)' <<<"$startup_banner"; then
+  echo "FAIL: coturn's startup banner has a WARNING or ERROR line (values masked):"
+  grep -E '(^|: )(WARNING|ERROR)' <<<"$startup_banner" | head -n 10 | mask_values
   failures=$((failures + 1))
-# Allowed Black listing lines are exact config ranges (they contain edge addresses such as
-# 255.255.255.255 that the test also uses as peers), so only the other lines are scanned for peers.
-elif grep -Fwq -f "$usernames_file" <<<"$server_logs" || grep -Fwq -f "$peers_file" <<<"$other_log_lines"; then
-  echo "FAIL: coturn logs contain a username or peer IP. Lines (values masked):"
-  { grep -Fw -f "$usernames_file" <<<"$server_logs"; grep -Fw -f "$peers_file" <<<"$other_log_lines"; } | head -n 10 | mask_values
+fi
+listed_ranges="$(sed -n 's/^INFO: Black listing: //p' <<<"$startup_banner" | sort -u)"
+# A single address may be printed as "a-a"; compare it as "a".
+listed_ranges="$(sed -E 's/^([^-]+)-\1$/\1/' <<<"$listed_ranges" | sort -u)"
+if [ "$listed_ranges" != "$(cat "$denied_ranges_file")" ]; then
+  echo "FAIL: the deny ranges coturn loaded differ from turnserver.conf (values masked):"
+  diff <(cat "$denied_ranges_file") <(printf '%s\n' "$listed_ranges") | head -n 10 | mask_values
+  failures=$((failures + 1))
+fi
+server_logs="$(docker logs "$container_name" 2>&1)"
+new_log_lines="$(strip_log_prefix <<<"$server_logs" | grep -v '^[[:space:]]*$' | grep -v -x -F -f <(printf '%s\n' "$startup_banner") || true)"
+if [ -n "$new_log_lines" ]; then
+  echo "FAIL: coturn logged lines beyond its startup banner during the test (values masked):"
+  printf '%s\n' "$new_log_lines" | head -n 10 | mask_values
+  failures=$((failures + 1))
+elif grep -Fwq -f "$usernames_file" <<<"$server_logs"; then
+  echo "FAIL: coturn logs contain a test username (values masked)"
   failures=$((failures + 1))
 else
-  echo "PASS: docker logs hold only allow-listed startup lines ($black_listing_count Black listing lines from the config), no username or peer IP, no WARNING or ERROR"
+  echo "PASS: docker logs hold only coturn's startup banner ($(wc -l <"$denied_ranges_file" | tr -d ' ') deny ranges, all from the config), no username, no session or peer line, no WARNING or ERROR"
 fi
 
 # Logging must stay off by configuration, not only by luck: no verbose, syslog or log-binding
