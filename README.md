@@ -55,7 +55,7 @@ the server refuses to start without a secret key.
 | `DJANGO_DEBUG` | `1` for local development only. |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated host names this server answers to. |
 | `SIGNALING_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to open a WebSocket, e.g. `https://call.example.com`. Empty means none. |
-| `TRUSTED_PROXY_IPS` | Comma-separated IPs of the reverse proxy (for the Pi: the Nginx Proxy Manager machine's LAN IP). Only from these peers is the rightmost `X-Forwarded-For` entry used as the client IP for rate limits; from anyone else the header is ignored. Empty (default) means no proxy is trusted, and behind a proxy all visitors then share one limit. The proxy must append to `X-Forwarded-For` (Nginx's default) or overwrite it; a CDN in front of the proxy would make the CDN the "client". IPv6 clients are counted per /64. |
+| `TRUSTED_PROXY_IPS` | Comma-separated IPs of the reverse proxy (for the Pi: the Nginx Proxy Manager machine's LAN IP). Only from these peers is the rightmost `X-Forwarded-For` entry used as the client IP for rate limits; from anyone else the header is ignored. Empty (default) means no proxy is trusted, and behind a proxy all visitors then share one limit. The proxy must append to `X-Forwarded-For` (Nginx's default) or overwrite it; a CDN in front of the proxy would make the CDN the "client". IPv6 clients are counted per /64, /56 and /48, and 6to4, Teredo and NAT64 addresses as the IPv4 address inside them (see Rate limits). |
 | `REDIS_URL` | Optional. Use Redis for the channel layer so several server processes can share rooms. |
 | `POSTGRES_HOST` | Optional. Set it to connect PostgreSQL; leave it unset for no database. |
 | `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` | Default `5432`, `securecall`, `securecall`. |
@@ -64,15 +64,50 @@ the server refuses to start without a secret key.
 | `DJANGO_SECURE_SSL_REDIRECT` | Defaults to on in production. TLS is terminated by the reverse proxy. |
 | `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. |
 
-Rate limits (in memory only, keyed by an HMAC of the client IP; constants in `signaling/rate_limits.py`):
-20 joins per IP per minute, 120 TURN credentials per IP per hour (over it, `joined` has no `turn`;
-a credential lasts up to 4 h, so up to 480 per IP can be valid at once), and per connection a
-burst of 100 messages refilled at 20 per second. Over a join or message limit the server sends
-`error rate-limited` and closes with application code `4029`.
+Rate limits (in memory only, keyed by an HMAC of the client address; constants in
+`signaling/rate_limits.py`): 20 joins per client per minute, 120 TURN credentials per client per
+hour (over it, `joined` has no `turn`; a credential lasts up to 4 h, so up to 480 per client can be
+valid at once), and per connection a burst of 100 messages refilled at 20 per second. A client is
+an IPv4 address or an IPv6 /64. Over a join or message limit the server sends `error rate-limited`
+and closes with application code `4029`.
 
-Open connections are capped at 20 per IP and 500 in total (per process); over a cap the socket is
-accepted, sent `error rate-limited` and closed with `4029`. A connection that sends no `join`
+Open connections are capped at 20 per client and 500 in total (per process); over a cap the socket
+is accepted, sent `error rate-limited` and closed with `4029`. A connection that sends no `join`
 within 10 s is closed with `4008`.
+
+IPv6 clients are also counted by their /56 and their /48, with 4 and 16 times the caps:
+
+| Limit | Per /64 (or IPv4 address) | Per /56 | Per /48 |
+|---|---|---|---|
+| Joins per minute | 20 | 80 | 320 |
+| TURN credentials per hour | 120 | 480 | 1,920 |
+| Open connections | 20 | 80 | 320 |
+
+One customer can hold 256 (/56) or 65,536 (/48) /64s, and many ISPs give each household a /56 or
+a /60 out of a /48 shared by 256 or more households. So one /56 can use at most a quarter of its
+/48, and one /64 a quarter of its /56. An action must pass all three; the server checks them all
+before it charges any, so a refusal by one charges none. IPv4 is counted once, as before, and so
+are 6to4, Teredo and NAT64 (`64:ff9b::/96`) addresses, as the IPv4 address inside them. The total
+of 500 connections is unchanged.
+
+What is still possible:
+- 4 /64s use up their /56, and 4 /56s (16 /64s across them) use up their /48. A customer with a
+  /60 can lock the other customers of its /56 out of joins (for a minute), TURN credentials (for
+  an hour, so their privacy-mode calls fail closed) or connections (while it holds them); one with
+  4 /56s can do the same to the rest of its /48. ISPs that put many customers' /64s in one /48
+  (mobile carriers) share its caps among them.
+- Someone with many /48s gets 16 times the caps for each: a tunnel broker gives out routed /48s
+  for free, and an LIR's /29 holds 524,288 of them. Two /48s (320 connections each) fill all 500
+  connection slots of a process; over IPv4 it takes 25 addresses.
+- Evicting an entry resets its counters. It happens once 500 other /48s, 1,000 other /56s or
+  10,000 other /64s (or IPv4 addresses) have been charged after the entry's last allowed event; a
+  refused request does not count. They need not be the abuser's: a busy server evicts capped
+  entries by itself, and someone with more prefixes than that can cycle them so that the tier no
+  longer limits them (the finer tiers still do). Eviction only lowers counts and never locks
+  anyone out.
+
+The counters take at most about 115 MiB per process (the worst case is worked out in
+`signaling/rate_limits.py`). **Deploy this before giving the backend an IPv6 address.**
 
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.

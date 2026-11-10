@@ -121,14 +121,15 @@ If the maximum seen is below 4, the quota can go lower; if it is above 6, raise 
 credential, not one client. With 41 relay ports and `user-quota=6`, **about 7 credentials fill
 every relay port** (41 / 6 rounded up); `bps-capacity` / `max-bps` (about 37 sessions at full
 rate) is reached with fewer allocations per credential. The only brake on the number of
-credentials is the backend's cap of 120 per client IP per hour (`signaling/rate_limits.py`). It
+credentials is the backend's cap of 120 per client per hour, a client being an IPv4 address or an
+IPv6 /64; an IPv6 /56 gets 480 and a /48 1,920 per hour in all (`signaling/rate_limits.py`). It
 cannot be lower, because many people share one address, so 7 is well inside it.
 
 A per-room credential budget was tried (#39) and removed: rooms are free to create and its count
 reset when a room emptied, so it did not stop a hostile client, while a long call with many
 reconnects could use it up and lose privacy mode. The per-IP cap has the same effect at a higher
 threshold: over it, `joined` has no `turn` and privacy-mode calls fail closed for everyone on
-that address until the hour window frees credentials.
+that address (or IPv6 /56 or /48) until the hour window frees credentials.
 
 So **one client can still fill the relay.** The impact is availability only: media stays
 DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full, privacy-mode
@@ -217,6 +218,10 @@ Dockerfile): with `entrypoint: ['turnserver']` the upstream image's own switch t
 user is skipped, and CI run 42770315949 showed `CapEff 0x400`, a root process.
 
 ### IPv6
+
+**Backend:** `signal.securevideocall.com` must stay without an AAAA record until the backend with
+the per-/56 and per-/48 rate limits (#38) is deployed; before that, one person with a /48 gets a
+separate limit per /64.
 
 This relay is IPv4-only. coturn runs on a network without IPv6 (`enable_ipv6: false`), relays on
 the single address `172.30.200.2` (`--relay-ip`), and `turnserver.conf` sets
