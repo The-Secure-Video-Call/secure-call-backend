@@ -117,6 +117,26 @@ SIGNALING_ALLOWED_ORIGINS = env_list(
 # Largest accepted WebSocket message, in bytes (PLAN.md section 3.5).
 SIGNALING_MAX_MESSAGE_BYTES = 64 * 1024
 
+# --- TURN credentials ------------------------------------------------------------------------
+
+# Short-lived HMAC credentials for coturn (PLAN.md 3.5). The feature is off unless BOTH
+# TURN_SHARED_SECRET and TURN_URLS are set; then `joined` has no `turn` field. The secret
+# comes from the environment only and is never logged or sent to clients.
+TURN_SHARED_SECRET = os.environ.get("TURN_SHARED_SECRET", "")
+TURN_URLS = env_list("TURN_URLS", default=[])
+MAX_TURN_CREDENTIAL_TTL_SECONDS = 24 * 3600  # "short-lived": never more than a day
+try:
+    TURN_CREDENTIAL_TTL_SECONDS = int(os.environ.get("TURN_CREDENTIAL_TTL_SECONDS", "3600"))
+except ValueError:
+    raise ImproperlyConfigured("TURN_CREDENTIAL_TTL_SECONDS must be a whole number.") from None
+if not 1 <= TURN_CREDENTIAL_TTL_SECONDS <= MAX_TURN_CREDENTIAL_TTL_SECONDS:
+    raise ImproperlyConfigured("TURN_CREDENTIAL_TTL_SECONDS must be between 1 and 86400.")
+if TURN_URLS and not (
+    len(TURN_URLS) <= 4 and all(url.startswith(("turn:", "turns:")) for url in TURN_URLS)
+):
+    # Fail at startup instead of on the first join. The message never includes the values.
+    raise ImproperlyConfigured("TURN_URLS needs 1-4 URLs, each starting with turn: or turns:.")
+
 # --- Security headers and HTTPS (production) -------------------------------------------------
 
 # TLS is terminated by the reverse proxy (Caddy), which must set X-Forwarded-Proto itself and

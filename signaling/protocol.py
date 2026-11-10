@@ -23,6 +23,9 @@ ROOM_ID_PATTERN: Final = r"^[A-Za-z0-9_-]{22,43}$"  # base64url, no padding
 BASE64_PATTERN: Final = r"^[A-Za-z0-9+/]+={0,2}$"  # standard base64
 IV_PATTERN: Final = r"^[A-Za-z0-9+/]{16}$"  # base64 of exactly 12 bytes (no padding needed)
 
+MAX_TURN_URL_CHARS: Final = 256
+TURN_URL_PATTERN: Final = r"^turns?:\S+$"
+
 _STRICT = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
@@ -101,14 +104,33 @@ class ClientMessage(RootModel[ClientMessageUnion]):
 # --- Server -> client -------------------------------------------------------------------------
 
 
+class TurnCredentials(BaseModel):
+    """Short-lived TURN credentials (coturn REST API scheme), new for every connection."""
+
+    model_config = _STRICT
+
+    urls: list[Annotated[str, Field(pattern=TURN_URL_PATTERN, max_length=MAX_TURN_URL_CHARS)]] = (
+        Field(
+            min_length=1,
+            max_length=4,
+            description="1-4 TURN server URLs, each starting with 'turn:' or 'turns:'.",
+        )
+    )
+    username: str = Field(min_length=1, max_length=128, description="'<expiry>:<random>'.")
+    credential: str = Field(min_length=1, max_length=128, description="Base64 HMAC-SHA1.")
+
+
 class JoinedMessage(BaseModel):
-    """Sent to a client that entered a room. TURN credentials are added in M3."""
+    """Sent to a client that entered a room. `turn` is only present when TURN is configured."""
 
     model_config = _STRICT
 
     v: Literal[1] = 1
     type: Literal["joined"] = "joined"
     role: Literal["first", "second"]
+    turn: TurnCredentials | None = Field(
+        default=None, description="Omitted unless the server has TURN configured."
+    )
 
 
 class PeerJoinedMessage(BaseModel):

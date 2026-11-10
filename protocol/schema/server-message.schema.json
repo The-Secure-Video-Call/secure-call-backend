@@ -36,7 +36,7 @@
     },
     "JoinedMessage": {
       "additionalProperties": false,
-      "description": "Sent to a client that entered a room. TURN credentials are added in M3.",
+      "description": "Sent to a client that entered a room. `turn` is only present when TURN is configured.",
       "properties": {
         "role": {
           "enum": [
@@ -45,6 +45,18 @@
           ],
           "title": "Role",
           "type": "string"
+        },
+        "turn": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TurnCredentials"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Omitted unless the server has TURN configured."
         },
         "type": {
           "const": "joined",
@@ -158,6 +170,45 @@
         "iv"
       ],
       "title": "SignalMessage",
+      "type": "object"
+    },
+    "TurnCredentials": {
+      "additionalProperties": false,
+      "description": "Short-lived TURN credentials (coturn REST API scheme), new for every connection.",
+      "properties": {
+        "credential": {
+          "description": "Base64 HMAC-SHA1.",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Credential",
+          "type": "string"
+        },
+        "urls": {
+          "description": "1-4 TURN server URLs, each starting with 'turn:' or 'turns:'.",
+          "items": {
+            "maxLength": 256,
+            "pattern": "^turns?:\\S+$",
+            "type": "string"
+          },
+          "maxItems": 4,
+          "minItems": 1,
+          "title": "Urls",
+          "type": "array"
+        },
+        "username": {
+          "description": "'<expiry>:<random>'.",
+          "maxLength": 128,
+          "minLength": 1,
+          "title": "Username",
+          "type": "string"
+        }
+      },
+      "required": [
+        "urls",
+        "username",
+        "credential"
+      ],
+      "title": "TurnCredentials",
       "type": "object"
     }
   },
