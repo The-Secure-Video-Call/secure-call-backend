@@ -298,6 +298,7 @@ if ! awk '/^  coturn:/{in_coturn=1; next} /^  [a-z]/{in_coturn=0} in_coturn && /
   failures=$((failures + 1))
 fi
 new_log_lines=""
+unexpected_deny_lines=""
 while IFS= read -r log_line; do
   [ -z "${log_line//[[:space:]]/}" ] && continue
   grep -Fxq -e "$log_line" <<<"$startup_banner" && continue
@@ -306,11 +307,18 @@ while IFS= read -r log_line; do
     && grep -Fxq -e "${BASH_REMATCH[1]}" "$failed_login_usernames_file"; then
     continue
   fi
-  # coturn refusing a peer the test deliberately asked for, in one of our configured deny ranges.
-  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]] \
-    && grep -Fxq -e "${BASH_REMATCH[1]}" "$peers_file" \
-    && grep -Fxq -e "$(sed -E 's/^([^-]+)-\1$/\1/' <<<"${BASH_REMATCH[2]}")" "$denied_ranges_file"; then
-    continue
+  # coturn refusing a peer the test deliberately asked for, in one of our configured deny ranges
+  # or the multicast range that no-multicast-peers adds (224.0.0.1 is a test peer).
+  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]]; then
+    denied_peer="${BASH_REMATCH[1]}"
+    denied_range="$(sed -E 's/^([^-]+)-\1$/\1/' <<<"${BASH_REMATCH[2]}")"
+    if grep -Fxq -e "$denied_peer" "$peers_file" \
+      && { grep -Fxq -e "$denied_range" "$denied_ranges_file" || [ "$denied_range" = "224.0.0.0-239.255.255.255" ]; }; then
+      continue
+    fi
+    # Deny lines only ever name the test's own synthetic peers and deny ranges, never a real
+    # user's address, so print them unmasked: the exact range is what tells us what to fix.
+    unexpected_deny_lines+="$log_line"$'\n'
   fi
   # coturn stopping when the test restarts it between groups.
   [ "$log_line" = "INFO: Terminating on signal 15" ] && continue
@@ -320,6 +328,10 @@ valid_usernames="$(grep -v -x -F -f "$failed_login_usernames_file" "$usernames_f
 if [ -n "$new_log_lines" ]; then
   echo "FAIL: coturn logged lines beyond its startup banner during the test (values masked):"
   printf '%s' "$new_log_lines" | head -n 10 | mask_values
+  if [ -n "$unexpected_deny_lines" ]; then
+    echo "  Deny lines outside the test's peers or deny ranges (unmasked: synthetic test peers only):"
+    printf '%s' "$unexpected_deny_lines" | head -n 10 | sed 's/^/    /'
+  fi
   failures=$((failures + 1))
 elif [ -n "$valid_usernames" ] && grep -Fwq -f <(printf '%s\n' "$valid_usernames") <<<"$server_logs"; then
   echo "FAIL: coturn logs contain the username of a login that worked (values masked)"
