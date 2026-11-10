@@ -81,12 +81,16 @@ Manual steps (owner):
    Dependabot proposes upgrades (it watches `deploy/raspberry-pi/coturn`); the CI `coturn` job must
    pass before one is merged. After merging, rebuild on the Pi when no call is running:
    `git pull`, then `docker compose up -d --build coturn`.
-   - **4.6.3 → 4.18.0 (#47):** 4.18 fixes published advisories that apply here (an IPv6 address
-     comparison, STUN length handling on TCP, an "even-port" denial of service, attributes after
-     MESSAGE-INTEGRITY). It no longer sends reason texts in error replies and logs in a new format,
-     so `test-coturn.sh` reads error codes and both formats. `no-dtls` is deprecated (DTLS is off
-     unless `dtls` is set), so it is gone, and the logging settings moved to the top of
-     `turnserver.conf`: a warning logged before them made 4.18 open a default log file.
+   - **4.6.3 → 4.18.0 (#47):** 4.18 fixes published advisories that apply to this setup:
+     GHSA-4v97-rxjj-4f99 (an IPv6 address comparison, fixed in 4.16.0), GHSA-m562-mf7x-q7rr
+     (STUN length truncation on TCP, 4.15.0), GHSA-847g-qmc6-6m4r ("even-port" denial of
+     service, 4.17.0) and GHSA-5538-7cxj-5jcc (attributes after MESSAGE-INTEGRITY, 4.15.0). It no
+     longer sends reason texts in error replies and logs in a new format, so `test-coturn.sh`
+     reads error codes and both formats. `no-dtls`, `no-cli` and `no-rfc5780` are deprecated or
+     no-ops (DTLS, the CLI and RFC 5780 are off unless `dtls`, `cli` or `rfc5780` is set, and the
+     test fails if one is), and `simple-log` does nothing with `log-file=stdout`, so all four are
+     gone. The logging settings moved to the top of `turnserver.conf` and onto compose's command
+     line: a warning logged before them made 4.18 open a default log file.
 
 ### Quotas
 
@@ -222,10 +226,12 @@ no option that refuses IPv6 allocation more directly (4.6.3 and 4.18.0). The tes
 answers IPv4-mapped peers on an IPv4 relay with `443`, 4.6.3 with `403`; both are accepted); if
 coturn answers differently, CI shows the real code.
 
-coturn also *listens* only on `172.30.200.2` and `127.0.0.1` (`--listening-ip`). `no-rfc5780` turns off NAT behaviour discovery,
-which needs two public IPs and is not used by WebRTC, and the pid file lives on the `/var/tmp`
-tmpfs because the root filesystem is read-only. The test fails on any WARNING or ERROR line in
-coturn's startup output, so an option coturn does not understand shows up in CI.
+coturn also *listens* only on `172.30.200.2` and `127.0.0.1` (`--listening-ip`). RFC 5780 NAT
+behaviour discovery, which needs two public IPs and is not used by WebRTC, is off (the default in
+4.18), and the pid file lives on the `/var/tmp` tmpfs because the root filesystem is read-only.
+The test fails on any WARNING or ERROR line in coturn's startup output (except the two notices
+about the unused default TLS certificate and key), so an option coturn does not understand shows
+up in CI.
 The IPv6 and mapped deny ranges in `turnserver.conf` stay as defence in depth.
 
 ### Logging
