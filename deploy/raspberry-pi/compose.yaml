@@ -67,9 +67,14 @@ services:
     # places it may try to write logs to. Their contents vanish when the container stops.
     read_only: true
     tmpfs:
-      - /var/tmp:size=1m,mode=1777
-      - /tmp:size=1m,mode=1777
-      - /var/log:size=1m,mode=1777
+      - /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev
+      - /tmp:size=1m,mode=1777,noexec,nosuid,nodev
+      - /var/log:size=1m,mode=1777,noexec,nosuid,nodev
+    # Ports 3478 and 49160-49200 are above 1024, so coturn needs no capabilities.
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     # The secret comes from .env (compose substitution), never from a file in the repo.
     # No env_file here: coturn must not receive the backend's other secrets.
     command:

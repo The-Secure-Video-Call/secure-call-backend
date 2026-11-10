@@ -88,17 +88,22 @@ The IPv6 and mapped deny ranges in `turnserver.conf` stay as defence in depth.
 
 ### Logging
 
-coturn logs nothing (`no-stdout-log`, `log-file=stdout`): session lines can contain
-usernames and peer IPs, which must never be logged. The cost is that startup errors are not
-visible in `docker logs`; to debug, temporarily run coturn by hand with a different config.
+coturn does not log sessions: session lines can contain usernames and peer IPs, which must
+never be logged. In 4.6.3 `log-file` is only a base name, so coturn always writes a small dated
+log file (`turn_<pid>_<date>.log`) and prints one startup line, `log file opened: /var/log/...`,
+to `docker logs`. The read-only root filesystem plus 1 MB in-memory (`tmpfs`) mounts for
+`/var/tmp`, `/tmp` and `/var/log` keep that file in memory: nothing coturn writes can reach the
+Pi's disk, and it vanishes when the container stops. The mounts are `noexec,nosuid,nodev`, the
+container drops all capabilities and sets `no-new-privileges`.
 
-`log-file=/dev/null` was not enough: CI found `/var/tmp/turn_1_<date>.log` inside the container.
-coturn derives a dated file name from the `log-file` value, so `/dev/null` is not special.
-The container therefore also has a read-only root filesystem and 1 MB in-memory (`tmpfs`)
-mounts for `/var/tmp`, `/tmp` and `/var/log`, so nothing coturn writes can reach the Pi's
-disk. The test inspects the container (as root) before each restart and at the end: a log file
-on the real filesystem fails, and a file on the tmpfs mounts is printed (masked) and fails if
-it contains a test username or peer IP.
+Checked in CI (an earlier run, before the allow-list and `cap_drop`): the dated log file has 2 startup lines and no test username or
+peer IP; `/dev/shm/mongoc-1` holds only binary counters; `/var/tmp/turnserver.pid` is the pid.
+
+The test inspects the container (as root, before each restart and at the end): a log file on the
+real filesystem fails, and a file on the tmpfs mounts is printed (masked) and fails if it contains
+a test username or peer IP. `docker logs` may contain only the line `[INFO: ]log file opened:
+/var/log/<name>` (whole-line match); any other line fails. Startup errors are therefore not visible in `docker logs`; to
+debug, temporarily run coturn by hand with a different config.
 
 ### Refresh after expiry (input for #26)
 

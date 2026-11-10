@@ -118,7 +118,7 @@ mask_values() { sed -E 's/[0-9]{9,}:[0-9a-f]{12}/<USERNAME>/g; s/[0-9]{1,3}(\.[0
 # tmpfs contents vanish when the container stops, so this also runs before every restart.
 inspect_log_files() {
   local when="$1" real_files real_exit tmpfs_files tmpfs_exit file line_count
-  real_files="$(docker exec -u 0 "$container_name" find / -xdev -type f -mmin -60 \
+  real_files="$(docker exec --privileged -u 0 "$container_name" find / -xdev -type f -mmin -60 \
     \( -name '*.log' -o -name 'turn_*' -o -path '/var/log/*' \) 2>&1)"
   real_exit=$?
   if [ "$real_exit" -ne 0 ]; then
@@ -132,7 +132,7 @@ inspect_log_files() {
   else
     echo "PASS: no log files on the real filesystem ($when)"
   fi
-  tmpfs_files="$(docker exec -u 0 "$container_name" find /var/tmp /tmp /var/log /dev/shm -type f 2>&1)"
+  tmpfs_files="$(docker exec --privileged -u 0 "$container_name" find /var/tmp /tmp /var/log /dev/shm -type f 2>&1)"
   tmpfs_exit=$?
   if [ "$tmpfs_exit" -ne 0 ]; then
     echo "FAIL: could not search the tmpfs mounts for log files ($when, exit $tmpfs_exit)"
@@ -145,10 +145,10 @@ inspect_log_files() {
     return
   fi
   while IFS= read -r file; do
-    line_count="$(docker exec -u 0 "$container_name" wc -l "$file" 2>&1 | awk '{print $1}')"
+    line_count="$(docker exec --privileged -u 0 "$container_name" wc -l "$file" 2>&1 | awk '{print $1}')"
     echo "NOTE: tmpfs file $file ($when): $line_count lines. First lines (values masked):"
-    docker exec -u 0 "$container_name" head -n 5 "$file" 2>&1 | mask_values | sed 's/^/    /'
-    if docker exec -u 0 "$container_name" cat "$file" 2>/dev/null \
+    docker exec --privileged -u 0 "$container_name" head -n 5 "$file" 2>&1 | mask_values | sed 's/^/    /'
+    if docker exec --privileged -u 0 "$container_name" cat "$file" 2>/dev/null \
       | grep -Fwq -f "$usernames_file" -f "$peers_file"; then
       echo "FAIL: $file contains a test username or peer IP ($when)"
       failures=$((failures + 1))
@@ -170,7 +170,10 @@ relay_ip="${relay_ip:-127.0.0.1}"
 cleanup
 # Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only.
 docker run -d --name "$container_name" --network host --read-only \
-  --tmpfs /var/tmp:size=1m,mode=1777 --tmpfs /tmp:size=1m,mode=1777 --tmpfs /var/log:size=1m,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  --tmpfs /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev \
+  --tmpfs /tmp:size=1m,mode=1777,noexec,nosuid,nodev \
+  --tmpfs /var/log:size=1m,mode=1777,noexec,nosuid,nodev \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
   --external-ip=127.0.0.1 --relay-ip="$relay_ip" >/dev/null || exit 1
@@ -207,6 +210,7 @@ restart_or_exit
 echo "== Group 4: IPv6 relay request and IPv6 / IPv4-mapped peers (raw STUN) =="
 read -r probe_user probe_pass < <(make_credential 600)
 # Not -I: the probe imports refresh_after_expiry.py from its own folder (repo code, not user input).
+printf '%s\n' ::1 fc00::1 fe80::1 ::ffff:10.0.0.5 ::ffff:127.0.0.1 ::ffff:192.168.1.10 ::ffff:169.254.1.1 >>"$peers_file"
 address_family_output="$(python3 "$here/address_family_probe.py" "$probe_user" "$probe_pass" 2>&1)"
 echo "$address_family_output"
 # $1 = label as printed by the probe, $2 = regex the outcome must match
@@ -227,18 +231,22 @@ done
 
 # The server logs must not contain any username or the peer IP. Logging is off in the config, so
 # they should be empty; if not, show the offending lines with the values masked.
+# coturn 4.6.3 always opens a small dated log file (log-file is only a base name) and announces
+# it on stdout. Only startup lines on this short allow-list are accepted; any other line, and any
+# test username or peer IP anywhere, fails.
+allowed_log_line_pattern='^(INFO: )?log file opened: /var/log/[A-Za-z0-9_.-]+$'
 server_logs="$(docker logs "$container_name" 2>&1)"
-if [ -n "$server_logs" ]; then
-  # Logging is meant to be off entirely, so ANY output fails (this also covers private peers).
-  echo "FAIL: docker logs are not empty. Lines (values masked):"
-  echo "$server_logs" | head -n 10 | mask_values
+unexpected_log_lines="$(grep -Ev -e "$allowed_log_line_pattern" <<<"$server_logs" | grep -v '^[[:space:]]*$')"
+if [ -n "$unexpected_log_lines" ]; then
+  echo "FAIL: docker logs contain lines outside the allow-list. Lines (values masked):"
+  echo "$unexpected_log_lines" | head -n 10 | mask_values
   failures=$((failures + 1))
-elif grep -Fq -f "$usernames_file" <<<"$server_logs" || grep -Fq "$public_peer" <<<"$server_logs"; then
-  echo "FAIL: coturn logs contain a username or peer IP. Offending lines (values masked):"
-  grep -F -e "$public_peer" -f "$usernames_file" <<<"$server_logs" | head -n 10 | mask_values
+elif grep -Fwq -f "$usernames_file" -f "$peers_file" <<<"$server_logs"; then
+  echo "FAIL: coturn logs contain a username or peer IP. Lines (values masked):"
+  grep -Fw -f "$usernames_file" -f "$peers_file" <<<"$server_logs" | head -n 10 | mask_values
   failures=$((failures + 1))
 else
-  echo "PASS: logs contain no username or peer IP"
+  echo "PASS: docker logs hold only allow-listed startup lines, no username or peer IP"
 fi
 
 # Logging must stay off by configuration, not only by luck: no verbose, syslog or log-binding
