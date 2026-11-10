@@ -19,6 +19,8 @@ Relaying uses one Channels group per room. A group send reaches every member inc
 sender, so each relayed event carries the sender's channel name and the sender skips it.
 """
 
+import logging
+import math
 import time
 from typing import Any
 
@@ -58,6 +60,9 @@ CLOSE_RATE_LIMITED = 4029
 # Per client IP, in memory only (tests replace these with ones that use a fake clock).
 join_limiter = new_join_limiter()
 turn_credential_limiter = new_turn_credential_limiter()
+
+
+logger = logging.getLogger(__name__)
 
 
 class SignalingConsumer(AsyncWebsocketConsumer):
@@ -112,11 +117,16 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.close(code=CLOSE_RATE_LIMITED)
             return
         group_name = group_name_for_room(room_id)
+        room_seconds_left: float | None = None
 
         async def remember_room_and_join_group() -> None:
+            nonlocal room_seconds_left
             # Runs under the registry lock. Setting room_id first means disconnect() cleans up
             # even if this task is cancelled halfway.
             self.room_id = room_id
+            # Read under the same lock, so it belongs to the room just joined (not to a room that
+            # expired and was recreated under the same ID while we awaited something).
+            room_seconds_left = room_registry.remaining_lifetime_seconds(room_id)
             await self.channel_layer.group_add(group_name, self.channel_name)
 
         role = await room_registry.add_member(
@@ -126,20 +136,36 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.send_message(ErrorMessage(code="room-full"))
             await self.close()
             return
-        await self.send_message(JoinedMessage(role=role, turn=self.issue_turn_credentials()))
+        turn = self.issue_turn_credentials(room_seconds_left)
+        await self.send_message(JoinedMessage(role=role, turn=turn))
         if role == "second":
             await self.send_event_to_peer(group_name, "peer_joined", PeerJoinedMessage())
 
-    def issue_turn_credentials(self) -> TurnCredentials | None:
-        """New credentials for this connection, or None when TURN is not fully configured."""
+    def issue_turn_credentials(self, room_seconds_left: float | None) -> TurnCredentials | None:
+        """New credentials for this connection that never outlive the room's 4-hour limit.
+
+        The lifetime is min(TTL, time the room has left), measured on the monotonic clock; the
+        wall clock is only read once, to turn that lifetime into the absolute expiry coturn checks.
+        None when TURN is not fully configured, when the room is gone, or in its last second.
+        """
         if not settings.TURN_SHARED_SECRET or not settings.TURN_URLS:
             return None
+        if room_seconds_left is None:
+            return None
+        credential_ttl_seconds = min(
+            settings.TURN_CREDENTIAL_TTL_SECONDS, math.floor(room_seconds_left)
+        )
+        if credential_ttl_seconds <= 0:
+            # No room ID or address here: only enough to notice the case.
+            logger.warning("TURN credential not issued: the room has no time left.")
+            return None
+        # Charged only when a credential is really issued (after the room-time checks above).
         if not turn_credential_limiter.try_acquire(self.client_key):
             return None  # over the hourly cap: the join works, just without a relay
         return issue_turn_credentials(
             settings.TURN_SHARED_SECRET,
             settings.TURN_URLS,
-            settings.TURN_CREDENTIAL_TTL_SECONDS,
+            credential_ttl_seconds,
             int(time.time()),
         )
 

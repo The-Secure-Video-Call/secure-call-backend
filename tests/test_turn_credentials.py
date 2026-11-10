@@ -1,6 +1,7 @@
 import base64
 import json
 import logging
+from types import SimpleNamespace
 
 import pytest
 from channels.testing import WebsocketCommunicator
@@ -8,7 +9,9 @@ from django.test import override_settings
 from pydantic import ValidationError
 
 from config.asgi import application
+from signaling.consumers import SignalingConsumer
 from signaling.protocol import JoinedMessage, ServerMessage, TurnCredentials
+from signaling.rooms import TOTAL_LIFETIME_LIMIT_SECONDS, RoomRegistry, room_registry
 from signaling.turn_credentials import (
     issue_turn_credentials,
     make_turn_credential,
@@ -135,3 +138,125 @@ async def test_joined_has_no_turn_without_urls() -> None:
 
     assert "turn" not in joined
     assert SHARED_SECRET not in text
+
+
+def use_fake_clocks(
+    monkeypatch: pytest.MonkeyPatch, wall_start: int
+) -> tuple[list[int], list[float]]:
+    """Separate fake clocks: wall time where credentials are issued, monotonic in the registry.
+
+    Only these two are replaced (not asyncio or Channels), so a test can step the wall clock
+    (as NTP does after a Pi boots) while monotonic time keeps flowing.
+    """
+    wall = [wall_start]
+    monotonic = [0.0]
+    monkeypatch.setattr("signaling.consumers.time", SimpleNamespace(time=lambda: float(wall[0])))
+    monkeypatch.setattr(room_registry, "_monotonic_clock", lambda: monotonic[0])
+    return wall, monotonic
+
+
+def expiry_of(joined: dict[str, object]) -> int:
+    turn = joined["turn"]
+    assert isinstance(turn, dict)
+    assert turn["credential"] == make_turn_credential(SHARED_SECRET, str(turn["username"]))
+    return int(str(turn["username"]).split(":")[0])
+
+
+async def open_and_join(room_id: str) -> tuple[WebsocketCommunicator, dict[str, object]]:
+    ws = WebsocketCommunicator(application, "/ws/signal/", headers=[(b"origin", ALLOWED_ORIGIN)])
+    await ws.connect()
+    await ws.send_to(text_data=json.dumps({"v": 1, "type": "join", "roomId": room_id}))
+    return ws, json.loads(await ws.receive_from())
+
+
+async def join_late(
+    room_id: str, monotonic: list[float], seconds_after_room_start: float
+) -> tuple[dict[str, object], dict[str, object]]:
+    """First person joins at monotonic 0, the second `seconds_after_room_start` later."""
+    first_ws, first = await open_and_join(room_id)
+    monotonic[0] = seconds_after_room_start
+    second_ws, second = await open_and_join(room_id)
+    await first_ws.disconnect()
+    await second_ws.disconnect()
+    return first, second
+
+
+@override_settings(TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS)
+async def test_late_joiner_credential_ends_when_the_room_closes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, monotonic = use_fake_clocks(monkeypatch, 1_000_000)
+    first, second = await join_late("G" * 22, monotonic, 10_000)
+
+    assert expiry_of(first) == 1_000_000 + TOTAL_LIFETIME_LIMIT_SECONDS
+    # The room has 4400 s left: never now + 4 h, which would outlive the room by 10 000 s.
+    assert expiry_of(second) == 1_000_000 + TOTAL_LIFETIME_LIMIT_SECONDS - 10_000
+
+
+@override_settings(TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS)
+async def test_a_wall_clock_step_does_not_change_the_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    wall, monotonic = use_fake_clocks(monkeypatch, 1_000_000)
+    first_ws, _ = await open_and_join("J" * 22)
+    wall[0] -= 3 * 60 * 60  # NTP steps a fast clock back 3 h ...
+    monotonic[0] = 10_000  # ... while real time moves on 10 000 s
+    second_ws, second = await open_and_join("J" * 22)
+    await first_ws.disconnect()
+    await second_ws.disconnect()
+
+    # Lifetime = the 4400 s the room really has left, from the (corrected) wall clock now.
+    assert expiry_of(second) == wall[0] + TOTAL_LIFETIME_LIMIT_SECONDS - 10_000
+
+
+@override_settings(TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS)
+async def test_a_join_in_the_last_second_gets_one_second(monkeypatch: pytest.MonkeyPatch) -> None:
+    wall, monotonic = use_fake_clocks(monkeypatch, 1_000_000)
+    _, second = await join_late("K" * 22, monotonic, TOTAL_LIFETIME_LIMIT_SECONDS - 1)
+
+    assert expiry_of(second) == wall[0] + 1
+
+
+@override_settings(TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS)
+async def test_no_credential_once_the_room_has_no_time_left(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    room_id = "L" * 22
+    _, monotonic = use_fake_clocks(monkeypatch, 1_000_000)
+    with caplog.at_level(logging.WARNING):
+        _, second = await join_late(room_id, monotonic, TOTAL_LIFETIME_LIMIT_SECONDS)
+
+    assert "turn" not in second
+    assert "TURN credential not issued" in caplog.text
+    assert room_id not in caplog.text
+
+
+@override_settings(
+    TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS, TURN_CREDENTIAL_TTL_SECONDS=3600
+)
+async def test_a_shorter_configured_ttl_still_applies(monkeypatch: pytest.MonkeyPatch) -> None:
+    wall, _ = use_fake_clocks(monkeypatch, 2_000_000)
+    ws, joined = await open_and_join("M" * 22)
+    await ws.disconnect()
+
+    assert expiry_of(joined) == wall[0] + 3600
+
+
+@override_settings(TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS)
+def test_no_credential_for_a_room_that_is_gone() -> None:
+    assert SignalingConsumer().issue_turn_credentials(None) is None
+
+
+async def test_remaining_lifetime_uses_the_monotonic_clock() -> None:
+    monotonic = [500.0]
+
+    async def ignore_expiry(room_id: str, channel_names: list[str]) -> None:
+        return None
+
+    registry = RoomRegistry(notify_room_expired=ignore_expiry, monotonic_clock=lambda: monotonic[0])
+    await registry.add_member("N" * 22, "channel-a")
+    monotonic[0] = 1_500.0
+
+    assert registry.remaining_lifetime_seconds("N" * 22) == TOTAL_LIFETIME_LIMIT_SECONDS - 1_000
+    assert registry.remaining_lifetime_seconds("O" * 22) is None
+    await registry.remove_member("N" * 22, "channel-a")
