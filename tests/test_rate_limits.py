@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 
@@ -13,12 +14,16 @@ from signaling.client_address import ClientAddressMiddleware
 from signaling.consumers import CLOSE_RATE_LIMITED
 from signaling.rate_limits import (
     JOIN_WINDOW_SECONDS,
+    MAX_CONNECTIONS_PER_CLIENT,
+    MAX_CONNECTIONS_TOTAL,
     MAX_JOINS_PER_WINDOW,
     MAX_TURN_CREDENTIALS_PER_WINDOW,
     MESSAGE_BURST_SIZE,
+    ConnectionLimiter,
     SlidingWindowLimiter,
     TokenBucket,
     client_key_for_ip,
+    new_connection_limiter,
     new_join_limiter,
     new_turn_credential_limiter,
 )
@@ -393,3 +398,259 @@ def test_new_limiters_use_the_documented_limits() -> None:
     assert new_join_limiter().window_seconds == 60.0
     assert new_turn_credential_limiter().max_events == 120
     assert new_turn_credential_limiter().window_seconds == 3600.0
+
+
+# --- Connection caps and the join timeout ----------------------------------------------------
+
+CAP_PER_CLIENT = 3
+CAP_TOTAL = 5
+PONG = {"v": 1, "type": "pong"}
+
+
+@pytest.fixture
+def small_connection_limiter(monkeypatch: pytest.MonkeyPatch) -> ConnectionLimiter:
+    limiter = ConnectionLimiter(CAP_PER_CLIENT, CAP_TOTAL)
+    monkeypatch.setattr(consumers, "connection_limiter", limiter)
+    return limiter
+
+
+def assert_no_connections_counted(limiter: ConnectionLimiter) -> None:
+    assert limiter.total_connection_count == 0
+    assert limiter.connection_count_by_client_key == {}
+
+
+async def open_connected_client(peer_ip: str = CLIENT_IP) -> WebsocketCommunicator:
+    client = open_client(peer_ip)
+    connected, _ = await client.connect()
+    assert connected
+    return client
+
+
+async def assert_refused_with_rate_limited(client: WebsocketCommunicator) -> str:
+    refusal_text = str(await client.receive_from())
+    assert json.loads(refusal_text) == RATE_LIMITED
+    assert await client.receive_output() == {
+        "type": "websocket.close",
+        "code": CLOSE_RATE_LIMITED,
+    }
+    await client.wait()
+    return refusal_text
+
+
+async def let_server_notice_close() -> None:
+    await asyncio.sleep(0.05)
+
+
+def test_connection_limiter_caps_per_client_and_in_total() -> None:
+    limiter = ConnectionLimiter(2, 3)
+    key = client_key_for_ip(CLIENT_IP)
+
+    assert [limiter.try_acquire(key) for _ in range(3)] == [True, True, False]
+    assert limiter.try_acquire(client_key_for_ip(OTHER_CLIENT_IP))
+    assert not limiter.try_acquire(client_key_for_ip("203.0.113.9"))  # global cap of 3
+
+
+def test_connection_limiter_release_never_goes_negative_and_drops_empty_keys() -> None:
+    limiter = ConnectionLimiter(2, 3)
+    key = client_key_for_ip(CLIENT_IP)
+
+    limiter.release(key)  # never acquired
+    assert_no_connections_counted(limiter)
+    assert limiter.try_acquire(key)
+    limiter.release(key)
+    limiter.release(key)  # released twice
+    assert_no_connections_counted(limiter)
+
+
+def test_connection_limiter_map_stays_bounded_by_the_global_cap() -> None:
+    limiter = ConnectionLimiter(1, 50)
+
+    for number in range(1000):
+        limiter.try_acquire(client_key_for_ip(f"10.0.{number // 256}.{number % 256}"))
+    assert len(limiter.connection_count_by_client_key) == 50
+
+
+def test_new_connection_limiter_uses_the_documented_caps() -> None:
+    assert (MAX_CONNECTIONS_PER_CLIENT, MAX_CONNECTIONS_TOTAL) == (20, 500)
+    assert new_connection_limiter().max_per_client == 20
+    assert new_connection_limiter().max_total == 500
+
+
+async def test_connection_over_the_client_cap_is_refused_and_other_ip_is_not(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
+
+    await assert_refused_with_rate_limited(await open_connected_client())
+    other_ip_client = await open_connected_client(OTHER_CLIENT_IP)
+    await other_ip_client.send_to(text_data=PING)
+    assert json.loads(await other_ip_client.receive_from()) == PONG
+
+    # The refused connection never held a slot.
+    assert small_connection_limiter.total_connection_count == CAP_PER_CLIENT + 1
+    for client in [*accepted, other_ip_client]:
+        await client.disconnect()
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_global_cap_refuses_even_a_new_ip(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    accepted = [
+        await open_connected_client(f"203.0.113.{number}") for number in range(10, 10 + CAP_TOTAL)
+    ]
+
+    await assert_refused_with_rate_limited(await open_connected_client("198.51.100.1"))
+
+    await accepted[0].disconnect()  # a freed slot is usable again
+    again = await open_connected_client("198.51.100.1")
+    await again.send_to(text_data=PING)
+    assert json.loads(await again.receive_from()) == PONG
+    for client in [*accepted[1:], again]:
+        await client.disconnect()
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_slot_is_released_on_normal_disconnect(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    client, _ = await join_once(1)
+    assert small_connection_limiter.total_connection_count == 1
+
+    await client.disconnect()
+
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_slot_is_released_when_the_server_closes_a_bad_connection(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    client = await open_connected_client()
+    await client.send_to(text_data="{not json")
+    await client.receive_output()  # the close
+    await client.wait()
+
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_slot_is_released_when_the_application_task_is_cancelled(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    client = await open_connected_client()
+    assert small_connection_limiter.total_connection_count == 1
+
+    client.future.cancel()  # an abnormal end: no websocket.disconnect is ever delivered
+    await let_server_notice_close()
+
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_slot_is_released_when_connect_fails_halfway(
+    small_connection_limiter: ConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def failing_accept(self: object, subprotocol: str | None = None) -> None:
+        raise RuntimeError("accept failed")
+
+    monkeypatch.setattr(consumers.SignalingConsumer, "accept", failing_accept)
+
+    with pytest.raises(RuntimeError):
+        await open_client().connect()
+
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_counters_return_to_zero_after_many_cycles(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    for number in range(60):
+        client = await open_connected_client(f"203.0.113.{number % 7}")
+        if number % 3 == 0:
+            await client.send_to(text_data="{not json")
+            await client.receive_output()
+            await client.wait()
+        elif number % 3 == 1:
+            client.future.cancel()
+            await let_server_notice_close()
+        else:
+            await client.disconnect()
+        assert small_connection_limiter.total_connection_count == 0
+
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_spoofed_forwarded_for_from_an_untrusted_peer_does_not_change_bucket(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    accepted = []
+    for number in range(CAP_PER_CLIENT):
+        client = open_client(CLIENT_IP, forwarded_for=f"198.51.100.{number}")
+        connected, _ = await client.connect()
+        assert connected
+        accepted.append(client)
+
+    spoofing_client = open_client(CLIENT_IP, forwarded_for="198.51.100.200")
+    await spoofing_client.connect()
+    await assert_refused_with_rate_limited(spoofing_client)
+
+    assert len(small_connection_limiter.connection_count_by_client_key) == 1
+    for client in accepted:
+        await client.disconnect()
+
+
+async def test_refused_connection_cannot_join_a_room(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
+    refused = await open_connected_client()
+    await refused.send_to(text_data=join_text(7))  # sent before the close is processed
+    await refused.receive_from()  # rate-limited error
+    await refused.receive_output()  # the close
+    await refused.wait()
+
+    assert room_registry.room_count() == 0
+    for client in accepted:
+        await client.disconnect()
+
+
+async def test_refusal_logs_and_sends_no_ip_address(
+    small_connection_limiter: ConnectionLimiter, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
+
+    refusal_text = await assert_refused_with_rate_limited(await open_connected_client())
+
+    assert CLIENT_IP not in caplog.text
+    assert CLIENT_IP not in refusal_text
+    for client in accepted:
+        await client.disconnect()
+
+
+async def test_connection_that_never_joins_is_closed(
+    small_connection_limiter: ConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.1)
+    client = await open_connected_client()
+    await client.send_to(text_data=PING)  # keeping it alive does not count as joining
+    assert json.loads(await client.receive_from()) == PONG
+
+    assert await client.receive_output() == {
+        "type": "websocket.close",
+        "code": consumers.CLOSE_POLICY_VIOLATION,
+    }
+    await client.disconnect()
+    assert_no_connections_counted(small_connection_limiter)
+
+
+async def test_connection_that_joins_in_time_stays_open(
+    small_connection_limiter: ConnectionLimiter, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(consumers, "JOIN_TIMEOUT_SECONDS", 0.2)
+    client, answer = await join_once(2)
+    assert answer["type"] == "joined"
+
+    await asyncio.sleep(0.4)
+    await client.send_to(text_data=PING)
+
+    assert json.loads(await client.receive_from()) == PONG
+    await client.disconnect()

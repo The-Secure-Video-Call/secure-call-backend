@@ -1,5 +1,5 @@
-"""In-memory rate limits (PLAN.md section 3): joins and TURN credentials per client IP, and
-messages per connection.
+"""In-memory limits (PLAN.md section 3): joins and TURN credentials per client IP, open
+connections per client IP and in total, and messages per connection.
 
 Privacy rules:
 - everything lives in memory only: nothing is written to disk, and a restart forgets it all;
@@ -42,6 +42,18 @@ TURN_CREDENTIAL_WINDOW_SECONDS = 3600.0
 # once and refill 20 per second.
 MESSAGES_REFILLED_PER_SECOND = 20.0
 MESSAGE_BURST_SIZE = 100
+
+# Open WebSocket connections, counted from accept to disconnect (joined or not). A browser uses
+# one per tab, so 20 per client IP leaves room for a household or office behind one address. The
+# global cap keeps many addresses together from exhausting a Raspberry Pi (memory, Daphne slots).
+# Over either cap the connection is accepted, told `rate-limited` and closed with 4029 (see
+# consumers.py). Counts are per process: with several server processes each one counts on its own.
+MAX_CONNECTIONS_PER_CLIENT = 20
+MAX_CONNECTIONS_TOTAL = 500
+
+# A connection that has not sent a `join` after this long is closed (code 4008). A browser joins
+# right after the socket opens, so 10 s leaves room for a slow mobile network.
+JOIN_TIMEOUT_SECONDS = 10.0
 
 # Most client keys one limiter keeps. When full, the least recently active key is evicted.
 MAX_TRACKED_CLIENTS = 10_000
@@ -104,6 +116,41 @@ class SlidingWindowLimiter:
         return len(self.event_times_by_client_key)
 
 
+class ConnectionLimiter:
+    """Counts open connections per client key and in total.
+
+    `try_acquire` takes a slot and `release` gives it back. A key is deleted when its count
+    reaches zero, so the map holds at most `max_total` keys. `release` of an unknown key does
+    nothing, so a count can never go negative.
+    """
+
+    def __init__(self, max_per_client: int, max_total: int) -> None:
+        self.max_per_client = max_per_client
+        self.max_total = max_total
+        self.connection_count_by_client_key: dict[bytes, int] = {}
+        self.total_connection_count = 0
+
+    def try_acquire(self, client_key: bytes) -> bool:
+        if self.total_connection_count >= self.max_total:
+            return False
+        client_connection_count = self.connection_count_by_client_key.get(client_key, 0)
+        if client_connection_count >= self.max_per_client:
+            return False
+        self.connection_count_by_client_key[client_key] = client_connection_count + 1
+        self.total_connection_count += 1
+        return True
+
+    def release(self, client_key: bytes) -> None:
+        client_connection_count = self.connection_count_by_client_key.get(client_key)
+        if client_connection_count is None:
+            return
+        if client_connection_count <= 1:
+            del self.connection_count_by_client_key[client_key]
+        else:
+            self.connection_count_by_client_key[client_key] = client_connection_count - 1
+        self.total_connection_count -= 1
+
+
 class TokenBucket:
     """Allows bursts up to `burst_size`, refilled at `refill_per_second`."""
 
@@ -134,6 +181,10 @@ def new_join_limiter() -> SlidingWindowLimiter:
 
 def new_turn_credential_limiter() -> SlidingWindowLimiter:
     return SlidingWindowLimiter(MAX_TURN_CREDENTIALS_PER_WINDOW, TURN_CREDENTIAL_WINDOW_SECONDS)
+
+
+def new_connection_limiter() -> ConnectionLimiter:
+    return ConnectionLimiter(MAX_CONNECTIONS_PER_CLIENT, MAX_CONNECTIONS_TOTAL)
 
 
 def new_message_bucket() -> TokenBucket:

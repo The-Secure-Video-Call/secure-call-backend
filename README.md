@@ -64,6 +64,10 @@ a credential lasts up to 4 h, so up to 480 per IP can be valid at once), and per
 burst of 100 messages refilled at 20 per second. Over a join or message limit the server sends
 `error rate-limited` and closes with application code `4029`.
 
+Open connections are capped at 20 per IP and 500 in total (per process); over a cap the socket is
+accepted, sent `error rate-limited` and closed with `4029`. A connection that sends no `join`
+within 10 s is closed with `4008`.
+
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.
 
