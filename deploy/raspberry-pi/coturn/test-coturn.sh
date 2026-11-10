@@ -57,15 +57,21 @@ run_client() {
 }
 
 # $1 label, $2 bound|forbidden|no_allocation, $3 client output
-# turnutils_uclient (4.6.3) prints, as seen in CI:
+# turnutils_uclient prints, as seen in CI (coturn 4.18.0; 4.6.3 wording in brackets):
 #   allocation worked:      "Received relay addr: ..." (after a 401 challenge, which is NOT a refusal)
-#   peer allowed:           "channel bind: success"
-#   peer denied by config:  "channel bind: error 403 (Forbidden IP)"
-# bound         = allocation worked AND the channel bind to the peer succeeded
-# forbidden     = allocation worked AND the channel bind was refused with
-#               "error 403 (Forbidden IP)" (never a success, never another 403)
-# no_allocation = no relay address was granted AND the output shows a 4xx error line (positive
-#               evidence of a refusal, e.g. 401 for a bad or expired credential)
+#   peer allowed:           "cb response received:" then "success: 0x<channel>"
+#                           ["channel bind: success"]
+#   peer denied by config:  "channel bind: error 403 ()" ["channel bind: error 403 (Forbidden IP)"]
+#   login refused:          "ERROR Cannot complete Allocation" ["ERROR: Cannot complete Allocation"]
+# coturn 4.18 no longer sends reason texts (less amplification), so a refusal is read from its
+# code. For a UDP allocation, coturn's ChannelBind answers 403 only when good_peer_addr() rejects
+# the peer (ns_turn_server.c, handle_turn_channel_bind; the one other 403 is for TCP relays,
+# which no-tcp-relay turns off), so a 403 there is the deny list / peer policy and nothing else.
+# bound         = allocation worked, no error 4xx/5xx, AND a channel bind to the peer succeeded
+# forbidden     = allocation worked, every channel bind was refused with 403, none succeeded
+# no_allocation = no relay address was granted AND the output shows a 4xx error line or
+#               "Cannot complete Allocation" (positive evidence of a refusal, e.g. 401 for a bad
+#               or expired credential)
 # Anything else ("unclear") fails. IPv6 and IPv4-mapped peers are not tested here: the client
 # only gets IPv4 relays; address_family_probe.py checks them with specific error codes.
 expect() {
@@ -83,16 +89,23 @@ expect() {
   # every long-term-credential exchange is not an error), and either a bind/permission success
   # line is present or the send summary shows messages sent with 0 dropped. 8.8.8.8 does not
   # echo, so a reply is not expected.
+  local channel_bind_succeeded=no
+  if grep -Fq 'channel bind: success' <<<"$output" \
+    || grep -A1 -F 'cb response received' <<<"$output" | grep -Eq 'success: 0x[0-9a-fA-F]+'; then
+    channel_bind_succeeded=yes
+  fi
   if grep -Fq 'Received relay addr' <<<"$output" \
     && ! grep -Eq 'error (40[02-9]|4[1-9][0-9]|5[0-9][0-9])' <<<"$output" \
-    && { grep -Fq 'channel bind: success' <<<"$output" \
+    && { [ "$channel_bind_succeeded" = yes ] \
       || { grep -Eq 'tot_send_msgs=[1-9]' <<<"$output" && grep -Eq 'total send dropped 0([^0-9]|$)' <<<"$output"; }; }; then
     got=bound
   elif grep -Fq 'Received relay addr' <<<"$output" \
-    && grep -Eq 'channel bind: error 403.*Forbidden IP' <<<"$output"; then
+    && [ "$channel_bind_succeeded" = no ] \
+    && grep -Eq 'channel bind: error 403( \((Forbidden IP)?\))?[[:space:]]*$' <<<"$output" \
+    && ! grep -E 'channel bind: error' <<<"$output" | grep -Evq 'channel bind: error 403( \((Forbidden IP)?\))?[[:space:]]*$'; then
     got=forbidden
   elif ! grep -Fq 'Received relay addr' <<<"$output" \
-    && grep -Eqi 'error[ :]*4[0-9][0-9]|ERROR: Cannot complete Allocation' <<<"$output"; then
+    && grep -Eqi 'error[ :]*4[0-9][0-9]|ERROR:? Cannot complete Allocation' <<<"$output"; then
     # A wrong or expired credential: the client prints "ERROR: Cannot complete Allocation" (exit
     # code 255) after the repeated 401 challenges, with no explicit 401 line.
     got=no_allocation
@@ -158,6 +171,16 @@ inspect_log_files() {
     return
   fi
   while IFS= read -r file; do
+    # Expected: the pid file, and the shared-memory statistics segment of the MongoDB driver linked
+    # into coturn (no log data). Anything else, above all a log file, means coturn wrote a log: the
+    # config is meant to send every line to stdout, which compose.yaml discards on the Pi.
+    case "$file" in
+      /var/tmp/turnserver.pid | /dev/shm/mongoc-*) ;;
+      *)
+        echo "FAIL: unexpected file on a tmpfs mount ($when): $file (coturn must not write a log file)"
+        failures=$((failures + 1))
+        ;;
+    esac
     line_count="$(docker exec --privileged -u 0 "$container_name" wc -l "$file" 2>&1 | awk '{print $1}')"
     echo "NOTE: tmpfs file $file ($when): $line_count lines. First lines (values masked):"
     docker exec --privileged -u 0 "$container_name" head -n 5 "$file" 2>&1 | mask_values | sed 's/^/    /'
@@ -231,8 +254,11 @@ fi
 
 # coturn prints a startup banner even with logging off. Capture it now, before any client has
 # connected, so it cannot hold user data. At the end, no line outside this banner may appear.
-# coturn prefixes every line with "<seconds>: (<pid>): ", e.g. "0: (1): INFO: ...".
-strip_log_prefix() { sed -E 's/^[0-9]+: \([0-9]+\): //'; }
+# Every line becomes "LEVEL: message". coturn 4.18 writes "2026-11-10T13:36:16.103+0000 INFO
+# message" (ISO time, the level without a colon); 4.6.3 wrote "0: (1): INFO: message".
+strip_log_prefix() {
+  sed -E 's/^[0-9]+: \([0-9]+\): //; s/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?([+-][0-9]{4}|Z) (DEBUG|INFO|WARNING|ERROR) /\3: /'
+}
 sleep 2 # let the banner finish printing after the port opens
 startup_banner="$(docker logs "$container_name" 2>&1 | strip_log_prefix | sort -u)"
 
@@ -279,6 +305,25 @@ else
   echo "FAIL: turnserver does not start as uid 65534 with all capabilities dropped (file capability left?)"
   echo "$exec_check_output" | head -n 5
   failures=$((failures + 1))
+fi
+
+# Listening sockets, read from the container's own /proc/net (its network namespace): no TLS or
+# DTLS listener on 5349 (TCP or UDP), no CLI on 5766, and TCP listens on 3478 only. Ports are hex.
+socket_tables="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 /proc/net/udp /proc/net/udp6 2>/dev/null)"
+if [ -z "$socket_tables" ]; then
+  echo "FAIL: could not read the container's socket tables"; failures=$((failures + 1))
+else
+  local_ports="$(awk '$2 ~ /:[0-9A-F]{4}$/ {split($2, a, ":"); print a[2]}' <<<"$socket_tables" | sort -u)"
+  tcp_listen_ports="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
+    | awk '$4 == "0A" {split($2, a, ":"); print a[2]}' | sort -u)"
+  if grep -Eqx '14E5|1686' <<<"$local_ports"; then
+    echo "FAIL: a socket is bound to 5349 (TLS/DTLS) or 5766 (CLI)"; failures=$((failures + 1))
+  elif [ "$tcp_listen_ports" != "0D96" ]; then
+    echo "FAIL: TCP listens on more than 3478 (hex ports: $(tr '\n' ' ' <<<"$tcp_listen_ports"))"
+    failures=$((failures + 1))
+  else
+    echo "PASS: no socket on 5349 (TLS/DTLS) or 5766 (CLI); TCP listens on 3478 only"
+  fi
 fi
 
 # bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
@@ -401,7 +446,7 @@ if ! restart_coturn; then
 fi
 read -r short_user short_pass < <(make_credential 5)
 probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 25 "$container_ip" 2>&1)"
-# What coturn 4.6.3 does, as found by this probe. coturn has no option to change it, so this pins the
+# What coturn does (4.6.3 and 4.18.0 alike), as found by this probe. coturn has no option to change it, so this pins the
 # behaviour: if an image bump changes it, the test fails and the README and turnserver.conf comments
 # must be updated (and this flipped to refused if coturn then refuses).
 expected_refresh_after_expiry="allowed"
@@ -426,7 +471,7 @@ else
 fi
 
 # The server logs must not contain any username or test peer IP. Logging is off in the config, but
-# coturn 4.6.3 still prints a startup banner (captured above, before any client connected, so it
+# coturn still prints a startup banner (captured above, before any client connected, so it
 # holds no user data). Rules:
 #   - the banner has no WARNING or ERROR line (for example an option coturn does not understand);
 #   - coturn loaded every denied-peer-ip range of turnserver.conf, and nothing else ("Black listing:");
@@ -453,10 +498,15 @@ if [ "$listed_ranges" != "$(cat "$denied_ranges_file")" ]; then
   failures=$((failures + 1))
 fi
 server_logs="$(docker logs "$container_name" 2>&1)"
-# Besides the banner, coturn 4.6.3 prints these runtime lines with logging off:
+# Besides the banner, coturn prints these runtime lines with logging off (4.18.0 wording; 4.6.3
+# had a "session <id>:" prefix and "check_stun_auth:" before the failed-login text):
 #   - an allocation counter (no username, no address);
-#   - "check_stun_auth: Cannot find credentials of user <name>" for a failed login;
-#   - "A peer IP <ip> denied in the range: <range>" when the deny list refuses a peer;
+#   - "credentials of user <name> are wrong (...)" / "... have expired (...)" / "Cannot find
+#     credentials of user <name>" for a failed login;
+#   - "A peer IP <ip> denied in the range: <range> in server <n> (session <id>)" when the deny list
+#     refuses a peer, and "A peer IP <ip> denied: link-local/unique-local/site-local scope ..." for
+#     IPv6 scopes coturn 4.18 always refuses;
+#   - "stateless-nonce: listener fast-path challenge active" (no data);
 #   - "Terminating on signal 15" when it stops.
 # On the Pi, compose.yaml discards coturn's console output (logging driver "none"), so neither
 # reaches the disk; this test container keeps Docker's default logs only to inspect them. A
@@ -471,15 +521,23 @@ unexpected_deny_lines=""
 while IFS= read -r log_line; do
   [ -z "${log_line//[[:space:]]/}" ] && continue
   grep -Fxq -e "$log_line" <<<"$startup_banner" && continue
-  [[ "$log_line" =~ ^DEBUG:\ Global\ turn\ allocation\ count\ (incremented|decremented),\ now\ [0-9]+$ ]] && continue
-  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ check_stun_auth:\ Cannot\ find\ credentials\ of\ user\ \<(.+)\>$ ]] \
+  [[ "$log_line" =~ ^(DEBUG|INFO):\ Global\ turn\ allocation\ count\ (incremented|decremented),\ now\ [0-9]+$ ]] && continue
+  [ "$log_line" = "INFO: stateless-nonce: listener fast-path challenge active" ] && continue
+  if { [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ check_stun_auth:\ Cannot\ find\ credentials\ of\ user\ \<(.+)\>$ ]] \
+      || [[ "$log_line" =~ ^ERROR:\ credentials\ of\ user\ \<(.+)\>\ (are\ wrong|have\ expired)\ \([^\)]*\)$ ]] \
+      || [[ "$log_line" =~ ^ERROR:\ Cannot\ find\ credentials\ of\ user\ \<(.+)\>$ ]]; } \
     && grep -Fxq -e "${BASH_REMATCH[1]}" "$failed_login_usernames_file"; then
     continue
   fi
   # coturn refusing, in one of our configured deny ranges, a peer the test deliberately asked
   # for, or the relay's own address (the runner's LAN IPv4 here, the Pi's on the Pi): the test
   # traffic makes coturn try to relay towards it, and the deny list correctly refuses that.
-  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]]; then
+  if [[ "$log_line" =~ ^ERROR:\ A\ peer\ IP\ ([^ ]+)\ denied:\ link-local/unique-local/site-local\ scope\ is\ not\ a\ permitted\ relay\ peer\ in\ server\ [0-9]+\ \(session\ [0-9]+\)$ ]] \
+    && grep -Fxq -e "${BASH_REMATCH[1]}" "$peers_file"; then
+    continue
+  fi
+  if [[ "$log_line" =~ ^ERROR:\ session\ [0-9]+:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range:\ ([^ ]+)\ in\ server\ [0-9]+\ ?$ ]] \
+    || [[ "$log_line" =~ ^ERROR:\ A\ peer\ IP\ ([^ ]+)\ denied\ in\ the\ range[:=]\ ([^ ]+)\ in\ server\ [0-9]+\ \(session\ [0-9]+\)$ ]]; then
     denied_peer="${BASH_REMATCH[1]}"
     denied_range="$(sed -E 's/^([^-]+)-\1$/\1/' <<<"${BASH_REMATCH[2]}")"
     if { grep -Fxq -e "$denied_peer" "$peers_file" || [ "$denied_peer" = "$container_ip" ]; } \

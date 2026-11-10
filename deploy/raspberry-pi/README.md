@@ -77,9 +77,16 @@ Manual steps (owner):
    - Or open https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/, add
      `turn:turn.securevideocall.com:3478` with that username and password, and gather: a
      `relay` candidate should appear.
-6. **Image pin:** `coturn/Dockerfile` pins the base to `4.6.3` plus its `@sha256:` digest (taken
-   from the CI pull). When upgrading, update both, e.g. from
-   `docker buildx imagetools inspect coturn/coturn:<tag>`, then rebuild.
+6. **Image pin:** `coturn/Dockerfile` pins the base to `4.18.0` plus its `@sha256:` digest.
+   Dependabot proposes upgrades (it watches `deploy/raspberry-pi/coturn`); the CI `coturn` job must
+   pass before one is merged. After merging, rebuild on the Pi when no call is running:
+   `git pull`, then `docker compose up -d --build coturn`.
+   - **4.6.3 → 4.18.0 (#47):** 4.18 fixes published advisories that apply here (an IPv6 address
+     comparison, STUN length handling on TCP, an "even-port" denial of service, attributes after
+     MESSAGE-INTEGRITY). It no longer sends reason texts in error replies and logs in a new format,
+     so `test-coturn.sh` reads error codes and both formats. `no-dtls` is deprecated (DTLS is off
+     unless `dtls` is set), so it is gone, and the logging settings moved to the top of
+     `turnserver.conf`: a warning logged before them made 4.18 open a default log file.
 
 ### Quotas
 
@@ -124,13 +131,13 @@ DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full
 calls fail closed ("Privacy mode needs our relay...") and normal calls lose their TURN fallback
 (direct calls still work). Closing this needs the relay to know who asked for a credential (for
 example a per-client allocation count in coturn, or an authenticated user), which is outside
-`turnserver.conf` in 4.6.3 and outside the current design (no accounts).
+`turnserver.conf` in 4.18 and outside the current design (no accounts).
 
 #### How long one allocation can live
 
 `max-allocate-lifetime=600` limits each Allocate or Refresh to 10 minutes (coturn's default is
 an hour), so a client that stops refreshing loses its relay port within 10 minutes. It does not
-limit the total: a client can keep refreshing. coturn 4.6.3 has no option to refuse a Refresh after
+limit the total: a client can keep refreshing. coturn 4.18 has no option to refuse a Refresh after
 the REST credential's expiry or to cap an allocation's total life. What it actually does is
 checked by the CI probe (next sections). So an allocation lives as long as the client keeps
 refreshing it, and the credential's expiry (up to the 4 h room lifetime) does not end it.
@@ -209,10 +216,11 @@ user is skipped, and CI run 42770315949 showed `CapEff 0x400`, a root process.
 
 This relay is IPv4-only. coturn runs on a network without IPv6 (`enable_ipv6: false`), relays on
 the single address `172.30.200.2` (`--relay-ip`), and `turnserver.conf` sets
-`allocation-default-address-family=ipv4`. An IPv6 relay request is answered with `440`. I found no
-4.6.3 option that refuses IPv6 allocation more directly. The test (`address_family_probe.py`)
-checks the `440` and the refusals of IPv6 and mapped peers; if 4.6.3 answers differently, CI shows
-the real code.
+`allocation-default-address-family=ipv4`. An IPv6 relay request is answered with `440`. There is
+no option that refuses IPv6 allocation more directly (4.6.3 and 4.18.0). The test
+(`address_family_probe.py`) checks the `440` and the refusals of IPv6 and mapped peers (4.18
+answers IPv4-mapped peers on an IPv4 relay with `443`, 4.6.3 with `403`; both are accepted); if
+coturn answers differently, CI shows the real code.
 
 coturn also *listens* only on `172.30.200.2` and `127.0.0.1` (`--listening-ip`). `no-rfc5780` turns off NAT behaviour discovery,
 which needs two public IPs and is not used by WebRTC, and the pid file lives on the `/var/tmp`
@@ -265,7 +273,8 @@ what coturn prints:
 ### Refresh after expiry (asserted in CI since #37; background from #26)
 
 `test-coturn.sh` now asserts the probe result against `expected_refresh_after_expiry`. It is
-`allowed`, the only result seen so far (coturn 4.6.3 has no option to change it), and a change
+`allowed`, the only result seen so far (coturn 4.6.3 and 4.18.0; neither has an option to change
+it), and a change
 (for example after an image bump) fails the test so these notes get updated.
 
 
