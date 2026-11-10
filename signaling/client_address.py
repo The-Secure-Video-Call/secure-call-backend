@@ -24,6 +24,9 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 # Used when the server gives no peer address at all (not the case under Daphne).
 UNKNOWN_CLIENT_IP = "unknown"
 IPV6_PREFIX_LENGTH = 64
+# A customer often gets a /56 or /48 (256 or 65,536 /64s), so rate_limits.py also counts IPv6
+# clients by this coarser prefix, with higher caps.
+IPV6_COARSE_PREFIX_LENGTH = 48
 
 
 def normalize_ip(address_text: str) -> str | None:
@@ -81,3 +84,16 @@ def group_ipv6_by_prefix(normalized_ip: str) -> str:
             ipaddress.ip_network(f"{address}/{IPV6_PREFIX_LENGTH}", strict=False).network_address
         )
     return normalized_ip
+
+
+def coarse_ipv6_prefix(client_ip: str) -> str | None:
+    """The IPv6 /48 that contains `client_ip`, or None for IPv4 and for "unknown"."""
+    try:
+        address = ipaddress.ip_address(client_ip)
+    except ValueError:
+        return None
+    if not isinstance(address, ipaddress.IPv6Address):
+        return None
+    return str(
+        ipaddress.ip_network(f"{address}/{IPV6_COARSE_PREFIX_LENGTH}", strict=False).network_address
+    )

@@ -55,7 +55,7 @@ the server refuses to start without a secret key.
 | `DJANGO_DEBUG` | `1` for local development only. |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated host names this server answers to. |
 | `SIGNALING_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to open a WebSocket, e.g. `https://call.example.com`. Empty means none. |
-| `TRUSTED_PROXY_IPS` | Comma-separated IPs of the reverse proxy (for the Pi: the Nginx Proxy Manager machine's LAN IP). Only from these peers is the rightmost `X-Forwarded-For` entry used as the client IP for rate limits; from anyone else the header is ignored. Empty (default) means no proxy is trusted, and behind a proxy all visitors then share one limit. The proxy must append to `X-Forwarded-For` (Nginx's default) or overwrite it; a CDN in front of the proxy would make the CDN the "client". IPv6 clients are counted per /64. |
+| `TRUSTED_PROXY_IPS` | Comma-separated IPs of the reverse proxy (for the Pi: the Nginx Proxy Manager machine's LAN IP). Only from these peers is the rightmost `X-Forwarded-For` entry used as the client IP for rate limits; from anyone else the header is ignored. Empty (default) means no proxy is trusted, and behind a proxy all visitors then share one limit. The proxy must append to `X-Forwarded-For` (Nginx's default) or overwrite it; a CDN in front of the proxy would make the CDN the "client". IPv6 clients are counted per /64 and also per /48 (see Rate limits). |
 | `REDIS_URL` | Optional. Use Redis for the channel layer so several server processes can share rooms. |
 | `POSTGRES_HOST` | Optional. Set it to connect PostgreSQL; leave it unset for no database. |
 | `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` | Default `5432`, `securecall`, `securecall`. |
@@ -73,6 +73,14 @@ burst of 100 messages refilled at 20 per second. Over a join or message limit th
 Open connections are capped at 20 per IP and 500 in total (per process); over a cap the socket is
 accepted, sent `error rate-limited` and closed with `4029`. A connection that sends no `join`
 within 10 s is closed with `4008`.
+
+IPv6 clients are counted twice: per /64 (the caps above) and per /48 with 4 times those caps
+(80 joins per minute, 480 TURN credentials per hour, 80 open connections), because one customer
+can control 256 (/56) or 65,536 (/48) /64s. An action must pass both; a refusal by one never
+charges the other. IPv4 is counted once, as before. The global connection cap is unchanged.
+Evicting a /48 entry (which would reset its counters) takes 10,000 other /48s active within the
+window, so many /64s from one /48 cannot do it. **Deploy this before giving the backend an IPv6
+address.**
 
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.

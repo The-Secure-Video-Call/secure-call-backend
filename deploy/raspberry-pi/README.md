@@ -218,6 +218,10 @@ user is skipped, and CI run 42770315949 showed `CapEff 0x400`, a root process.
 
 ### IPv6
 
+**Backend:** `signal.securevideocall.com` must stay without an AAAA record until the backend with
+the per-/48 rate limits (#38) is deployed; before that, one person with a /48 gets a separate
+limit per /64.
+
 This relay is IPv4-only. coturn runs on a network without IPv6 (`enable_ipv6: false`), relays on
 the single address `172.30.200.2` (`--relay-ip`), and `turnserver.conf` sets
 `allocation-default-address-family=ipv4`. An IPv6 relay request is answered with `440`. There is

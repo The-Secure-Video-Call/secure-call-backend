@@ -9,6 +9,15 @@ Privacy rules:
 - entries expire when their window passes, and at most MAX_TRACKED_CLIENTS keys are kept
   (the least recently active is evicted first), so memory cannot grow without bound.
 
+IPv6 clients are counted twice: by /64 (the fine key, the same caps as one IPv4 address) and by
+/48 (the coarse key, with COARSE_CAP_FACTOR times the caps), because one customer can control
+65,536 /64s and each would otherwise get its own limits and map entries. An action must pass both.
+The fine limiter is charged first and given back when the coarse one refuses, so a refusal never
+leaves a charge. IPv4 has no coarse key and is counted once, as before. A /48 is one map entry
+however many /64s it uses, so evicting entries (which resets counters) takes MAX_TRACKED_CLIENTS
+distinct /48s active within the window, each a separate customer allocation; /64s of one /48
+cannot do it.
+
 The clock is passed in so tests can fake it. With several server processes each one counts on
 its own, so the effective limit is the limit times the number of processes.
 """
@@ -19,6 +28,8 @@ import secrets
 import time
 from collections import OrderedDict, deque
 from collections.abc import Callable
+
+from signaling.client_address import coarse_ipv6_prefix
 
 # Joins: at most 20 per client IP per minute. A reconnecting browser retries after 1, 2, 4, 8
 # and 15 s for up to 2 minutes (about 8 joins), so this leaves room for a few tabs and retries.
@@ -55,6 +66,13 @@ MAX_CONNECTIONS_TOTAL = 500
 # right after the socket opens, so 10 s leaves room for a slow mobile network.
 JOIN_TIMEOUT_SECONDS = 10.0
 
+# The coarse (IPv6 /48) caps are this many times the per-/64 caps: a /48 may hold several
+# households or an office, but not 65,536 times one client. The global connection cap is unchanged.
+COARSE_CAP_FACTOR = 4
+MAX_JOINS_PER_WINDOW_COARSE = COARSE_CAP_FACTOR * MAX_JOINS_PER_WINDOW
+MAX_TURN_CREDENTIALS_PER_WINDOW_COARSE = COARSE_CAP_FACTOR * MAX_TURN_CREDENTIALS_PER_WINDOW
+MAX_CONNECTIONS_PER_CLIENT_COARSE = COARSE_CAP_FACTOR * MAX_CONNECTIONS_PER_CLIENT
+
 # Most client keys one limiter keeps. When full, the least recently active key is evicted.
 MAX_TRACKED_CLIENTS = 10_000
 
@@ -67,6 +85,16 @@ _client_key_secret = secrets.token_bytes(32)
 def client_key_for_ip(client_ip: str) -> bytes:
     """Counter key for a client IP: an HMAC, so the raw address is not kept in the maps."""
     return hmac.new(_client_key_secret, client_ip.encode("utf-8"), hashlib.sha256).digest()
+
+
+def coarse_client_key_for_ip(client_ip: str) -> bytes | None:
+    """Counter key for the IPv6 /48 of a client IP (same secret), or None for IPv4."""
+    prefix = coarse_ipv6_prefix(client_ip)
+    if prefix is None:
+        return None
+    return hmac.new(
+        _client_key_secret, b"coarse:" + prefix.encode("utf-8"), hashlib.sha256
+    ).digest()
 
 
 class SlidingWindowLimiter:
@@ -105,6 +133,15 @@ class SlidingWindowLimiter:
         self.event_times_by_client_key.move_to_end(client_key)
         return True
 
+    def give_back(self, client_key: bytes) -> None:
+        """Undo the newest event of a `try_acquire` that just succeeded (nothing ran between)."""
+        event_times = self.event_times_by_client_key.get(client_key)
+        if event_times is None:
+            return
+        event_times.pop()
+        if not event_times:
+            del self.event_times_by_client_key[client_key]  # an empty key must not stay
+
     def drop_expired_clients(self, window_start: float) -> None:
         while self.event_times_by_client_key:
             oldest_client_key = next(iter(self.event_times_by_client_key))
@@ -114,6 +151,21 @@ class SlidingWindowLimiter:
 
     def tracked_client_count(self) -> int:
         return len(self.event_times_by_client_key)
+
+
+def try_acquire_fine_then_coarse(
+    fine_limiter: SlidingWindowLimiter,
+    coarse_limiter: SlidingWindowLimiter,
+    client_key: bytes,
+    coarse_client_key: bytes | None,
+) -> bool:
+    """Charge the fine limiter, then the coarse one; give the fine one back if coarse refuses."""
+    if not fine_limiter.try_acquire(client_key):
+        return False  # the coarse limiter is never touched
+    if coarse_client_key is not None and not coarse_limiter.try_acquire(coarse_client_key):
+        fine_limiter.give_back(client_key)
+        return False
+    return True
 
 
 class ConnectionLimiter:
@@ -185,6 +237,20 @@ def new_turn_credential_limiter() -> SlidingWindowLimiter:
 
 def new_connection_limiter() -> ConnectionLimiter:
     return ConnectionLimiter(MAX_CONNECTIONS_PER_CLIENT, MAX_CONNECTIONS_TOTAL)
+
+
+def new_coarse_join_limiter() -> SlidingWindowLimiter:
+    return SlidingWindowLimiter(MAX_JOINS_PER_WINDOW_COARSE, JOIN_WINDOW_SECONDS)
+
+
+def new_coarse_turn_credential_limiter() -> SlidingWindowLimiter:
+    return SlidingWindowLimiter(
+        MAX_TURN_CREDENTIALS_PER_WINDOW_COARSE, TURN_CREDENTIAL_WINDOW_SECONDS
+    )
+
+
+def new_coarse_connection_limiter() -> ConnectionLimiter:
+    return ConnectionLimiter(MAX_CONNECTIONS_PER_CLIENT_COARSE, MAX_CONNECTIONS_TOTAL)
 
 
 def new_message_bucket() -> TokenBucket:

@@ -52,13 +52,17 @@ from signaling.protocol import (
 )
 from signaling.rate_limits import (
     JOIN_TIMEOUT_SECONDS,
-    ConnectionLimiter,
     TokenBucket,
     client_key_for_ip,
+    coarse_client_key_for_ip,
+    new_coarse_connection_limiter,
+    new_coarse_join_limiter,
+    new_coarse_turn_credential_limiter,
     new_connection_limiter,
     new_join_limiter,
     new_message_bucket,
     new_turn_credential_limiter,
+    try_acquire_fine_then_coarse,
 )
 from signaling.rooms import group_name_for_room, room_registry
 from signaling.turn_credentials import issue_turn_credentials
@@ -69,10 +73,14 @@ CLOSE_POLICY_VIOLATION = 4008
 CLOSE_MESSAGE_TOO_BIG = 4009
 CLOSE_RATE_LIMITED = 4029
 
-# Per client IP, in memory only (tests replace these with ones that use a fake clock).
+# Per client IP (IPv6: per /64), in memory only (tests replace these with ones that use a fake
+# clock). The coarse ones count IPv6 clients per /48 with higher caps; IPv4 skips them.
 join_limiter = new_join_limiter()
 turn_credential_limiter = new_turn_credential_limiter()
 connection_limiter = new_connection_limiter()
+coarse_join_limiter = new_coarse_join_limiter()
+coarse_turn_credential_limiter = new_coarse_turn_credential_limiter()
+coarse_connection_limiter = new_coarse_connection_limiter()
 
 
 logger = logging.getLogger(__name__)
@@ -81,8 +89,10 @@ logger = logging.getLogger(__name__)
 class SignalingConsumer(AsyncWebsocketConsumer):
     room_id: str | None = None
     client_key: bytes
+    coarse_client_key: bytes | None = None
     message_bucket: TokenBucket
-    limiter_holding_slot: ConnectionLimiter | None = None
+    holds_fine_slot = False
+    holds_coarse_slot = False
     join_attempted = False
     refused_over_cap = False
     join_timeout_task: asyncio.Task[None] | None = None
@@ -98,11 +108,11 @@ class SignalingConsumer(AsyncWebsocketConsumer):
 
     async def connect(self) -> None:
         # Counters are keyed by an HMAC of the client IP (set by ClientAddressMiddleware).
-        self.client_key = client_key_for_ip(self.scope.get("client_ip", "unknown"))
+        client_ip = self.scope.get("client_ip", "unknown")
+        self.client_key = client_key_for_ip(client_ip)
+        self.coarse_client_key = coarse_client_key_for_ip(client_ip)
         self.message_bucket = new_message_bucket()
-        has_slot = connection_limiter.try_acquire(self.client_key)
-        if has_slot:
-            self.limiter_holding_slot = connection_limiter
+        has_slot = self.try_acquire_connection_slots()
         await self.accept()
         if not has_slot:
             self.refused_over_cap = True  # receive() ignores anything sent before the close lands
@@ -111,11 +121,25 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             return
         self.join_timeout_task = asyncio.create_task(self.close_if_not_joined())
 
+    def try_acquire_connection_slots(self) -> bool:
+        """Take a slot per /64 (or IPv4 address), then per /48; give the first back if refused."""
+        if not connection_limiter.try_acquire(self.client_key):
+            return False
+        self.holds_fine_slot = True
+        if self.coarse_client_key is not None:
+            if not coarse_connection_limiter.try_acquire(self.coarse_client_key):
+                self.release_connection_slot()
+                return False
+            self.holds_coarse_slot = True
+        return True
+
     def release_connection_slot(self) -> None:
-        limiter = self.limiter_holding_slot
-        if limiter is not None:
-            self.limiter_holding_slot = None
-            limiter.release(self.client_key)
+        if self.holds_fine_slot:
+            self.holds_fine_slot = False
+            connection_limiter.release(self.client_key)
+        if self.holds_coarse_slot and self.coarse_client_key is not None:
+            self.holds_coarse_slot = False
+            coarse_connection_limiter.release(self.coarse_client_key)
 
     def cancel_join_timeout(self) -> None:
         if self.join_timeout_task is not None:
@@ -170,7 +194,9 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.send_message(ErrorMessage(code="bad-message"))
             return
         self.join_attempted = True  # a join in progress must not be cut off by the join timeout
-        if not join_limiter.try_acquire(self.client_key):
+        if not try_acquire_fine_then_coarse(
+            join_limiter, coarse_join_limiter, self.client_key, self.coarse_client_key
+        ):
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.close(code=CLOSE_RATE_LIMITED)
             return
@@ -218,7 +244,12 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             logger.warning("TURN credential not issued: the room has no time left.")
             return None
         # Charged only when a credential is really issued (after the room-time checks above).
-        if not turn_credential_limiter.try_acquire(self.client_key):
+        if not try_acquire_fine_then_coarse(
+            turn_credential_limiter,
+            coarse_turn_credential_limiter,
+            self.client_key,
+            self.coarse_client_key,
+        ):
             return None  # over the hourly cap: the join works, just without a relay
         return issue_turn_credentials(
             settings.TURN_SHARED_SECRET,

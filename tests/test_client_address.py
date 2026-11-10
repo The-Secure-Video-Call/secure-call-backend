@@ -9,6 +9,7 @@ from signaling.client_address import (
     Receive,
     Scope,
     Send,
+    coarse_ipv6_prefix,
     normalize_ip,
 )
 
@@ -94,6 +95,14 @@ async def test_ipv6_addresses_in_one_slash_64_count_as_one_client() -> None:
 
     assert first == second == direct == "2001:db8:1:2::"
     assert other_prefix == "2001:db8:1:3::"
+
+
+def test_coarse_prefix_is_the_slash_48_and_ipv4_has_none() -> None:
+    assert coarse_ipv6_prefix("2001:db8:1:2::") == "2001:db8:1::"
+    assert coarse_ipv6_prefix("2001:db8:1:ffff::") == "2001:db8:1::"
+    assert coarse_ipv6_prefix("2001:db8:2:2::") == "2001:db8:2::"
+    assert coarse_ipv6_prefix(CLIENT_IP) is None
+    assert coarse_ipv6_prefix(UNKNOWN_CLIENT_IP) is None
 
 
 async def test_missing_peer_address_gives_unknown() -> None:
