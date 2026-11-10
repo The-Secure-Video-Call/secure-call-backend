@@ -23,6 +23,7 @@ ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 
 # Used when the server gives no peer address at all (not the case under Daphne).
 UNKNOWN_CLIENT_IP = "unknown"
+IPV6_PREFIX_LENGTH = 64
 
 
 def normalize_ip(address_text: str) -> str | None:
@@ -68,5 +69,15 @@ class ClientAddressMiddleware:
         if peer_ip in self.trusted_proxy_ips:
             forwarded_ip = rightmost_forwarded_for_ip(scope.get("headers", []))
             if forwarded_ip is not None:
-                return forwarded_ip
-        return peer_ip
+                return group_ipv6_by_prefix(forwarded_ip)
+        return group_ipv6_by_prefix(peer_ip)
+
+
+def group_ipv6_by_prefix(normalized_ip: str) -> str:
+    """One IPv6 /64 is one customer, so it counts as one client (else a /64 has 2^64 buckets)."""
+    address = ipaddress.ip_address(normalized_ip)
+    if isinstance(address, ipaddress.IPv6Address):
+        return str(
+            ipaddress.ip_network(f"{address}/{IPV6_PREFIX_LENGTH}", strict=False).network_address
+        )
+    return normalized_ip

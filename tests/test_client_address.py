@@ -82,10 +82,18 @@ async def test_unparseable_rightmost_entry_falls_back_to_the_peer(bad_value: str
 
 
 async def test_ipv6_and_ipv4_mapped_addresses_are_normalized() -> None:
-    assert await resolve_client_ip(["::ffff:192.168.1.10"], PROXY_IP, ["2001:DB8::1"]) == (
-        "2001:db8::1"
-    )
     assert normalize_ip("::ffff:203.0.113.7") == CLIENT_IP
+    assert await resolve_client_ip(["::ffff:192.168.1.10"], PROXY_IP, [CLIENT_IP]) == CLIENT_IP
+
+
+async def test_ipv6_addresses_in_one_slash_64_count_as_one_client() -> None:
+    first = await resolve_client_ip([PROXY_IP], PROXY_IP, ["2001:DB8:1:2:aaaa::1"])
+    second = await resolve_client_ip([PROXY_IP], PROXY_IP, ["2001:db8:1:2:bbbb::9"])
+    other_prefix = await resolve_client_ip([PROXY_IP], PROXY_IP, ["2001:db8:1:3::1"])
+    direct = await resolve_client_ip([], "2001:db8:1:2:cccc::5", [])
+
+    assert first == second == direct == "2001:db8:1:2::"
+    assert other_prefix == "2001:db8:1:3::"
 
 
 async def test_missing_peer_address_gives_unknown() -> None:
