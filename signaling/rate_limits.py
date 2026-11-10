@@ -28,8 +28,12 @@ JOIN_WINDOW_SECONDS = 60.0
 # TURN credentials: at most 120 per client IP per hour. Many people can share one address (a
 # household, an office, a mobile carrier's NAT), and every join and signaling reconnect uses one,
 # so 30 was reached in normal use. Over the limit the join still works but `joined` has no `turn`,
-# so a script cannot collect unlimited relay credentials. coturn's own quotas (allocations per
-# username, total bandwidth) still cap what the relay can carry.
+# so a script cannot collect unlimited relay credentials. A credential lives up to 4 h (the room
+# lifetime) against this 1 h window, so up to 480 per IP can be valid at once. This cap does not
+# protect the relay's capacity: coturn's `user-quota` counts per username, and every credential
+# has a new one. What the relay carries is capped by its global limits in turnserver.conf (41
+# relay ports, `total-quota`, and `bps-capacity` for about 37 sessions), however many credentials
+# exist.
 MAX_TURN_CREDENTIALS_PER_WINDOW = 120
 TURN_CREDENTIAL_WINDOW_SECONDS = 3600.0
 
