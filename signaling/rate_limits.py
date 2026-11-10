@@ -25,9 +25,12 @@ from collections.abc import Callable
 MAX_JOINS_PER_WINDOW = 20
 JOIN_WINDOW_SECONDS = 60.0
 
-# TURN credentials: at most 30 per client IP per hour. Over the limit the join still works but
-# `joined` has no `turn`, so a script cannot collect unlimited relay credentials.
-MAX_TURN_CREDENTIALS_PER_WINDOW = 30
+# TURN credentials: at most 120 per client IP per hour. Many people can share one address (a
+# household, an office, a mobile carrier's NAT), and every join and signaling reconnect uses one,
+# so 30 was reached in normal use. Over the limit the join still works but `joined` has no `turn`,
+# so a script cannot collect unlimited relay credentials. coturn's own quotas (allocations per
+# username, total bandwidth) still cap what the relay can carry.
+MAX_TURN_CREDENTIALS_PER_WINDOW = 120
 TURN_CREDENTIAL_WINDOW_SECONDS = 3600.0
 
 # Messages per connection: a token bucket. ICE candidates arrive in bursts, so allow 100 at

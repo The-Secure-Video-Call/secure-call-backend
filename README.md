@@ -59,7 +59,7 @@ the server refuses to start without a secret key.
 | `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. |
 
 Rate limits (in memory only, keyed by an HMAC of the client IP; constants in `signaling/rate_limits.py`):
-20 joins per IP per minute, 30 TURN credentials per IP per hour (over it, `joined` has no `turn`),
+20 joins per IP per minute, 120 TURN credentials per IP per hour (over it, `joined` has no `turn`),
 and per connection a burst of 100 messages refilled at 20 per second. Over a join or message
 limit the server sends `error rate-limited` and closes with application code `4029`.
 
