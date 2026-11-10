@@ -214,6 +214,9 @@ and closes it when both answer again. It reads only those two public URLs and re
 one failed and when: no personal data, and nothing runs on the Pis. If only the signaling server
 is down, check the proxy machine first (`docker ps -a` there): the backend answers on its own
 with `curl -H 'Host: signal.securevideocall.com' http://<this Pi's LAN IP>:8001/healthz`.
+GitHub turns the schedule off after 60 days without activity in the web repository, and a push
+does not turn it back on: re-enable it on that repository's Actions tab, or with
+`gh workflow enable uptime.yml -R The-Secure-Video-Call/secure-call`.
 
 To look inside the database from the Pi: `docker compose exec postgres psql -U securecall
 securecall`, or point a database tool at port `5434`.
