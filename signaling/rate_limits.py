@@ -33,9 +33,8 @@ JOIN_WINDOW_SECONDS = 60.0
 # protect the relay's capacity: coturn's `user-quota` counts per username, and every credential
 # has a new one. What the relay carries is capped by its global limits in turnserver.conf (41
 # relay ports, `total-quota`, and `bps-capacity` for about 37 sessions), however many credentials
-# exist; about 7 credentials fill it (see deploy/raspberry-pi/README.md). The per-room budget
-# (`MAX_TURN_CREDENTIALS_PER_ROOM` in rooms.py) is separate; it resets when a room empties, so
-# it does not stop a client that rejoins or creates rooms.
+# exist; about 7 credentials fill it (see "What one client can still do" in
+# deploy/raspberry-pi/README.md).
 MAX_TURN_CREDENTIALS_PER_WINDOW = 120
 TURN_CREDENTIAL_WINDOW_SECONDS = 3600.0
 

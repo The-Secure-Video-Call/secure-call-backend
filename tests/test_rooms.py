@@ -400,29 +400,3 @@ async def test_stale_room_expired_event_after_leave_and_rejoin_is_ignored(
     assert await first.receive_nothing()
     assert registry.room_count() == 1
     await first.disconnect()
-
-
-async def test_turn_credential_budget_is_per_room_and_starts_again_when_recreated(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("signaling.rooms.MAX_TURN_CREDENTIALS_PER_ROOM", 2)
-    registry = RoomRegistry()
-    await registry.add_member(ROOM_ID, "channel-a")
-    await registry.add_member(OTHER_ROOM_ID, "channel-b")
-
-    assert registry.try_take_turn_credential_slot(ROOM_ID)
-    assert registry.try_take_turn_credential_slot(ROOM_ID)
-    assert not registry.try_take_turn_credential_slot(ROOM_ID)  # used up
-    assert not registry.try_take_turn_credential_slot(ROOM_ID)  # and it stays used up
-    assert registry.try_take_turn_credential_slot(OTHER_ROOM_ID)  # another room is unaffected
-
-    await registry.remove_member(ROOM_ID, "channel-a")  # the room empties and is deleted
-    await registry.add_member(ROOM_ID, "channel-c")  # same ID, a new room
-    assert registry.try_take_turn_credential_slot(ROOM_ID)
-
-    await registry.remove_member(ROOM_ID, "channel-c")
-    await registry.remove_member(OTHER_ROOM_ID, "channel-b")
-
-
-async def test_turn_credential_slot_is_refused_for_a_room_that_does_not_exist() -> None:
-    assert not RoomRegistry().try_take_turn_credential_slot(ROOM_ID)

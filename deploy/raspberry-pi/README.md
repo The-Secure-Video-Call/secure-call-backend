@@ -109,17 +109,15 @@ If the maximum seen is below 4, the quota can go lower; if it is above 6, raise 
 `user-quota` counts per username, and **every credential has a new username**, so it limits one
 credential, not one client. With 41 relay ports and `user-quota=6`, **about 7 credentials fill
 every relay port** (41 / 6 rounded up); `bps-capacity` / `max-bps` (about 37 sessions at full
-rate) is reached with fewer allocations per credential. What brakes the number of credentials:
+rate) is reached with fewer allocations per credential. The only brake on the number of
+credentials is the backend's cap of 120 per client IP per hour (`signaling/rate_limits.py`). It
+cannot be lower, because many people share one address, so 7 is well inside it.
 
-- the backend's cap of 120 credentials per client IP per hour (`signaling/rate_limits.py`). It
-  cannot be lower, because many people share one address, so 7 is well inside it;
-- the backend's cap of 20 credentials per room (`signaling/rooms.py`), which stops a reconnect
-  loop in one occupied room from being an endless credential source. The count lives only while
-  the room exists (we keep no list of old room IDs), so **it resets when the room empties: one
-  client that leaves and rejoins the same ID, or a script that creates rooms, is not stopped by
-  it.** It is a guard against runaway reconnects, not a defence against a hostile client. Also
-  note it is shared by both members: one of them reconnecting 20 times leaves the room without
-  a relay until it ends (privacy-mode calls then fail closed).
+A per-room credential budget was tried (#39) and removed: rooms are free to create and its count
+reset when a room emptied, so it did not stop a hostile client, while a long call with many
+reconnects could use it up and lose privacy mode. The per-IP cap has the same effect at a higher
+threshold: over it, `joined` has no `turn` and privacy-mode calls fail closed for everyone on
+that address until the hour window frees credentials.
 
 So **one client can still fill the relay.** The impact is availability only: media stays
 DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full, privacy-mode
