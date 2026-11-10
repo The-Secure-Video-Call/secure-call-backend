@@ -125,8 +125,15 @@ SIGNALING_MAX_MESSAGE_BYTES = 64 * 1024
 TURN_SHARED_SECRET = os.environ.get("TURN_SHARED_SECRET", "")
 TURN_URLS = env_list("TURN_URLS", default=[])
 MAX_TURN_CREDENTIAL_TTL_SECONDS = 24 * 3600  # "short-lived": never more than a day
+# Default: as long as a room can live (signaling.rooms.TOTAL_LIFETIME_LIMIT_SECONDS, 4 h), so a
+# credential never expires mid-call. coturn renews an existing allocation after expiry, but a
+# new allocation (an ICE restart after a network change) needs a valid credential, and in
+# privacy mode the relay is the only path. tests/test_settings.py keeps the two values equal.
+DEFAULT_TURN_CREDENTIAL_TTL_SECONDS = 4 * 60 * 60
 try:
-    TURN_CREDENTIAL_TTL_SECONDS = int(os.environ.get("TURN_CREDENTIAL_TTL_SECONDS", "3600"))
+    TURN_CREDENTIAL_TTL_SECONDS = int(
+        os.environ.get("TURN_CREDENTIAL_TTL_SECONDS", str(DEFAULT_TURN_CREDENTIAL_TTL_SECONDS))
+    )
 except ValueError:
     raise ImproperlyConfigured("TURN_CREDENTIAL_TTL_SECONDS must be a whole number.") from None
 if not 1 <= TURN_CREDENTIAL_TTL_SECONDS <= MAX_TURN_CREDENTIAL_TTL_SECONDS:
