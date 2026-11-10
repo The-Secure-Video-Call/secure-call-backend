@@ -88,9 +88,17 @@ The IPv6 and mapped deny ranges in `turnserver.conf` stay as defence in depth.
 
 ### Logging
 
-coturn logs nothing (`no-stdout-log`, `log-file=/dev/null`): session lines can contain
+coturn logs nothing (`no-stdout-log`, `log-file=stdout`): session lines can contain
 usernames and peer IPs, which must never be logged. The cost is that startup errors are not
 visible in `docker logs`; to debug, temporarily run coturn by hand with a different config.
+
+`log-file=/dev/null` was not enough: CI found `/var/tmp/turn_1_<date>.log` inside the container.
+coturn derives a dated file name from the `log-file` value, so `/dev/null` is not special.
+The container therefore also has a read-only root filesystem and 1 MB in-memory (`tmpfs`)
+mounts for `/var/tmp`, `/tmp` and `/var/log`, so nothing coturn writes can reach the Pi's
+disk. The test inspects the container (as root) before each restart and at the end: a log file
+on the real filesystem fails, and a file on the tmpfs mounts is printed (masked) and fails if
+it contains a test username or peer IP.
 
 ### Refresh after expiry (input for #26)
 

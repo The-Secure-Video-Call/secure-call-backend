@@ -12,8 +12,9 @@ container_name="coturn-test"
 failures=0
 
 usernames_file="$(mktemp)"
+peers_file="$(mktemp)"
 
-cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file"; }
+cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; rm -f "$usernames_file" "$peers_file"; }
 trap cleanup EXIT
 
 # $1 = seconds until the credential expires (negative = already expired). Prints
@@ -33,6 +34,7 @@ make_credential() {
 run_client() {
   local username password
   read -r username password < <(make_credential "$1")
+  echo "$2" >>"$peers_file"
   if [ -n "${3-}" ]; then password="$3"; fi
   local client_output client_exit_code
   client_output="$(docker exec "$container_name" timeout 20 turnutils_uclient -v -u "$username" -w "$password" -e "$2" -n 1 -m 1 127.0.0.1 2>&1)"
@@ -76,7 +78,10 @@ expect() {
   elif grep -Fq 'Received relay addr' <<<"$output" \
     && grep -Eq 'channel bind: error 403.*Forbidden IP' <<<"$output"; then
     got=forbidden
-  elif ! grep -Fq 'Received relay addr' <<<"$output" && grep -Eqi 'error[ :]*4[0-9][0-9]' <<<"$output"; then
+  elif ! grep -Fq 'Received relay addr' <<<"$output" \
+    && grep -Eqi 'error[ :]*4[0-9][0-9]|ERROR: Cannot complete Allocation' <<<"$output"; then
+    # A wrong or expired credential: the client prints "ERROR: Cannot complete Allocation" (exit
+    # code 255) after the repeated 401 challenges, with no explicit 401 line.
     got=no_allocation
   else
     got=unclear
@@ -101,14 +106,71 @@ wait_for_turn_port() {
   return 1
 }
 
-restart_coturn() { docker restart "$container_name" >/dev/null && wait_for_turn_port; }
+# Masks usernames and IPv4 addresses so a failing check can show a line without leaking values.
+mask_values() { sed -E 's/[0-9]{9,}:[0-9a-f]{12}/<USERNAME>/g; s/[0-9]{1,3}(\.[0-9]{1,3}){3}/<IP>/g'; }
+
+# Looks for log files in the container, as root (so a permission error cannot hide a file):
+#  - on the real (non-tmpfs) filesystem: any log-like file written in the last hour fails. The
+#    root filesystem is read-only in compose.yaml, so there should be none. -xdev skips the tmpfs
+#    mounts, which are searched separately below.
+#  - on the tmpfs mounts (/var/tmp, /tmp, /var/log): files are reported (name, line count, masked
+#    first lines, to show what wrote them); a file containing a test username or peer IP fails.
+# tmpfs contents vanish when the container stops, so this also runs before every restart.
+inspect_log_files() {
+  local when="$1" real_files real_exit tmpfs_files tmpfs_exit file line_count
+  real_files="$(docker exec -u 0 "$container_name" find / -xdev -type f -mmin -60 \
+    \( -name '*.log' -o -name 'turn_*' -o -path '/var/log/*' \) 2>&1)"
+  real_exit=$?
+  if [ "$real_exit" -ne 0 ]; then
+    echo "FAIL: could not search the container for log files ($when, exit $real_exit)"
+    echo "$real_files" | tail -n 5
+    failures=$((failures + 1))
+  elif [ -n "$real_files" ]; then
+    echo "FAIL: log files exist on the container's real filesystem ($when):"
+    echo "$real_files" | head -n 10
+    failures=$((failures + 1))
+  else
+    echo "PASS: no log files on the real filesystem ($when)"
+  fi
+  tmpfs_files="$(docker exec -u 0 "$container_name" find /var/tmp /tmp /var/log /dev/shm -type f 2>&1)"
+  tmpfs_exit=$?
+  if [ "$tmpfs_exit" -ne 0 ]; then
+    echo "FAIL: could not search the tmpfs mounts for log files ($when, exit $tmpfs_exit)"
+    echo "$tmpfs_files" | tail -n 5
+    failures=$((failures + 1))
+    return
+  fi
+  if [ -z "$tmpfs_files" ]; then
+    echo "PASS: no files on the tmpfs mounts ($when)"
+    return
+  fi
+  while IFS= read -r file; do
+    line_count="$(docker exec -u 0 "$container_name" wc -l "$file" 2>&1 | awk '{print $1}')"
+    echo "NOTE: tmpfs file $file ($when): $line_count lines. First lines (values masked):"
+    docker exec -u 0 "$container_name" head -n 5 "$file" 2>&1 | mask_values | sed 's/^/    /'
+    if docker exec -u 0 "$container_name" cat "$file" 2>/dev/null \
+      | grep -Fwq -f "$usernames_file" -f "$peers_file"; then
+      echo "FAIL: $file contains a test username or peer IP ($when)"
+      failures=$((failures + 1))
+    else
+      echo "PASS: $file contains no test username or peer IP ($when)"
+    fi
+  done <<<"$tmpfs_files"
+}
+
+restart_coturn() {
+  inspect_log_files "before restart"
+  docker restart "$container_name" >/dev/null && wait_for_turn_port
+}
 
 # The Pi passes --relay-ip=$TURN_RELAY_IP (its LAN IPv4); the test uses the runner's own IPv4.
 relay_ip="$(hostname -I | tr ' ' '\n' | grep -m1 -E '^[0-9]+(\.[0-9]+){3}$')"
 relay_ip="${relay_ip:-127.0.0.1}"
 
 cleanup
-docker run -d --name "$container_name" --network host \
+# Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only.
+docker run -d --name "$container_name" --network host --read-only \
+  --tmpfs /var/tmp:size=1m,mode=1777 --tmpfs /tmp:size=1m,mode=1777 --tmpfs /var/log:size=1m,mode=1777 \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
   --external-ip=127.0.0.1 --relay-ip="$relay_ip" >/dev/null || exit 1
@@ -166,10 +228,14 @@ done
 # The server logs must not contain any username or the peer IP. Logging is off in the config, so
 # they should be empty; if not, show the offending lines with the values masked.
 server_logs="$(docker logs "$container_name" 2>&1)"
-if grep -Fq -f "$usernames_file" <<<"$server_logs" || grep -Fq "$public_peer" <<<"$server_logs"; then
+if [ -n "$server_logs" ]; then
+  # Logging is meant to be off entirely, so ANY output fails (this also covers private peers).
+  echo "FAIL: docker logs are not empty. Lines (values masked):"
+  echo "$server_logs" | head -n 10 | mask_values
+  failures=$((failures + 1))
+elif grep -Fq -f "$usernames_file" <<<"$server_logs" || grep -Fq "$public_peer" <<<"$server_logs"; then
   echo "FAIL: coturn logs contain a username or peer IP. Offending lines (values masked):"
-  grep -F -e "$public_peer" -f "$usernames_file" <<<"$server_logs" | head -n 10 \
-    | sed -E 's/[0-9]{9,}:[0-9a-f]{12}/<USERNAME>/g; s/[0-9]{1,3}(\.[0-9]{1,3}){3}/<IP>/g'
+  grep -F -e "$public_peer" -f "$usernames_file" <<<"$server_logs" | head -n 10 | mask_values
   failures=$((failures + 1))
 else
   echo "PASS: logs contain no username or peer IP"
@@ -186,21 +252,8 @@ else
   echo "PASS: config has no verbose, syslog or log-binding"
 fi
 
-# No log files may exist in the container after the run (regular files written in the last
-# hour that look like logs). A failing docker exec is a failure, not "no files".
-log_files_output="$(docker exec "$container_name" find / -xdev -type f -mmin -60 \
-  \( -name '*.log' -o -name 'turn_*' -o -path '/var/log/*' \) 2>&1)"
-log_files_exit_code=$?
-if [ "$log_files_exit_code" -ne 0 ]; then
-  echo "FAIL: could not search the container for log files (exit $log_files_exit_code)"
-  echo "$log_files_output" | tail -n 5
-  failures=$((failures + 1))
-elif [ -n "$log_files_output" ]; then
-  echo "FAIL: log files exist in the container:"; echo "$log_files_output" | head -n 10
-  failures=$((failures + 1))
-else
-  echo "PASS: no log files in the container"
-fi
+# No log file may hold a username or peer IP, and none may exist outside the tmpfs mounts.
+inspect_log_files "end of run"
 
 # The admin CLI must be off.
 if (exec 3<>/dev/tcp/127.0.0.1/5766) 2>/dev/null; then

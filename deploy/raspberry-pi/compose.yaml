@@ -62,6 +62,14 @@ services:
     container_name: secure-call-coturn
     restart: unless-stopped
     network_mode: host
+    # Nothing coturn writes can reach the Pi's disk: read-only root filesystem, and small
+    # in-memory mounts (world-writable, as the image runs coturn as an unprivileged user) for the
+    # places it may try to write logs to. Their contents vanish when the container stops.
+    read_only: true
+    tmpfs:
+      - /var/tmp:size=1m,mode=1777
+      - /tmp:size=1m,mode=1777
+      - /var/log:size=1m,mode=1777
     # The secret comes from .env (compose substitution), never from a file in the repo.
     # No env_file here: coturn must not receive the backend's other secrets.
     command:
