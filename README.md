@@ -62,7 +62,7 @@ the server refuses to start without a secret key.
 | `POSTGRES_PASSWORD` | Required when `POSTGRES_HOST` is set (outside DEBUG). |
 | `POSTGRES_SSLMODE` | Default `prefer`. Use `require` if the database is on another machine. |
 | `DJANGO_SECURE_SSL_REDIRECT` | Defaults to on in production. TLS is terminated by the reverse proxy. |
-| `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. |
+| `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. Every log line reads `<ISO 8601 UTC time>Z <LEVEL> <logger name> <message>`, e.g. `2026-11-10T20:42:01Z WARNING signaling.consumers TURN credential not issued`. The format adds no IP addresses, room IDs or message contents, and this server's own log calls never include them. At `INFO` or lower, Daphne and Django's own loggers may log addresses, so keep the default and run Daphne with `-v 0`. |
 
 Rate limits (in memory only, keyed by an HMAC of the client address; constants in
 `signaling/rate_limits.py`): 20 joins per client per minute, 120 TURN credentials per client per

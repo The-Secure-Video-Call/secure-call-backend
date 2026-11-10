@@ -1,10 +1,13 @@
 """Production defaults must be safe: these run the real settings module in a clean process."""
 
+import logging
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
+from config.settings import LOG_LINE_FORMAT, LOGGING, build_utc_log_formatter
 from signaling.rooms import TOTAL_LIFETIME_LIMIT_SECONDS
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -185,3 +188,43 @@ def test_turn_ttl_cap_matches_the_room_lifetime_limit() -> None:
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.split() == [str(TOTAL_LIFETIME_LIMIT_SECONDS)] * 2
+
+
+LOG_LINE_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (DEBUG|INFO|WARNING|ERROR|CRITICAL) [\w.]+ .+$"
+)
+
+
+def format_log_record(logger_name: str, level: int, message: str) -> str:
+    record = logging.LogRecord(logger_name, level, __file__, 1, message, None, None)
+    record.created = 0.0  # the Unix epoch, to prove the time is UTC
+    return build_utc_log_formatter().format(record)
+
+
+def test_log_line_has_utc_time_level_and_logger_name() -> None:
+    line = format_log_record("signaling.consumers", logging.WARNING, "TURN credential not issued")
+
+    assert LOG_LINE_PATTERN.match(line)
+    assert line == "1970-01-01T00:00:00Z WARNING signaling.consumers TURN credential not issued"
+
+
+def test_console_handler_uses_the_utc_formatter() -> None:
+    assert LOGGING["handlers"]["console"]["formatter"] == "utc_line"
+    assert LOGGING["formatters"]["utc_line"]["()"] is build_utc_log_formatter
+
+
+def test_log_line_format_only_allows_time_level_logger_and_message() -> None:
+    assert set(re.findall(r"%\((\w+)\)", LOG_LINE_FORMAT)) == {
+        "asctime",
+        "levelname",
+        "name",
+        "message",
+    }
+
+
+def test_formatter_adds_no_address_or_room_id_of_its_own() -> None:
+    line = format_log_record("signaling.consumers", logging.ERROR, "join rejected")
+
+    text_after_time = line.split(" ", 1)[1]
+    assert text_after_time == "ERROR signaling.consumers join rejected"
+    assert not re.search(r"\d{1,3}(\.\d{1,3}){3}|[0-9a-f]{1,4}:[0-9a-f]{1,4}:", text_after_time)
