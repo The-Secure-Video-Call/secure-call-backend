@@ -94,7 +94,9 @@ log file (`turn_<pid>_<date>.log`) and prints one startup line, `log file opened
 to `docker logs`. The read-only root filesystem plus 1 MB in-memory (`tmpfs`) mounts for
 `/var/tmp`, `/tmp` and `/var/log` keep that file in memory: nothing coturn writes can reach the
 Pi's disk, and it vanishes when the container stops. The mounts are `noexec,nosuid,nodev`, the
-container drops all capabilities and sets `no-new-privileges`.
+container drops all capabilities except `NET_BIND_SERVICE`. That one is needed because the image
+puts a file capability on the `turnserver` binary, and the kernel refuses to start it without it.
+`no-new-privileges` is not set, because it blocks that file capability too (CI run 42757878869).
 
 Checked in CI (an earlier run, before the allow-list and `cap_drop`): the dated log file has 2 startup lines and no test username or
 peer IP; `/dev/shm/mongoc-1` holds only binary counters; `/var/tmp/turnserver.pid` is the pid.

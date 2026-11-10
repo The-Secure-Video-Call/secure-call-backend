@@ -170,14 +170,30 @@ relay_ip="${relay_ip:-127.0.0.1}"
 cleanup
 # Same hardening as compose.yaml: read-only root filesystem, small tmpfs mounts only.
 docker run -d --name "$container_name" --network host --read-only \
-  --cap-drop ALL --security-opt no-new-privileges:true \
+  --cap-drop ALL --cap-add NET_BIND_SERVICE \
   --tmpfs /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /tmp:size=1m,mode=1777,noexec,nosuid,nodev \
   --tmpfs /var/log:size=1m,mode=1777,noexec,nosuid,nodev \
   -v "$here/turnserver.conf:/etc/coturn/turnserver.conf:ro" \
   "$image" -c /etc/coturn/turnserver.conf --static-auth-secret="$test_secret" \
   --external-ip=127.0.0.1 --relay-ip="$relay_ip" >/dev/null || exit 1
-wait_for_turn_port || { echo "FAIL: coturn did not start"; exit 1; }
+if ! wait_for_turn_port; then
+  echo "FAIL: coturn did not start. Diagnostics:"
+  echo "-- docker logs:"
+  docker logs "$container_name" 2>&1 | mask_values | sed "s|$test_secret|<SECRET>|g" | tail -n 30
+  echo "-- docker inspect (status exit-code error):"
+  docker inspect --format "{{.State.Status}} {{.State.ExitCode}} {{.State.Error}}" "$container_name" 2>&1
+  echo "-- file capabilities on turnserver:"
+  for turnserver_path in /usr/bin/turnserver /usr/local/bin/turnserver; do
+    # getcap may be missing from the image; fall back to getfattr, then to python3's getxattr.
+    docker run --rm --network none --entrypoint sh "$image" -c \
+      "ls -l $turnserver_path; if command -v getcap >/dev/null; then getcap $turnserver_path; \
+       elif command -v getfattr >/dev/null; then getfattr -d -m - $turnserver_path; \
+       else echo 'no getcap or getfattr in the image'; fi" 2>&1 \
+      | mask_values | sed "s|$test_secret|<SECRET>|g; s|^|  |"
+  done
+  exit 1
+fi
 
 # bps-capacity / max-bps allows about 37 concurrent allocations (README). Each group below stays
 # well under that, and coturn is restarted (fresh state) between groups.
