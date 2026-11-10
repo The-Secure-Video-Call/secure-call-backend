@@ -391,5 +391,5 @@ def _client_for(
 def test_new_limiters_use_the_documented_limits() -> None:
     assert new_join_limiter().max_events == 20
     assert new_join_limiter().window_seconds == 60.0
-    assert new_turn_credential_limiter().max_events == 30
+    assert new_turn_credential_limiter().max_events == 120
     assert new_turn_credential_limiter().window_seconds == 3600.0

@@ -59,9 +59,10 @@ the server refuses to start without a secret key.
 | `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. |
 
 Rate limits (in memory only, keyed by an HMAC of the client IP; constants in `signaling/rate_limits.py`):
-20 joins per IP per minute, 30 TURN credentials per IP per hour (over it, `joined` has no `turn`),
-and per connection a burst of 100 messages refilled at 20 per second. Over a join or message
-limit the server sends `error rate-limited` and closes with application code `4029`.
+20 joins per IP per minute, 120 TURN credentials per IP per hour (over it, `joined` has no `turn`;
+a credential lasts up to 4 h, so up to 480 per IP can be valid at once), and per connection a
+burst of 100 messages refilled at 20 per second. Over a join or message limit the server sends
+`error rate-limited` and closes with application code `4029`.
 
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.
