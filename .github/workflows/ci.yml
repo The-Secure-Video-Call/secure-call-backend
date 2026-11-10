@@ -21,7 +21,7 @@ jobs:
     # A throwaway PostgreSQL so the database tests run against a real server.
     services:
       postgres:
-        image: postgres:18
+        image: postgres:18@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
         env:
           POSTGRES_DB: securecall
           POSTGRES_USER: securecall
@@ -34,9 +34,13 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # Every action pinned to a commit SHA and every image to a digest (a tag can be moved).
+      - name: Actions and images are pinned
+        run: python3 scripts/check_pinned_references.py
 
       # Python version comes from .python-version; uv installs it.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -63,7 +67,9 @@ jobs:
           DJANGO_SECRET_KEY="$(uv run python -c 'import secrets; print(secrets.token_urlsafe(50))')" \
             uv run python manage.py check --deploy --fail-level WARNING
 
-      - run: uv run pip-audit
+      # The environment is exactly uv.lock (uv sync --locked above). --strict also fails when a
+      # package cannot be audited, so nothing is skipped silently.
+      - run: uv run pip-audit --strict
 
   # The hardened coturn config (deploy/raspberry-pi/coturn/) against the pinned image:
   # valid credentials allocate; wrong or expired credentials and private peers are refused.
@@ -71,7 +77,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: Hardened coturn checks

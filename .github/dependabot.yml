@@ -8,8 +8,19 @@ updates:
     directory: /
     schedule:
       interval: weekly
-  # Base images in the Dockerfile (python, uv).
+  # Base images in the Dockerfile (python, uv), pinned by digest.
   - package-ecosystem: docker
     directory: /
+    schedule:
+      interval: weekly
+  # The coturn base image, pinned by digest.
+  - package-ecosystem: docker
+    directory: /deploy/raspberry-pi/coturn
+    schedule:
+      interval: weekly
+  # postgres in compose.yaml, pinned by digest. After merging a bump, update the Pi by hand
+  # (see deploy/raspberry-pi/README.md): update.sh only updates the backend.
+  - package-ecosystem: docker-compose
+    directory: /deploy/raspberry-pi
     schedule:
       interval: weekly
