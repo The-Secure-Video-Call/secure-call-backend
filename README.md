@@ -31,12 +31,18 @@ DJANGO_DEBUG=1 uv run daphne -b 127.0.0.1 -p 8000 config.asgi:application
 ## Checks (the same ones CI runs)
 
 ```sh
+python3 scripts/check_pinned_references.py
 uv run ruff check
 uv run ruff format --check
 uv run mypy .
 uv run pytest
-uv run pip-audit
+uv run pip-audit --strict
 ```
+
+Every GitHub Action is pinned to a full commit SHA and every container image to an `@sha256:`
+digest, because a tag can be moved to other code. `scripts/check_pinned_references.py` fails CI
+on anything else (our own images, built here or on the Pi, are the only exceptions). Dependabot
+proposes the updates every week.
 
 ## Configuration
 
@@ -143,6 +149,14 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
 
 To look inside the database from the Pi: `docker compose exec postgres psql -U securecall
 securecall`, or point a database tool at port `5434`.
+
+**PostgreSQL updates:** `compose.yaml` pins `postgres:18` by digest. After merging a Dependabot
+PR that bumps it, run on the Pi (`update.sh` only updates the backend):
+
+```sh
+cd ~/secure-call-backend && git pull
+cd deploy/raspberry-pi && docker compose pull postgres && docker compose up -d postgres
+```
 
 ## Protocol contract
 

@@ -30,14 +30,14 @@ jobs:
       id-token: write
       actions: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
 
       # Read-only copy of the other repo's latest main, so Claude can read its code like a
       # teammate on the other team would. It has no credentials and .gitignore lists
       # .reference/, so it can never be changed or committed from here.
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: The-Secure-Video-Call/secure-call
           path: .reference/secure-call
@@ -47,9 +47,11 @@ jobs:
       # uv (and through it Python 3.14) so Claude can run the project's checks.
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
+          # The same uv as the Dockerfile (ghcr.io/astral-sh/uv:0.12.13).
+          version: "0.12.13"
           enable-cache: true
 
-      - uses: anthropics/claude-code-action@v1
+      - uses: anthropics/claude-code-action@4fa93a88de49bbef68b10eb15aabedf28ca0e1ed # v1.0.271
         with:
           # Runs on the maintainer's Claude subscription (token from `claude setup-token`).
           # Console promotional API credits don't cover Claude Code / this Action.
