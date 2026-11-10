@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from signaling.rooms import TOTAL_LIFETIME_LIMIT_SECONDS
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -86,11 +88,23 @@ TURN_PRINT = (
 )
 
 
-def test_turn_is_off_by_default_with_one_hour_ttl() -> None:
+def test_turn_is_off_by_default_with_four_hour_ttl() -> None:
     result = load_settings({"DJANGO_SECRET_KEY": "k" * 60}, TURN_PRINT)
 
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "False [] 3600"
+    assert result.stdout.strip() == "False [] 14400"
+
+
+def test_default_turn_ttl_matches_the_room_lifetime_limit() -> None:
+    # A TURN credential must not expire before the room does, or an ICE restart late in a call
+    # (the relay is the only path in privacy mode) could not get a new allocation.
+    result = load_settings(
+        {"DJANGO_SECRET_KEY": "k" * 60},
+        "import config.settings as s; print(s.DEFAULT_TURN_CREDENTIAL_TTL_SECONDS)",
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert int(result.stdout.strip()) == TOTAL_LIFETIME_LIMIT_SECONDS
 
 
 def test_turn_settings_come_from_environment() -> None:
