@@ -10,8 +10,11 @@ addresses or message contents.
 """
 
 import ipaddress
+import logging
 import os
+import time
 from pathlib import Path
+from typing import Any
 
 from django.core.exceptions import ImproperlyConfigured
 from django.core.management.utils import get_random_secret_key
@@ -183,10 +186,22 @@ SILENCED_SYSTEM_CHECKS = [
     "security.W021",
 ]
 
-LOGGING = {
+LOG_LINE_FORMAT = "%(asctime)s %(levelname)s %(name)s %(message)s"
+LOG_TIME_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
+
+
+def build_utc_log_formatter() -> logging.Formatter:
+    """Log lines carry an ISO 8601 UTC time, the level and the logger name, and nothing else."""
+    utc_formatter = logging.Formatter(LOG_LINE_FORMAT, datefmt=LOG_TIME_FORMAT)
+    utc_formatter.converter = time.gmtime
+    return utc_formatter
+
+
+LOGGING: dict[str, Any] = {
     "version": 1,
     "disable_existing_loggers": False,
-    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "formatters": {"utc_line": {"()": build_utc_log_formatter}},
+    "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "utc_line"}},
     # Default to warnings only: never log message payloads, room IDs or IP addresses.
     "root": {"handlers": ["console"], "level": os.environ.get("DJANGO_LOG_LEVEL", "WARNING")},
 }
