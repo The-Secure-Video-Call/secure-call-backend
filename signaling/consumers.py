@@ -27,6 +27,7 @@ sender, so each relayed event carries the sender's channel name and the sender s
 """
 
 import asyncio
+import contextlib
 import logging
 import math
 import time
@@ -83,6 +84,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
     message_bucket: TokenBucket
     limiter_holding_slot: ConnectionLimiter | None = None
     join_attempted = False
+    refused_over_cap = False
     join_timeout_task: asyncio.Task[None] | None = None
 
     async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
@@ -103,6 +105,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             self.limiter_holding_slot = connection_limiter
         await self.accept()
         if not has_slot:
+            self.refused_over_cap = True  # receive() ignores anything sent before the close lands
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.close(code=CLOSE_RATE_LIMITED)
             return
@@ -122,7 +125,9 @@ class SignalingConsumer(AsyncWebsocketConsumer):
     async def close_if_not_joined(self) -> None:
         await asyncio.sleep(JOIN_TIMEOUT_SECONDS)
         if not self.join_attempted:
-            await self.close(code=CLOSE_POLICY_VIOLATION)
+            # If the socket is already gone there is nothing left to close.
+            with contextlib.suppress(Exception):
+                await self.close(code=CLOSE_POLICY_VIOLATION)
 
     async def disconnect(self, code: int) -> None:
         self.cancel_join_timeout()
@@ -130,6 +135,8 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         await self.leave_room()
 
     async def receive(self, text_data: str | None = None, bytes_data: bytes | None = None) -> None:
+        if self.refused_over_cap:
+            return  # no slot: never join a room
         if not self.message_bucket.try_take_token():
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.leave_room_then_close(CLOSE_RATE_LIMITED)

@@ -597,6 +597,21 @@ async def test_spoofed_forwarded_for_from_an_untrusted_peer_does_not_change_buck
         await client.disconnect()
 
 
+async def test_refused_connection_cannot_join_a_room(
+    small_connection_limiter: ConnectionLimiter,
+) -> None:
+    accepted = [await open_connected_client() for _ in range(CAP_PER_CLIENT)]
+    refused = await open_connected_client()
+    await refused.send_to(text_data=join_text(7))  # sent before the close is processed
+    await refused.receive_from()  # rate-limited error
+    await refused.receive_output()  # the close
+    await refused.wait()
+
+    assert room_registry.room_count() == 0
+    for client in accepted:
+        await client.disconnect()
+
+
 async def test_refusal_logs_and_sends_no_ip_address(
     small_connection_limiter: ConnectionLimiter, caplog: pytest.LogCaptureFixture
 ) -> None:
