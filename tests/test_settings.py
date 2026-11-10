@@ -19,7 +19,7 @@ DEFAULT_PRINT = (
 def load_settings(
     env: dict[str, str], code: str = DEFAULT_PRINT
 ) -> subprocess.CompletedProcess[str]:
-    prefixes = ("DJANGO_", "SIGNALING_", "POSTGRES_", "TURN_")
+    prefixes = ("DJANGO_", "SIGNALING_", "POSTGRES_", "TURN_", "TRUSTED_")
     clean_env = {k: v for k, v in os.environ.items() if not k.startswith(prefixes)}
     return subprocess.run(  # noqa: S603 - fixed command, no user input
         [sys.executable, "-c", code],
@@ -145,6 +145,34 @@ def test_refuses_database_without_password_in_production() -> None:
 
     assert result.returncode != 0
     assert "POSTGRES_PASSWORD must be set" in result.stderr
+
+
+TRUSTED_PROXY_PRINT = "import config.settings as s; print(s.TRUSTED_PROXY_IPS)"
+
+
+def test_no_proxy_is_trusted_by_default() -> None:
+    result = load_settings({"DJANGO_SECRET_KEY": "k" * 60}, TRUSTED_PROXY_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "[]"
+
+
+def test_trusted_proxy_ips_come_from_environment() -> None:
+    env = {"DJANGO_SECRET_KEY": "k" * 60, "TRUSTED_PROXY_IPS": "192.168.1.10, fd00::1"}
+    result = load_settings(env, TRUSTED_PROXY_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "['192.168.1.10', 'fd00::1']"
+
+
+def test_bad_trusted_proxy_ips_stop_startup_without_echoing_the_value() -> None:
+    for bad_value in ("proxy.example", "192.168.1.0/24", "192.168.1.10;evil"):
+        env = {"DJANGO_SECRET_KEY": "k" * 60, "TRUSTED_PROXY_IPS": bad_value}
+        result = load_settings(env, TRUSTED_PROXY_PRINT)
+
+        assert result.returncode != 0, bad_value
+        assert "TRUSTED_PROXY_IPS must be" in result.stderr
+        assert bad_value not in result.stderr
 
 
 def test_turn_ttl_cap_matches_the_room_lifetime_limit() -> None:

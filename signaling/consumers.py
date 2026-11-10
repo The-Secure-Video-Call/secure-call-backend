@@ -9,7 +9,8 @@ Security rules (PLAN.md 3.5):
 - bad connections are closed with application codes, because Daphne (Autobahn) only lets an
   application send 1000 or 3000-4999 (anything else raises and skips `disconnect`):
   4003 unsupported data (a binary frame), 4008 policy violation (a malformed or invalid message),
-  4009 message too big. 1000 stays the normal close (`room-full`, `room-expired`);
+  4009 message too big, 4029 rate limited (too many joins or messages; `error rate-limited` is
+  sent first; see rate_limits.py). 1000 stays the normal close (`room-full`, `room-expired`);
 - a room holds at most two connections and expires (see rooms.py): members get `room-expired`;
 - `signal` text is relayed to the other member exactly as received. It is validated like every
   message but never stored or logged; message contents and room IDs are never logged.
@@ -40,6 +41,13 @@ from signaling.protocol import (
     SignalMessage,
     TurnCredentials,
 )
+from signaling.rate_limits import (
+    TokenBucket,
+    client_key_for_ip,
+    new_join_limiter,
+    new_message_bucket,
+    new_turn_credential_limiter,
+)
 from signaling.rooms import group_name_for_room, room_registry
 from signaling.turn_credentials import issue_turn_credentials
 
@@ -47,6 +55,11 @@ from signaling.turn_credentials import issue_turn_credentials
 CLOSE_UNSUPPORTED_DATA = 4003
 CLOSE_POLICY_VIOLATION = 4008
 CLOSE_MESSAGE_TOO_BIG = 4009
+CLOSE_RATE_LIMITED = 4029
+
+# Per client IP, in memory only (tests replace these with ones that use a fake clock).
+join_limiter = new_join_limiter()
+turn_credential_limiter = new_turn_credential_limiter()
 
 
 logger = logging.getLogger(__name__)
@@ -54,14 +67,23 @@ logger = logging.getLogger(__name__)
 
 class SignalingConsumer(AsyncWebsocketConsumer):
     room_id: str | None = None
+    client_key: bytes
+    message_bucket: TokenBucket
 
     async def connect(self) -> None:
+        # Counters are keyed by an HMAC of the client IP (set by ClientAddressMiddleware).
+        self.client_key = client_key_for_ip(self.scope.get("client_ip", "unknown"))
+        self.message_bucket = new_message_bucket()
         await self.accept()
 
     async def disconnect(self, code: int) -> None:
         await self.leave_room()
 
     async def receive(self, text_data: str | None = None, bytes_data: bytes | None = None) -> None:
+        if not self.message_bucket.try_take_token():
+            await self.send_message(ErrorMessage(code="rate-limited"))
+            await self.leave_room_then_close(CLOSE_RATE_LIMITED)
+            return
         if text_data is None:
             await self.leave_room_then_close(CLOSE_UNSUPPORTED_DATA)
             return
@@ -89,6 +111,10 @@ class SignalingConsumer(AsyncWebsocketConsumer):
     async def join_room(self, room_id: str) -> None:
         if self.room_id is not None:
             await self.send_message(ErrorMessage(code="bad-message"))
+            return
+        if not join_limiter.try_acquire(self.client_key):
+            await self.send_message(ErrorMessage(code="rate-limited"))
+            await self.close(code=CLOSE_RATE_LIMITED)
             return
         group_name = group_name_for_room(room_id)
         room_seconds_left: float | None = None
@@ -133,6 +159,9 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             # No room ID or address here: only enough to notice the case.
             logger.warning("TURN credential not issued: the room has no time left.")
             return None
+        # Charged only when a credential is really issued (after the room-time checks above).
+        if not turn_credential_limiter.try_acquire(self.client_key):
+            return None  # over the hourly cap: the join works, just without a relay
         return issue_turn_credentials(
             settings.TURN_SHARED_SECRET,
             settings.TURN_URLS,

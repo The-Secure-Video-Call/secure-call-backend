@@ -16,6 +16,7 @@ from channels.routing import ProtocolTypeRouter, URLRouter  # noqa: E402
 from channels.security.websocket import OriginValidator  # noqa: E402
 from django.conf import settings  # noqa: E402
 
+from signaling.client_address import ClientAddressMiddleware  # noqa: E402
 from signaling.routing import websocket_urlpatterns  # noqa: E402
 
 application = ProtocolTypeRouter(
@@ -23,7 +24,9 @@ application = ProtocolTypeRouter(
         "http": django_asgi_app,
         # Reject WebSocket connections from any origin not explicitly allowed.
         "websocket": OriginValidator(
-            URLRouter(websocket_urlpatterns), settings.SIGNALING_ALLOWED_ORIGINS
+            # Adds scope["client_ip"] (the real client behind the trusted proxy) for rate limits.
+            ClientAddressMiddleware(URLRouter(websocket_urlpatterns), settings.TRUSTED_PROXY_IPS),
+            settings.SIGNALING_ALLOWED_ORIGINS,
         ),
     }
 )
