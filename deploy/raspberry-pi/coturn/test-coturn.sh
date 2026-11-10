@@ -369,7 +369,28 @@ expect_reachability "relay B->A" "delivered"
 expect_reachability "listener $host_lan_ip:40001" "nothing received \(.*\)"
 expect_reachability "listener $gateway_ip:40002" "nothing received \(.*\)"
 
-# Refresh-after-expiry probe (result recorded in README.md for #26, informational, not asserted):
+# user-quota: one credential may hold 6 allocations; the 7th gets 486 (Allocation Quota Reached).
+# This limits one credential, NOT one client (every credential has a new username).
+restart_or_exit
+echo "== Group 6: user-quota (6 allocations per credential) =="
+read -r quota_user quota_pass < <(make_credential 600)
+quota_output="$(python3 "$here/allocation_quota_probe.py" "$quota_user" "$quota_pass" 7 "$container_ip" 2>&1)"
+quota_exit_code=$?
+echo "$quota_output"
+for allocation_number in 1 2 3 4 5 6; do
+  if [ "$quota_exit_code" -eq 0 ] && grep -Fxq "ALLOCATION $allocation_number: success" <<<"$quota_output"; then
+    echo "PASS: allocation $allocation_number of 6 allowed"
+  else
+    echo "FAIL: allocation $allocation_number of 6 (probe exit code $quota_exit_code)"; failures=$((failures + 1))
+  fi
+done
+if [ "$quota_exit_code" -eq 0 ] && grep -Fxq 'ALLOCATION 7: error 486' <<<"$quota_output"; then
+  echo "PASS: allocation 7 over user-quota refused with 486"
+else
+  echo "FAIL: allocation 7 should get error 486 (probe exit code $quota_exit_code)"; failures=$((failures + 1))
+fi
+
+# Refresh-after-expiry probe (asserted against expected_refresh_after_expiry below, see README.md):
 # allocate with a credential that expires 5 s later, wait 25 s (longer than the test-only
 # --stale-nonce=20, so the server has rotated the nonce), then send a Refresh for that allocation.
 # It runs BEFORE the log checks below, so its traffic is checked too. The probe reaches the server
@@ -380,8 +401,18 @@ if ! restart_coturn; then
 fi
 read -r short_user short_pass < <(make_credential 5)
 probe_output="$(python3 -I "$here/refresh_after_expiry.py" "$short_user" "$short_pass" 25 "$container_ip" 2>&1)"
+# What coturn 4.6.3 does, as found by this probe. coturn has no option to change it, so this pins the
+# behaviour: if an image bump changes it, the test fails and the README and turnserver.conf comments
+# must be updated (and this flipped to refused if coturn then refuses).
+expected_refresh_after_expiry="allowed"
 if grep -Eq '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"; then
   grep -E '^REFRESH AFTER EXPIRY: (allowed|refused)$' <<<"$probe_output"
+  if grep -Fxq "REFRESH AFTER EXPIRY: $expected_refresh_after_expiry" <<<"$probe_output"; then
+    echo "PASS: refresh after expiry is $expected_refresh_after_expiry, as documented"
+  else
+    echo "FAIL: refresh after expiry is not $expected_refresh_after_expiry; update README.md and turnserver.conf"
+    failures=$((failures + 1))
+  fi
   grep -E '^\(' <<<"$probe_output" # notes: nonce rotation seen or not, error code if refused
   # A refused refresh may make coturn print "Cannot find credentials of user" for this username,
   # like the deliberate failed logins; accept that line for it (the Pi discards console output).

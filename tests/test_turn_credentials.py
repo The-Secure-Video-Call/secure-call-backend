@@ -260,3 +260,35 @@ async def test_remaining_lifetime_uses_the_monotonic_clock() -> None:
     assert registry.remaining_lifetime_seconds("N" * 22) == TOTAL_LIFETIME_LIMIT_SECONDS - 1_000
     assert registry.remaining_lifetime_seconds("O" * 22) is None
     await registry.remove_member("N" * 22, "channel-a")
+
+
+@override_settings(TURN_SHARED_SECRET=SHARED_SECRET, TURN_URLS=TURN_URLS)
+async def test_room_over_its_credential_budget_still_joins_without_a_relay(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr("signaling.rooms.MAX_TURN_CREDENTIALS_PER_ROOM", 3)
+    room_id = "P" * 22
+    other_room_id = "Q" * 22
+    holder_ws, holder = await open_and_join(room_id)  # keeps the room alive; credential 1
+    assert "turn" in holder
+    with caplog.at_level(logging.DEBUG):
+        # Reconnects of the second person: credentials 2 and 3, then the budget is used up.
+        for _ in range(2):
+            reconnecting_ws, reconnected = await open_and_join(room_id)
+            assert "turn" in reconnected
+            await reconnecting_ws.disconnect()
+        over_budget_ws, over_budget = await open_and_join(room_id)
+        other_room_ws, other_room = await open_and_join(other_room_id)
+
+    # The join works (a role, not an error); only the relay is missing.
+    assert over_budget == {"v": 1, "type": "joined", "role": "second"}
+    assert "turn" in other_room  # the budget is per room
+    assert room_id not in caplog.text
+    assert "127.0.0.1" not in caplog.text
+    for client in (holder_ws, over_budget_ws, other_room_ws):
+        await client.disconnect()
+
+    # Everyone left, so the room is gone; the same ID is a new room with a new budget.
+    recreated_ws, recreated = await open_and_join(room_id)
+    await recreated_ws.disconnect()
+    assert "turn" in recreated
