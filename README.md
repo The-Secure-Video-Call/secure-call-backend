@@ -49,6 +49,7 @@ the server refuses to start without a secret key.
 | `DJANGO_DEBUG` | `1` for local development only. |
 | `DJANGO_ALLOWED_HOSTS` | Comma-separated host names this server answers to. |
 | `SIGNALING_ALLOWED_ORIGINS` | Comma-separated browser origins allowed to open a WebSocket, e.g. `https://call.example.com`. Empty means none. |
+| `TRUSTED_PROXY_IPS` | Comma-separated IPs of the reverse proxy (for the Pi: the Nginx Proxy Manager machine's LAN IP). Only from these peers is the rightmost `X-Forwarded-For` entry used as the client IP for rate limits; from anyone else the header is ignored. Empty (default) means no proxy is trusted, and behind a proxy all visitors then share one limit. |
 | `REDIS_URL` | Optional. Use Redis for the channel layer so several server processes can share rooms. |
 | `POSTGRES_HOST` | Optional. Set it to connect PostgreSQL; leave it unset for no database. |
 | `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` | Default `5432`, `securecall`, `securecall`. |
@@ -56,6 +57,11 @@ the server refuses to start without a secret key.
 | `POSTGRES_SSLMODE` | Default `prefer`. Use `require` if the database is on another machine. |
 | `DJANGO_SECURE_SSL_REDIRECT` | Defaults to on in production. TLS is terminated by the reverse proxy. |
 | `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. |
+
+Rate limits (in memory only, keyed by an HMAC of the client IP; constants in `signaling/rate_limits.py`):
+20 joins per IP per minute, 30 TURN credentials per IP per hour (over it, `joined` has no `turn`),
+and per connection a burst of 100 messages refilled at 20 per second. Over a join or message
+limit the server sends `error rate-limited` and closes with application code `4029`.
 
 In production, run Daphne with `-v 0` so its access log (which contains client IP addresses) is
 off.

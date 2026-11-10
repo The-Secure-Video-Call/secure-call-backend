@@ -9,6 +9,7 @@ future user accounts only; it must never hold call data such as room IDs, call t
 addresses or message contents.
 """
 
+import ipaddress
 import os
 from pathlib import Path
 
@@ -116,6 +117,17 @@ SIGNALING_ALLOWED_ORIGINS = env_list(
 )
 # Largest accepted WebSocket message, in bytes (PLAN.md section 3.5).
 SIGNALING_MAX_MESSAGE_BYTES = 64 * 1024
+# IPs of the reverse proxy (Nginx Proxy Manager's LAN IP). Only from these peers is
+# X-Forwarded-For believed, to find the client IP for rate limits (signaling/client_address.py).
+# Empty by default: then the header is ignored. Plain IP addresses, no ranges.
+TRUSTED_PROXY_IPS = env_list("TRUSTED_PROXY_IPS", default=[])
+for _trusted_proxy_ip in TRUSTED_PROXY_IPS:
+    try:
+        ipaddress.ip_address(_trusted_proxy_ip)
+    except ValueError:
+        raise ImproperlyConfigured(
+            "TRUSTED_PROXY_IPS must be comma-separated IP addresses."
+        ) from None
 
 # --- TURN credentials ------------------------------------------------------------------------
 
