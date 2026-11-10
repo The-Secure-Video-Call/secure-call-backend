@@ -314,15 +314,20 @@ if [ -z "$socket_tables" ]; then
   echo "FAIL: could not read the container's socket tables"; failures=$((failures + 1))
 else
   local_ports="$(awk '$2 ~ /:[0-9A-F]{4}$/ {split($2, a, ":"); print a[2]}' <<<"$socket_tables" | sort -u)"
-  tcp_listen_ports="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
-    | awk '$4 == "0A" {split($2, a, ":"); print a[2]}' | sort -u)"
+  # TCP listeners as "address:port" in /proc's hex. 0B00007F is 127.0.0.11, Docker's embedded DNS
+  # server, which Docker itself runs in every container on a user-defined network (random ports);
+  # it is not coturn. Every other TCP listener must be coturn's 3478 (0D96).
+  tcp_listeners="$(docker exec -u 0 "$container_name" cat /proc/net/tcp /proc/net/tcp6 2>/dev/null \
+    | awk '$4 == "0A" {print $2}' | sort -u)"
+  echo "TCP listeners (hex address:port):"; sed 's/^/    /' <<<"$tcp_listeners"
+  unexpected_tcp_listeners="$(grep -Ev '^0B00007F:|:0D96$' <<<"$tcp_listeners" || true)"
   if grep -Eqx '14E5|1686' <<<"$local_ports"; then
     echo "FAIL: a socket is bound to 5349 (TLS/DTLS) or 5766 (CLI)"; failures=$((failures + 1))
-  elif [ "$tcp_listen_ports" != "0D96" ]; then
-    echo "FAIL: TCP listens on more than 3478 (hex ports: $(tr '\n' ' ' <<<"$tcp_listen_ports"))"
+  elif ! grep -Eq ':0D96$' <<<"$tcp_listeners" || [ -n "$unexpected_tcp_listeners" ]; then
+    echo "FAIL: TCP listens on something other than 3478 (and Docker's DNS on 127.0.0.11)"
     failures=$((failures + 1))
   else
-    echo "PASS: no socket on 5349 (TLS/DTLS) or 5766 (CLI); TCP listens on 3478 only"
+    echo "PASS: no socket on 5349 (TLS/DTLS) or 5766 (CLI); TCP listens on 3478 only (plus Docker's DNS)"
   fi
 fi
 
@@ -484,9 +489,15 @@ fi
 # Plus the one deny range of the command line (--denied-peer-ip=<public IP>, as compose.yaml does).
 { cat "$denied_ranges_file"; echo "$test_public_ip"; } | sort -u >"$denied_ranges_file.new" \
   && mv "$denied_ranges_file.new" "$denied_ranges_file"
-if grep -Eq '(^|: )(WARNING|ERROR)' <<<"$startup_banner"; then
+# Two warnings are expected and harmless: coturn 4.18 always prints whether the default TLS
+# certificate and key files exist (openssl_load_certificates -> print_abs_file_name), even with
+# no-tls and without "dtls", and loads them only when TLS is on. The socket check above proves no
+# TLS/DTLS listener runs. Any other WARNING or ERROR line fails.
+banner_problems="$(grep -E '(^|: )(WARNING|ERROR)' <<<"$startup_banner" \
+  | grep -Evx 'WARNING: (Certificate|Private key) file not found or not readable: //turn_server_(cert|pkey)\.pem' || true)"
+if [ -n "$banner_problems" ]; then
   echo "FAIL: coturn's startup banner has a WARNING or ERROR line (values masked):"
-  grep -E '(^|: )(WARNING|ERROR)' <<<"$startup_banner" | head -n 10 | mask_values
+  head -n 10 <<<"$banner_problems" | mask_values
   failures=$((failures + 1))
 fi
 listed_ranges="$(sed -n 's/^INFO: Black listing: //p' <<<"$startup_banner" | sort -u)"
@@ -507,7 +518,7 @@ server_logs="$(docker logs "$container_name" 2>&1)"
 #     refuses a peer, and "A peer IP <ip> denied: link-local/unique-local/site-local scope ..." for
 #     IPv6 scopes coturn 4.18 always refuses;
 #   - "stateless-nonce: listener fast-path challenge active" (no data);
-#   - "Terminating on signal 15" when it stops.
+#   - "Terminating on signal 15" and "All worker threads joined" when it stops.
 # On the Pi, compose.yaml discards coturn's console output (logging driver "none"), so neither
 # reaches the disk; this test container keeps Docker's default logs only to inspect them. A
 # failed-login line is accepted here only for the test's own deliberate failures, and the
@@ -550,6 +561,7 @@ while IFS= read -r log_line; do
   fi
   # coturn stopping when the test restarts it between groups.
   [ "$log_line" = "INFO: Terminating on signal 15" ] && continue
+  [ "$log_line" = "INFO: All worker threads joined" ] && continue
   new_log_lines+="$log_line"$'\n'
 done < <(strip_log_prefix <<<"$server_logs")
 valid_usernames="$(grep -v -x -F -f "$failed_login_usernames_file" "$usernames_file" || true)"
