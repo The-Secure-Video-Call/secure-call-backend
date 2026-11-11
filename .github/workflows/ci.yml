@@ -181,6 +181,22 @@ jobs:
             "$(curl -sk -D - -o /dev/null --max-time 5 https://127.0.0.1:18443/healthz)"
           docker rm -f npm-like >/dev/null
 
+      # firewall.sh (#63) applied on the runner for real, with the stack above: the backend reaches
+      # only PostgreSQL, only the proxy reaches its published port, coturn's network reaches public
+      # addresses only, neither network reaches the runner itself, coturn's TCP ports are limited
+      # per address, another container is unaffected, the systemd unit re-applies after Docker
+      # restarts, and --remove takes it all out. Each check runs without the firewall first.
+      # Last of the Docker steps: it republishes the backend and restarts Docker.
+      - name: The firewall (firewall.sh) on the runner
+        working-directory: deploy/raspberry-pi
+        run: |
+          if command -v shellcheck >/dev/null; then
+            shellcheck --severity=warning firewall.sh ci/test-firewall.sh
+          else
+            echo "shellcheck is not installed on this runner; skipped"
+          fi
+          bash ci/test-firewall.sh
+
       - name: Django production checks
         env:
           DJANGO_ALLOWED_HOSTS: signal.example.invalid

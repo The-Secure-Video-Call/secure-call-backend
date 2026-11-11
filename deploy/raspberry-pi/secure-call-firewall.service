@@ -1,0 +1,31 @@
+# Applies firewall.sh at boot and again after every restart of Docker (secure-call-backend#63).
+# Install it as deploy/raspberry-pi/README.md, "Firewall", describes: the path in ExecStart is
+# replaced with this folder's real path on the way into /etc/systemd/system/.
+[Unit]
+Description=Secure Call firewall rules for its Docker bridges (firewall.sh)
+Documentation=https://github.com/The-Secure-Video-Call/secure-call-backend/blob/main/deploy/raspberry-pi/README.md
+# Docker creates the DOCKER-USER chain the rules hook into, so run once it is up. Requires= and
+# PartOf= restart this unit whenever Docker restarts; WantedBy=docker.service starts it whenever
+# Docker starts.
+Requires=docker.service
+After=docker.service
+PartOf=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# A root-owned copy of firewall.sh, never the one in the repository, which the login user (and
+# anything running as that user) can change. The proxy's IP and the home's public IP are read
+# from the stack's .env, line by line and checked; the file is never run.
+ExecStart=/usr/local/sbin/secure-call-firewall --env-file /home/pi/secure-call-backend/deploy/raspberry-pi/.env
+# No ExecStop: stopping this unit, or Docker, leaves the rules in place (containers can outlive
+# the daemon with live-restore). `sudo secure-call-firewall --remove` takes them out.
+# Only what iptables needs, plus reading the .env file (mode 600, owned by the login user).
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectHome=read-only
+PrivateTmp=yes
+
+[Install]
+WantedBy=docker.service

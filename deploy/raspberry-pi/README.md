@@ -4,7 +4,7 @@
 "Updating the backend" below (gh and its token), then copy `.env.example` to `.env`, fill in the
 values marked "set", run `./make-local-certs.sh` (README.md, "One-time setup on the Pi"),
 and run `docker compose up -d postgres`, `./update.sh` and `docker compose up -d`, in that
-order. compose never pulls the backend image itself
+order. Then install the firewall ("Firewall" below). compose never pulls the backend image itself
 (`pull_policy: never`): a bare `docker compose up -d` before `update.sh` stops with "No such
 image" instead of running an unverified one.
 
@@ -82,11 +82,128 @@ To look at what a published image contains, `docker buildx imagetools inspect
 ghcr.io/the-secure-video-call/secure-call-backend:main --format '{{ json .SBOM }}'` shows its
 SBOM, and `--format '{{ json .Provenance }}'` the BuildKit provenance.
 
+## Firewall
+
+`firewall.sh` limits what this stack's containers can reach and who can reach them (#63). The Pi
+runs other Docker projects too, so it touches only this stack's two bridges, which
+`compose.yaml` names: `br-securecall` (backend and PostgreSQL, `172.30.200.16/28`) and `br-turn`
+(coturn, `172.30.200.0/29`). Its rules live in two chains of its own: `SECURE-CALL-FWD`, jumped
+to first from Docker's `DOCKER-USER` (which Docker runs before its own forwarding rules), and
+`SECURE-CALL-IN`, jumped to first from `INPUT` (traffic to the Pi itself never passes
+`DOCKER-USER`). Apart from those two jump rules it changes nothing outside its chains, and never
+flushes a built-in or Docker chain. Every rule names one of the two bridges; the first rule of each
+chain only lets packets of connections already allowed go on to the next rules (`RETURN`, not
+`ACCEPT`), so it decides nothing for anyone else's traffic. Each run rebuilds both chains in one
+atomic `iptables-restore --noflush`, so running it again is safe.
+
+| From or to the two bridges | What happens |
+|---|---|
+| Replies to allowed connections, related ICMP errors | go on to Docker's own rules |
+| Backend and PostgreSQL to each other | allowed |
+| New connections from `br-securecall` to anything else (internet, LAN, the Pi) | dropped: neither needs any |
+| Into the backend's published port (`BACKEND_PUBLISH_ADDR:8001`) | from `TRUSTED_PROXY_IPS` (the proxy) only; any other LAN device is dropped |
+| Into PostgreSQL's published port | as published (`POSTGRES_PUBLISH_ADDR`, `127.0.0.1` by default: the Pi only) |
+| Into coturn | its published ports only: 3478 UDP and TCP, 5349 TCP, 49160-49200 UDP |
+| New TCP connections to 3478 and 5349 | per source address: at most 24 open at once, 30 in a row, then 60 a minute |
+| New connections from `br-turn` | public addresses only: not the ranges `coturn/turnserver.conf` denies (RFC 1918, CGNAT, loopback, link-local, reserved and documentation blocks), multicast, or the home's public IP (`TURN_PUBLIC_IP`) |
+| New connections from either bridge to the Pi itself (gateway, LAN address, any other) | dropped (`INPUT`) |
+| IPv6 from either bridge to the Pi | dropped (both networks are IPv4 only) |
+
+`./firewall.sh --print` shows the exact rules without changing anything (it needs no root).
+The proxy's IP comes from `TRUSTED_PROXY_IPS` in `.env` (or `--proxy-ip`), the public IP from
+`TURN_PUBLIC_IP` (or `--turn-public-ip`). The script reads `.env` line by line and never runs it;
+it refuses to change anything when a value is missing or not a plain IPv4 address.
+
+**TCP limits on coturn.** coturn has no per-address connection limit, and on 5349 every connection
+costs a full TLS handshake (it keeps no session cache), which is heavy on a Pi. So, per source
+address, `turn_tcp_max_connections_per_source=24` connections may be open at once,
+`turn_tcp_new_connections_burst=30` may be opened in a row, and after that
+`turn_tcp_new_connections_per_minute=60` (constants at the top of `firewall.sh`; the rate is
+remembered for 60 s, so pausing does not refill the burst early). A browser opens one connection
+per TCP URL (TCP and TLS) per network interface it uses: 2 per caller, 4 during an ICE restart
+(the old ones stay for a moment), 8 on two interfaces. So several callers behind one address (a
+household, or a carrier-grade NAT) stay well inside, and `tests/test_firewall.py` fails if the
+values leave less room than two such callers. A connection over the limit is dropped (the
+browser still has its UDP candidates). Not covered: a flood from many addresses at once, and UDP
+(coturn's quotas cover that).
+
+**Not covered:** for a few seconds after boot or a Docker restart, the containers run before the
+unit has applied the rules (it has to run after Docker, which creates `DOCKER-USER`). Docker's
+nftables firewall backend has no `DOCKER-USER`, and the script refuses to run with it. A home LAN
+in public address space is not denied (as in `turnserver.conf`). With the proxy on this Pi
+(`BACKEND_PUBLISH_ADDR=127.0.0.1`), its connections never pass these rules.
+
+### Setup (once, on the Pi, in `deploy/raspberry-pi`)
+
+**Keep a second SSH session open** while you do this. The rules only touch traffic from and to
+the two bridges, never SSH or the Pi's own traffic, but if something goes wrong,
+`sudo ./firewall.sh --remove` (once installed: `sudo secure-call-firewall --remove`) in that
+session takes them all out. Until step 4, a reboot removes them too.
+
+1. **Give the networks their bridge names** (right after the `git pull` that brings this, at a
+   quiet time: calls drop for a moment): `docker compose down && docker compose up -d`. Never add
+   `--volumes`, which deletes the database. Check: `ip -br addr show br-securecall br-turn` shows
+   `172.30.200.17/28` and `172.30.200.1/29`. Later `down`/`up` runs need nothing: the rules match
+   the bridges by name.
+2. **Check `.env`:** `TRUSTED_PROXY_IPS` is the proxy machine's LAN IP (the backend uses it too)
+   and `TURN_PUBLIC_IP` is set. Then look at the rules: `./firewall.sh --print`.
+3. **Apply by hand and check:** `sudo ./firewall.sh`, then `sudo ./firewall.sh --check` (it shows
+   the rules with their counters and ends with `Secure Call firewall: active.`),
+   `curl https://signal.securevideocall.com/healthz` from outside the home, and a test call.
+4. **Make it permanent** with the systemd unit. It runs a root-owned copy of the script (the
+   repository can be changed by your login user, and the unit runs as root) and reads the two
+   values from this folder's `.env`. It runs whenever Docker starts (`WantedBy=docker.service`) and
+   again after every Docker restart (`PartOf=docker.service`):
+   ```sh
+   sudo install -o root -g root -m 0755 firewall.sh /usr/local/sbin/secure-call-firewall
+   sed "s|/home/pi/secure-call-backend/deploy/raspberry-pi|$PWD|" secure-call-firewall.service \
+     | sudo tee /etc/systemd/system/secure-call-firewall.service >/dev/null
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now secure-call-firewall
+   sudo secure-call-firewall --check
+   ```
+5. **Check from the containers.** For the `/dev/tcp` lines, exit code `124` (timed out) is what
+   the firewall gives; `0` (connected) or `1` (refused) means the packet got through:
+   ```sh
+   # coturn: the router, the Pi itself (gateway and LAN address) and the LAN are unreachable ...
+   docker compose exec coturn timeout 5 bash -c 'echo > /dev/tcp/<router LAN IP>/80'; echo $?
+   docker compose exec coturn timeout 5 bash -c 'echo > /dev/tcp/172.30.200.1/22'; echo $?
+   docker compose exec coturn timeout 5 bash -c 'echo > /dev/tcp/<this Pi LAN IP>/22'; echo $?
+   # ... and the internet is reachable (0)
+   docker compose exec coturn timeout 5 bash -c 'echo > /dev/tcp/1.1.1.1/443'; echo $?
+   # The backend reaches PostgreSQL and nothing else (TimeoutError)
+   docker compose exec backend python manage.py migrate --check && echo database reachable
+   docker compose exec backend python -c "import socket; socket.create_connection(('1.1.1.1', 443), 5)"
+   # From a LAN device that is not the proxy: no answer at all (curl: timed out)
+   curl -k --max-time 5 https://<this Pi LAN IP>:8001/healthz
+   ```
+   Then check the relay still works (TURN, step 5 below) and make a test call.
+
+**Undo:** `sudo systemctl disable --now secure-call-firewall && sudo secure-call-firewall --remove`.
+Stopping the unit (or Docker) alone leaves the rules in place.
+
+**After a change:** to `TRUSTED_PROXY_IPS` or `TURN_PUBLIC_IP` in `.env`, run
+`sudo systemctl restart secure-call-firewall`. To `firewall.sh` (after a `git pull`), repeat the
+`sudo install` line of step 4, then restart the unit.
+
+**Tests:** `tests/test_firewall.py` runs the script against stand-ins for iptables (the exact
+rules, running twice, `--remove` leaving everything else as it was, refused values, the same
+names and ports as `compose.yaml`, the same ranges as `turnserver.conf`). CI
+(`ci/test-firewall.sh`) applies it on the runner, with the backend and a stand-in for coturn on
+their real bridges, a network namespace as the home network, and each check run without the
+firewall first: the backend reaches PostgreSQL but not the internet, the LAN or the runner; only
+the stand-in proxy reaches the backend's published port; coturn's network reaches the internet
+but not the LAN or the runner, and only coturn's ports are reachable from outside, with the TCP
+limits holding; another container is unaffected; the unit re-applies after Docker restarts; and
+`--remove` leaves no rule behind. Not tested in CI: a reboot, the Pi's own kernel and iptables,
+and IPv6 (CI's containers have no IPv6 to try it with).
+
 ## TURN
 
 coturn relays media for callers behind strict NATs. It runs on its **own Docker bridge network**
-(`turn`, subnet `172.30.200.0/29`, no IPv6, coturn at the fixed address `172.30.200.2`, the Pi as
-gateway `172.30.200.1`) with the hardened config in `coturn/turnserver.conf`. The config refuses to
+(`turn`, Linux bridge `br-turn`, subnet `172.30.200.0/29`, no IPv6, coturn at the fixed address
+`172.30.200.2`, the Pi as gateway `172.30.200.1`) with the hardened config in
+`coturn/turnserver.conf`. The config refuses to
 relay to private, loopback, link-local and multicast addresses, so a credential holder cannot reach
 your home network. Do not remove those lines.
 
@@ -104,12 +221,14 @@ only reach coturn itself, because nothing else runs in that container.
 
 **Limits:** the deny ranges cover RFC 1918, CGNAT and the other IANA special-purpose IPv4 blocks
 listed in `coturn/turnserver.conf`; if the home LAN or Docker's address pools use public address
-space, nothing denies it. The subnet `172.30.200.0/29` must not overlap
-another Docker network. The deny list constrains peers requested through the TURN protocol, not
-code running inside a compromised container: that could still reach the Pi's services through the
-gateway `172.30.200.1`, which is why the container has no capabilities, no-new-privileges and a
-read-only root. A `DOCKER-USER` firewall rule dropping traffic from the `turn` bridge to the Pi
-is optional extra hardening. A bare `docker compose pull` also tries to pull
+space, nothing denies it. The subnets `172.30.200.0/29` (`turn`) and `172.30.200.16/28`
+(`internal`) must not overlap another Docker network. The deny list constrains peers requested
+through the TURN protocol, not code running inside a compromised container. For that,
+`firewall.sh` (see "Firewall" above) drops every new connection from the `br-turn` bridge to a
+non-public address (in `DOCKER-USER`, mirroring the deny list) and to the Pi itself (in `INPUT`:
+the gateway `172.30.200.1`, the Pi's LAN address and any other; traffic to the Pi never passes
+`DOCKER-USER`, so a rule there alone would not stop it). The container also has no capabilities,
+no-new-privileges and a read-only root. A bare `docker compose pull` also tries to pull
 `secure-call-coturn:local`; `update.sh` only names the backend.
 
 **Derived image:** `compose.yaml` builds `coturn/Dockerfile` (the pinned upstream image plus

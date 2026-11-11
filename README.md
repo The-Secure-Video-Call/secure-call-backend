@@ -270,7 +270,7 @@ Manager already running.
    room IDs and TURN credentials never cross the home network in plaintext, and without
    `proxy_ssl_verify` anyone on that network could pose as the backend. A host that works is
    no proof the check is on (without these lines it works too), so check, with the host's id
-   from step 6 (5 here); this must print the three lines:
+   from step 7 (5 here); this must print the three lines:
    ```sh
    docker exec nginx-proxy-manager-app-1 sh -c \
      'grep -E "proxy_ssl_(verify on|trusted_certificate|name)" /data/nginx/proxy_host/5.conf'
@@ -314,7 +314,12 @@ Manager already running.
    An image that fails a check is skipped (the backend keeps running the last verified one), and
    `journalctl -t secure-call-update --since today` shows why; a Pi sends no mail, so the
    journal is where refusals and token expiry warnings end up.
-6. **Check:** `curl https://signal.securevideocall.com/healthz` returns `{"status": "ok"}`.
+6. **Firewall:** install `deploy/raspberry-pi/firewall.sh` and its systemd unit as
+   `deploy/raspberry-pi/README.md` ("Firewall") describes. Then the backend and PostgreSQL can
+   reach nothing but each other, only the proxy (`TRUSTED_PROXY_IPS`) reaches port 8001, and
+   coturn reaches public addresses only, never the home network or the Pi itself. The rules touch
+   only this stack's two Docker bridges, not the Pi's other containers.
+7. **Check:** `curl https://signal.securevideocall.com/healthz` returns `{"status": "ok"}`.
    Then make a short call and, on the proxy machine, check that this host's access log stays
    empty (replace the container name and look up the host's `<id>` first):
    ```sh
