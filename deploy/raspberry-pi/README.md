@@ -138,6 +138,15 @@ reconnects could use it up and lose privacy mode. The per-IP cap has the same ef
 threshold: over it, `joined` has no `turn` and privacy-mode calls fail closed for everyone on
 that address (or IPv6 /56 or /48) until the hour window frees credentials.
 
+**Decision (#55, ASVS V17.3.1 / V2.4.1): accepted limit of a single Pi; the credential cap stays
+at 120 per client per hour.** Lowering it would not help: 7 credentials already fill the 41 ports,
+so any cap that still lets a shared address (a household, an office, a mobile carrier's NAT) make
+a call would also let one client make 7. A cap low enough to matter (6 or fewer per hour) would
+lock out ordinary users who reconnect. Against sockets held open for nothing, the existing
+10-minute limit on a member alone in a room (`WAITING_ALONE_LIMIT_SECONDS` in
+`signaling/rooms.py`, close `room-expired`, restarted when a partner leaves) already frees the
+connection slot and ends the room, so no new timeout was added.
+
 So **one client can still fill the relay.** The impact is availability only: media stays
 DTLS-SRTP encrypted and the peer deny list is unchanged; while the relay is full, privacy-mode
 calls fail closed ("Privacy mode needs our relay...") and normal calls lose their TURN fallback
