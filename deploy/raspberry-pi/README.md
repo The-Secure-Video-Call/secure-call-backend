@@ -154,6 +154,30 @@ the REST credential's expiry or to cap an allocation's total life. What it actua
 checked by the CI probe (next sections). So an allocation lives as long as the client keeps
 refreshing it, and the credential's expiry (up to the 4 h room lifetime) does not end it.
 
+#### Accepted risk: Refresh with an expired credential (ASVS V9.2.1, Low)
+
+Listed in the [security review](https://github.com/The-Secure-Video-Call/secure-call/blob/main/docs/security-review.md)
+(section Gaps, V9.2.1) and accepted here (issue #54).
+
+- **What coturn 4.18 does:** it refuses an expired credential for a new Allocate, but accepts a
+  Refresh with one. A relay allocation can therefore outlive its credential and its room, for as
+  long as the client keeps refreshing it. coturn has no option to refuse this or to cap an
+  allocation's total life.
+- **Credentials are not revoked on `leave`:** the signaling server hands out a stateless HMAC
+  credential and keeps no list of them, so leaving a room does not invalidate it. It stays valid
+  until its expiry (never later than the room's end).
+- **Why it is acceptable:** it affects relay availability only (a relay port stays occupied
+  longer than intended, within the quotas above). Media stays DTLS-SRTP encrypted, so the relay
+  never sees it in the clear, and the peer deny list still applies to every allocation, so it
+  cannot be used to reach private addresses.
+- **How it is pinned:** the "Refresh-after-expiry probe" in `coturn/test-coturn.sh` (it
+  prints `PASS: refresh after expiry is allowed, as documented`) fails if coturn's behaviour
+  changes. Keep that check.
+- **When to revisit:** on every coturn upgrade, re-run `test-coturn.sh` and reconsider this. If
+  coturn gains a cap on allocation lifetime or can refuse a Refresh with an expired credential,
+  turn it on, change `expected_refresh_after_expiry` to `refused`, and close #54. Until then,
+  keep the issue open as the record.
+
 ### Tests
 
 `coturn/test-coturn.sh` starts the pinned image with this config and a test secret (a fresh
