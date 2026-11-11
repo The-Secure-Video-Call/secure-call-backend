@@ -85,6 +85,8 @@ journal_cursor() { sudo journalctl -n 1 -q --no-pager --show-cursor | sed -n 's/
 run_unit() {
   local status=0 cursor
   cursor="$(journal_cursor)"
+  # This script starts the unit more often than systemd's start limit (5 in 10 s) allows.
+  sudo systemctl reset-failed "$UNIT" 2>/dev/null || true
   sudo systemctl start "$UNIT" || status=$?
   sudo journalctl --sync
   # shellcheck disable=SC2024 # the runner's own user writes its own file
