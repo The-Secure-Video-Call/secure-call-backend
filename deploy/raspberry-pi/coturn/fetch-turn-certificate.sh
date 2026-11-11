@@ -1,37 +1,36 @@
-#!/usr/bin/env bash
-# Fetches the TURN certificate from the proxy machine and installs it for coturn (#90; README.md,
-# TURN step 3b). secure-call-turn-certificate.timer runs it twice a day, as root, from a
-# root-owned copy next to a root-owned copy of install-turn-certificate.sh:
+#!/bin/bash
+# Fetches the TURN certificate and its key from the proxy machine (#90; README.md, TURN step 3b).
+# secure-call-turn-certificate.service runs a root-owned copy twice a day, as an unprivileged user
+# of its own; afterwards, as root, install-turn-certificate.sh checks and installs what it fetched:
 #
-#   /usr/local/lib/secure-call/sync-turn-certificate.sh [--config-dir DIR]
+#   fetch-turn-certificate.sh CONFIG_DIR OUTPUT_DIR
 #
-# DIR (default /etc/secure-call/turn-certificate, root only) holds:
+# CONFIG_DIR (the unit's credentials, copied by systemd from /etc/secure-call/turn-certificate/,
+# which only root can read) holds:
 #   proxy        one line, the SSH login on the proxy machine: USER@HOST or USER@HOST:PORT
-#   id_ed25519   the SSH key that the proxy machine accepts only from this Pi and only for its
-#                forced command, print-turn-certificate.sh
+#   id_ed25519   the SSH key the proxy machine accepts only from this Pi and only for its forced
+#                command, print-turn-certificate.sh
 #   known_hosts  the proxy machine's host key; no other host key is trusted
-#   coturn       a symbolic link to this folder (deploy/raspberry-pi/coturn) in the checkout
+# OUTPUT_DIR must be in memory (the unit's runtime folder in /run, which systemd removes when the
+# run ends). On success it holds fullchain.pem and privkey.pem; otherwise neither.
 #
-# 1. The proxy's answer goes into a private folder in /dev/shm, which must be in memory (the unit
-#    gives every run a fresh one of its own). It is never printed or logged.
+# 1. The proxy's answer is kept in OUTPUT_DIR (at most 64 KiB) and never printed or logged.
+#    Messages from ssh and the proxy are logged, cut to 4 KiB of printable text.
 # 2. It must be nothing but one or more certificates followed by one private key, in PEM lines of
 #    printable ASCII. Anything else (a banner, a blank line, a second key, text after the key) is
-#    refused. If the proxy ran the command this script asks for instead of its forced command,
-#    the key is not restricted there; that is refused too, with a message that says so.
-# 3. install-turn-certificate.sh, next to this script, then checks the certificate (the name, a
-#    trusted chain, 7 or more days left, the key matching) and installs it into coturn/tls/ only
-#    if it changed, telling coturn to reload. Its messages are this run's outcome in the journal.
+#    refused.
+# 3. If the proxy ran the command this script asks for, instead of its forced command, nothing on
+#    the proxy machine forces one for this key; that is refused, with a message that says so.
+# It never runs as root: it handles what the proxy machine sends, and only installing needs root.
 set -euo pipefail
+export LC_ALL=C
 
-script_dir="$(cd "$(dirname "$0")" && pwd)"
-readonly SCRIPT_DIR="$script_dir"
 readonly MAX_ANSWER_BYTES=65536
-# What this script asks the proxy to run. With the forced command in place, sshd runs that instead
-# and this text never comes back; without it, the proxy's shell runs it and the answer is this.
+readonly MAX_MESSAGE_BYTES=4096
+# What this script asks the proxy to run. With a forced command in place, sshd runs that instead
+# and this text never comes back; without one, the proxy's shell runs it and the answer is this.
 readonly UNRESTRICTED_KEY_MARKER=secure-call-turn-certificate-key-is-not-restricted
 readonly PROXY_PATTERN='^([a-z_][a-z0-9_-]{0,31})@([A-Za-z0-9][A-Za-z0-9.-]{0,252})(:([0-9]{1,5}))?$'
-# Only for tests (not every test machine has a /dev/shm): another folder in its place.
-readonly TEST_MEMORY_DIR="${TURN_CERTIFICATE_TEST_MEMORY_DIR:-}"
 
 # The proxy's answer, line by line: certificates (fullchain.pem), then one private key
 # (privkey.pem), and nothing else. Messages name line numbers only, never their contents.
@@ -66,33 +65,27 @@ END {
 }'
 
 refuse() {
-  echo "sync-turn-certificate.sh: $1 Nothing was installed." >&2
+  echo "fetch-turn-certificate.sh: $1 Nothing was fetched." >&2
   exit 1
 }
 
-config_dir=/etc/secure-call/turn-certificate
-if [ "$#" -eq 2 ] && [ "$1" = --config-dir ]; then
-  config_dir="$2"
-elif [ "$#" -ne 0 ]; then
-  echo "Usage: $0 [--config-dir DIR]" >&2
+if [ "$#" -ne 2 ]; then
+  echo "Usage: $0 CONFIG_DIR OUTPUT_DIR" >&2
   exit 2
 fi
-readonly CONFIG_DIR="$config_dir"
+readonly CONFIG_DIR="$1"
+readonly OUTPUT_DIR="$2"
+if [ "$(id -u)" -eq 0 ]; then
+  refuse "it must not run as root (secure-call-turn-certificate.service runs it as its own user)."
+fi
 
-if [ -n "$TEST_MEMORY_DIR" ]; then
-  echo "sync-turn-certificate.sh: WARNING: using $TEST_MEMORY_DIR instead of /dev/shm" \
-    "(TURN_CERTIFICATE_TEST_MEMORY_DIR is for tests only)." >&2
-  memory_dir="$TEST_MEMORY_DIR"
-else
-  memory_dir=/dev/shm
-  case "$(stat -f -c %T "$memory_dir" 2>/dev/null || true)" in
-    tmpfs | ramfs) ;;
-    *) refuse "/dev/shm is not in memory (tmpfs), and the key must never reach a disk." ;;
-  esac
+if [ -L "$OUTPUT_DIR" ] || [ ! -d "$OUTPUT_DIR" ] || [ ! -w "$OUTPUT_DIR" ]; then
+  refuse "$OUTPUT_DIR is not a folder this user can write."
 fi
-if [ ! -d "$memory_dir" ] || [ ! -w "$memory_dir" ]; then
-  refuse "cannot write to $memory_dir."
-fi
+case "$(stat -f -c %T "$OUTPUT_DIR" 2>/dev/null || true)" in
+  tmpfs | ramfs) ;;
+  *) refuse "$OUTPUT_DIR is not in memory (tmpfs), and the key must never reach a disk." ;;
+esac
 
 if [ ! -f "$CONFIG_DIR/proxy" ]; then
   refuse "$CONFIG_DIR/proxy is missing (README.md, TURN step 3b)."
@@ -108,13 +101,11 @@ for required_file in id_ed25519 known_hosts; do
     refuse "$CONFIG_DIR/$required_file is missing (README.md, TURN step 3b)."
   fi
 done
-if [ ! -d "$CONFIG_DIR/coturn" ]; then
-  refuse "$CONFIG_DIR/coturn is not a link to deploy/raspberry-pi/coturn (README.md, TURN step 3b)."
-fi
 
 umask 077
-work_dir="$(mktemp -d "$memory_dir/secure-call-turn-certificate.XXXXXXXX")"
-trap 'rm -rf "$work_dir"' EXIT
+rm -f -- "$OUTPUT_DIR/fullchain.pem" "$OUTPUT_DIR/privkey.pem"
+work_dir="$(mktemp -d "$OUTPUT_DIR/fetch.XXXXXXXX")"
+trap 'rm -rf -- "$work_dir"' EXIT
 trap 'exit 1' HUP INT TERM
 answer="$work_dir/answer"
 
@@ -132,9 +123,11 @@ ssh_command=(
   -- "$PROXY_LOGIN" "echo $UNRESTRICTED_KEY_MARKER"
 )
 echo "Fetching the TURN certificate from $PROXY_LOGIN."
-# At most one byte more than allowed is kept, so a runaway answer cannot fill the memory.
+# At most one byte more than allowed is kept, so a runaway answer cannot fill the memory; ssh's
+# and the proxy's messages are cut short and stripped of control characters before they are logged.
 fetch_status=0
-"${ssh_command[@]}" | head -c "$((MAX_ANSWER_BYTES + 1))" >"$answer" || fetch_status=$?
+"${ssh_command[@]}" 2> >(tr -cd '\n -~' | head -c "$MAX_MESSAGE_BYTES" >&2) \
+  | head -c "$((MAX_ANSWER_BYTES + 1))" >"$answer" || fetch_status=$?
 if [ "$(($(wc -c <"$answer")))" -gt "$MAX_ANSWER_BYTES" ]; then
   refuse "the proxy sent more than $MAX_ANSWER_BYTES bytes."
 fi
@@ -142,16 +135,14 @@ if [ "$fetch_status" -ne 0 ]; then
   refuse "fetching from $PROXY_LOGIN failed (exit status $fetch_status; the message from ssh or the proxy, if any, is above)."
 fi
 if [ "$(head -n 1 "$answer")" = "$UNRESTRICTED_KEY_MARKER" ]; then
-  refuse "$PROXY_LOGIN ran this script's own command instead of print-turn-certificate.sh, so its authorized_keys line for this key lacks restrict and command= and the key can open a shell there. Fix that line first (README.md, TURN step 3b)."
+  refuse "$PROXY_LOGIN ran this script's own command instead of print-turn-certificate.sh: neither its authorized_keys line for this key (command=) nor its sshd_config (ForceCommand) forces one, so the key can open a shell there. Fix that first (README.md, TURN step 3b)."
 fi
-if [ "$(($(LC_ALL=C tr -d '\n -~' <"$answer" | wc -c)))" -ne 0 ]; then
+if [ "$(($(tr -d '\n -~' <"$answer" | wc -c)))" -ne 0 ]; then
   refuse "the proxy's answer holds bytes that are not printable ASCII."
 fi
-if ! problem="$(LC_ALL=C awk -v fullchain_file="$work_dir/fullchain.pem" \
+if ! problem="$(awk -v fullchain_file="$work_dir/fullchain.pem" \
   -v key_file="$work_dir/privkey.pem" "$PEM_GRAMMAR" "$answer")"; then
   refuse "the proxy's answer is not just certificates followed by one private key: $problem."
 fi
-echo "Fetched a certificate and a key; checking them."
-
-"$SCRIPT_DIR/install-turn-certificate.sh" --coturn-dir "$CONFIG_DIR/coturn" \
-  "$work_dir/fullchain.pem" "$work_dir/privkey.pem"
+mv -- "$work_dir/fullchain.pem" "$work_dir/privkey.pem" "$OUTPUT_DIR/"
+echo "Fetched a certificate and a key; install-turn-certificate.sh checks them next."

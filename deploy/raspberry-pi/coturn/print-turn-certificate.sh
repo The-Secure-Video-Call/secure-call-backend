@@ -1,7 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/bash
 # Runs on the PROXY machine (the one with Nginx Proxy Manager), not on the coturn Pi (#90). It is
-# the forced command of the one SSH key that sync-turn-certificate.sh on the coturn Pi uses
-# (README.md, TURN step 3b):
+# the forced command of the one SSH key that fetch-turn-certificate.sh on the coturn Pi uses
+# (README.md, TURN step 3b: authorized_keys command= and sshd_config ForceCommand):
 #
 #   print-turn-certificate.sh CONTAINER CERTIFICATE   e.g. nginx-proxy-manager-app-1 npm-30
 #
@@ -9,11 +9,13 @@
 # else: /etc/letsencrypt/live/CERTIFICATE/fullchain.pem, then privkey.pem. It only reads them and
 # writes no file. It takes no input from the client: the command the client asked for
 # (SSH_ORIGINAL_COMMAND), stdin and the environment are ignored. Both names come from the
-# authorized_keys and sudoers lines on the proxy machine, so the key can fetch this one
-# certificate and do nothing else. Installed root-owned as
+# authorized_keys, sshd_config and sudoers lines on the proxy machine, so the key can fetch this
+# one certificate and do nothing else. Installed root-owned as
 # /usr/local/sbin/secure-call-print-turn-certificate and run through sudo: reading the files needs
 # Docker, and the SSH account has no other rights.
 set -euo pipefail
+# The client can set LC_* (sshd's default AcceptEnv); the name checks below must not depend on it.
+export LC_ALL=C
 
 # Docker's own rule for container names (so never an option such as "--privileged").
 readonly CONTAINER_PATTERN='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'

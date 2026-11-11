@@ -182,11 +182,12 @@ jobs:
           docker rm -f npm-like >/dev/null
 
       # The automatic refresh of coturn's certificate (#90), set up with README TURN step 3b's
-      # commands and run by its real unit under systemd: the runner's sshd, a sudo-only account
-      # and a container named like Nginx Proxy Manager's stand in for the proxy machine. A renewal
-      # is installed; a wrong name and a key without its forced command are refused; the key opens
-      # no shell; no key line reaches the journal.
-      - name: The TURN certificate refresh (sync-turn-certificate.sh) on the runner
+      # commands and run by its real unit under systemd (unprivileged fetch, then the install as
+      # root): the runner's sshd, a sudo-only account and a container named like Nginx Proxy
+      # Manager's stand in for the proxy machine. A renewal is installed; a wrong name and a key
+      # with neither forced command are refused; the key opens no shell, terminal or forwarding;
+      # no key line reaches the journal.
+      - name: The TURN certificate refresh (fetch-turn-certificate.sh) on the runner
         working-directory: deploy/raspberry-pi
         run: |
           if command -v shellcheck >/dev/null; then

@@ -6,10 +6,11 @@
 # machine, and this checkout for the coturn Pi. It checks that:
 #   - the first run installs the certificate (key owner 65534, mode 400) and logs the outcome;
 #   - a second run changes nothing, and a renewed certificate in the container is installed;
-#   - a certificate for another name, or the key without restrict and command=, is refused, and
-#     what is installed stays;
-#   - the key opens no shell on the proxy: whatever its login asks for, it gets the certificate;
-#   - no line of a private key is ever in the journal, and nothing is left in the host's /dev/shm.
+#   - a certificate for another name is refused, and what is installed stays;
+#   - either lock alone (authorized_keys or sshd_config) forces the command, and a key with
+#     neither is refused and named;
+#   - the key opens no shell, terminal or forwarding, and sudo runs nothing else for the account;
+#   - no line of a private key is ever in the journal, and no fetched file is left behind.
 # A test CA is added to the runner's trust store for the run, as Let's Encrypt cannot issue here.
 # Needs Docker, passwordless sudo, systemd, openssl, and the backend image (built by a step
 # before; it stands in for Nginx Proxy Manager's image). Run from deploy/raspberry-pi.
@@ -19,9 +20,11 @@ cd "$(dirname "$0")/.."
 readonly CONFIG_DIR=/etc/secure-call/turn-certificate
 readonly CONTAINER=nginx-proxy-manager-app-1
 readonly CERTIFICATE=npm-30
-readonly PRINT_COMMAND="/usr/local/sbin/secure-call-print-turn-certificate $CONTAINER $CERTIFICATE"
+readonly PRINT_SCRIPT=/usr/local/sbin/secure-call-print-turn-certificate
+readonly PRINT_COMMAND="$PRINT_SCRIPT $CONTAINER $CERTIFICATE"
 readonly STAND_IN_IMAGE=ghcr.io/the-secure-video-call/secure-call-backend:main
 readonly TEST_CA_IN_STORE=/usr/local/share/ca-certificates/secure-call-ci-test-ca.crt
+readonly UNIT=secure-call-turn-certificate.service
 work="$(mktemp -d)"
 live="$work/live"
 failures=0
@@ -32,15 +35,21 @@ fail() {
 }
 pass() { echo "PASS: $*"; }
 
+reload_sshd() { sudo sshd -t && { sudo systemctl reload ssh 2>/dev/null || sudo systemctl restart ssh; }; }
+
 cleanup() {
   set +e
   sudo systemctl disable --now secure-call-turn-certificate.timer >/dev/null 2>&1
-  sudo rm -f /etc/systemd/system/secure-call-turn-certificate.service \
-    /etc/systemd/system/secure-call-turn-certificate.timer
+  sudo rm -f "/etc/systemd/system/$UNIT" /etc/systemd/system/secure-call-turn-certificate.timer
   sudo systemctl daemon-reload
   sudo rm -rf /usr/local/lib/secure-call "$CONFIG_DIR" /etc/sudoers.d/secure-call-turn-certificate \
-    /usr/local/sbin/secure-call-print-turn-certificate coturn/tls
+    "$PRINT_SCRIPT" coturn/tls
+  if [ -f "$work/sshd_config.before" ]; then
+    sudo cp "$work/sshd_config.before" /etc/ssh/sshd_config
+    reload_sshd
+  fi
   sudo deluser --system --remove-home turn-certificate >/dev/null 2>&1
+  sudo deluser --system turn-certificate-fetch >/dev/null 2>&1
   sudo rm -f "$TEST_CA_IN_STORE"
   sudo update-ca-certificates --fresh >/dev/null 2>&1
   docker rm -f "$CONTAINER" >/dev/null 2>&1
@@ -66,22 +75,30 @@ put_in_container() {
   cp "$work/$1.key" "$live/privkey.pem"
 }
 
-# One run of the unit: its exit status, and what it logged (secure-call-turn) in $work/journal.
+journal_cursor() { sudo journalctl -n 1 -q --no-pager --show-cursor | sed -n 's/^-- cursor: //p'; }
+
+# One run of the unit: its exit status, and the unit's journal lines in $work/journal.
 run_unit() {
   local status=0 cursor
-  cursor="$(sudo journalctl -n 1 -q --no-pager --show-cursor | sed -n 's/^-- cursor: //p')"
-  sudo systemctl start secure-call-turn-certificate.service || status=$?
+  cursor="$(journal_cursor)"
+  sudo systemctl start "$UNIT" || status=$?
   sudo journalctl --sync
-  sudo journalctl --no-pager -q -o cat -t secure-call-turn --after-cursor "$cursor" \
-    >"$work/journal"
-  cat "$work/journal" >>"$work/all-journals"
+  sudo journalctl --no-pager -q -o cat -u "$UNIT" --after-cursor "$cursor" >"$work/journal"
   sed 's/^/    journal: /' "$work/journal"
   return "$status"
 }
 
 installed_key_is() { sudo cmp -s "$work/$1.key" coturn/tls/privkey.pem; }
 
+# ssh with the Pi's key, as the fetch would ($@ = more options, then the command if any).
+ssh_as_the_pi() {
+  sudo ssh -F none -n -o BatchMode=yes -o IdentitiesOnly=yes -i "$CONFIG_DIR/id_ed25519" \
+    -o UserKnownHostsFile="$CONFIG_DIR/known_hosts" -o StrictHostKeyChecking=yes \
+    -o ExitOnForwardFailure=yes -o ConnectTimeout=10 "$@"
+}
+
 echo "== Setup =="
+start_cursor="$(journal_cursor)"
 openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
   -subj /CN=secure-call-ci-test-ca -addext basicConstraints=critical,CA:TRUE \
   -addext keyUsage=critical,keyCertSign,cRLSign -keyout "$work/ca.key" -out "$work/ca.crt" \
@@ -97,7 +114,6 @@ chmod 0644 "$live"/*
 docker run -d --name "$CONTAINER" --user 0:0 --entrypoint sleep \
   -v "$live:/etc/letsencrypt/live/$CERTIFICATE:ro" "$STAND_IN_IMAGE" infinity >/dev/null
 
-touch "$work/start"
 if [ ! -x /usr/sbin/sshd ]; then
   sudo apt-get update -qq
   sudo apt-get install -y -qq openssh-server >/dev/null
@@ -115,24 +131,52 @@ for attempt in $(seq 1 20); do
   fi
   sleep 0.5
 done
+sudo cp /etc/ssh/sshd_config "$work/sshd_config.before"
 
-# The proxy machine's part, as in the README (the script comes from this checkout).
-sudo install -o root -g root -m 0755 coturn/print-turn-certificate.sh \
-  /usr/local/sbin/secure-call-print-turn-certificate
+# The coturn Pi's part 1.
+sudo adduser --system --group --no-create-home --home /nonexistent turn-certificate-fetch \
+  >/dev/null
+sudo install -d -o root -g root -m 0700 "$CONFIG_DIR"
+sudo ssh-keygen -q -t ed25519 -N '' -C secure-call-turn-certificate -f "$CONFIG_DIR/id_ed25519"
+public_key="$(sudo cat "$CONFIG_DIR/id_ed25519.pub")"
+
+# The proxy machine's part (the script comes from this checkout).
+sudo install -o root -g root -m 0755 coturn/print-turn-certificate.sh "$PRINT_SCRIPT"
 sudo adduser --system --group --shell /bin/sh --home /var/lib/turn-certificate turn-certificate \
   >/dev/null
-echo "turn-certificate ALL=(root) NOPASSWD: $PRINT_COMMAND" >"$work/turn-certificate.sudoers"
+sudo chown root:root /var/lib/turn-certificate
+sudo chmod 0755 /var/lib/turn-certificate
+echo "Defaults!$PRINT_SCRIPT !log_output" >"$work/turn-certificate.sudoers"
+echo "turn-certificate ALL=(root) NOPASSWD: $PRINT_COMMAND" >>"$work/turn-certificate.sudoers"
 sudo visudo -cf "$work/turn-certificate.sudoers"
 sudo install -o root -g root -m 0440 "$work/turn-certificate.sudoers" \
   /etc/sudoers.d/secure-call-turn-certificate
 sudo install -d -o root -g root -m 0755 /var/lib/turn-certificate/.ssh
-
-# The coturn Pi's part 1, then the authorized_keys line with its key.
-sudo install -d -o root -g root -m 0700 "$CONFIG_DIR"
-sudo ssh-keygen -q -t ed25519 -N '' -C secure-call-turn-certificate -f "$CONFIG_DIR/id_ed25519"
-public_key="$(sudo cat "$CONFIG_DIR/id_ed25519.pub")"
 forced_line="restrict,from=\"127.0.0.1\",command=\"sudo -n $PRINT_COMMAND\" $public_key"
 echo "$forced_line" | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys >/dev/null
+sudo tee -a /etc/ssh/sshd_config >/dev/null <<EOF
+
+# secure-call-backend #90: the coturn Pi's key may only fetch the TURN certificate.
+Match User turn-certificate
+    AuthenticationMethods publickey
+    DisableForwarding yes
+    PermitTTY no
+    PermitTunnel no
+    PermitUserRC no
+    ForceCommand sudo -n $PRINT_COMMAND
+EOF
+sudo cp /etc/ssh/sshd_config "$work/sshd_config.locked"
+reload_sshd
+effective="$(sudo sshd -T -C user=turn-certificate,host=pi,addr=127.0.0.1)"
+others="$(sudo sshd -T -C "user=$USER,host=pi,addr=127.0.0.1")"
+if grep -qx "forcecommand sudo -n $PRINT_COMMAND" <<<"$effective" \
+  && grep -qx 'disableforwarding yes' <<<"$effective" && grep -qx 'permittty no' <<<"$effective" \
+  && grep -qx 'forcecommand none' <<<"$others"; then
+  pass "sshd -T: the Match block applies to turn-certificate only"
+else
+  fail "sshd -T for turn-certificate: $(grep -E '^(forcecommand|disableforwarding|permittty) ' \
+    <<<"$effective" | tr '\n' ';'); for $USER: $(grep '^forcecommand ' <<<"$others")"
+fi
 
 # The coturn Pi's part 2.
 echo 'turn-certificate@127.0.0.1' | sudo tee "$CONFIG_DIR/proxy" >/dev/null
@@ -145,10 +189,10 @@ else
   fail "host key fingerprints: known_hosts '$known', sshd '$actual'"
 fi
 sudo install -D -o root -g root -m 0755 -t /usr/local/lib/secure-call \
-  coturn/sync-turn-certificate.sh coturn/install-turn-certificate.sh
+  coturn/fetch-turn-certificate.sh coturn/install-turn-certificate.sh
 sudo ln -sfn "$PWD/coturn" "$CONFIG_DIR/coturn"
-sudo install -o root -g root -m 0644 coturn/secure-call-turn-certificate.service \
-  coturn/secure-call-turn-certificate.timer /etc/systemd/system/
+sudo install -o root -g root -m 0644 "coturn/$UNIT" coturn/secure-call-turn-certificate.timer \
+  /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now secure-call-turn-certificate.timer
 if systemctl list-timers --all --no-pager | grep -q secure-call-turn-certificate.timer; then
@@ -158,7 +202,8 @@ else
 fi
 
 echo "== The first run installs the certificate =="
-if run_unit && grep -q 'Installed the certificate for turn.securevideocall.com' "$work/journal" \
+if run_unit && grep -q 'Fetched a certificate and a key' "$work/journal" \
+  && grep -q 'Installed the certificate for turn.securevideocall.com' "$work/journal" \
   && installed_key_is first && cmp -s "$work/first.fullchain.pem" coturn/tls/fullchain.pem; then
   pass "installed"
 else
@@ -174,6 +219,9 @@ if grep -q 'coturn is not running' "$work/journal"; then
   pass "coturn, not running in this job, is left alone"
 else
   fail "the journal does not say what happened to coturn"
+fi
+if grep -q 'WARNING' "$work/journal"; then
+  fail "a warning in the journal (a copy that differs from the checkout?)"
 fi
 
 echo "== A second run changes nothing; a renewal is installed =="
@@ -198,39 +246,88 @@ else
   fail "a certificate for another name"
 fi
 put_in_container renewed
+
+echo "== Each lock alone forces the command; neither is refused =="
 echo "$public_key" | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys >/dev/null
-if ! run_unit && grep -q 'lacks restrict and command=' "$work/journal" \
-  && installed_key_is renewed; then
-  pass "the key without restrict and command= is refused, and named"
+if run_unit && grep -q 'already installed' "$work/journal"; then
+  pass "a bare authorized_keys line: sshd_config's ForceCommand still forces the command"
 else
-  fail "the key without restrict and command="
+  fail "a bare authorized_keys line with the Match block"
+fi
+sudo cp "$work/sshd_config.before" /etc/ssh/sshd_config
+reload_sshd
+if ! run_unit && grep -q 'can open a shell there' "$work/journal" && installed_key_is renewed; then
+  pass "neither lock: the key is refused, and named"
+else
+  fail "neither lock"
 fi
 echo "$forced_line" | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys >/dev/null
+if run_unit && grep -q 'already installed' "$work/journal"; then
+  pass "authorized_keys alone forces the command"
+else
+  fail "authorized_keys alone"
+fi
+sudo cp "$work/sshd_config.locked" /etc/ssh/sshd_config
+reload_sshd
 
-echo "== The key opens no shell on the proxy =="
-first_line="$(sudo ssh -F none -n -T -o BatchMode=yes -o IdentitiesOnly=yes \
-  -i "$CONFIG_DIR/id_ed25519" -o UserKnownHostsFile="$CONFIG_DIR/known_hosts" \
-  -o StrictHostKeyChecking=yes turn-certificate@127.0.0.1 'id; cat /etc/passwd' \
+echo "== The key opens no shell, terminal or forwarding =="
+first_line="$(ssh_as_the_pi -T turn-certificate@127.0.0.1 'id; cat /etc/passwd' \
   | head -n 1 || true)"
 if [ "$first_line" = '-----BEGIN CERTIFICATE-----' ]; then
   pass "asked to run 'id', the login printed the certificate instead"
 else
   fail "the login ran something else: '$first_line'"
 fi
-if run_unit; then pass "the restored line works again"; else fail "the restored line"; fi
+tty_messages="$(ssh_as_the_pi -tt turn-certificate@127.0.0.1 2>&1 >/dev/null || true)"
+if grep -q 'PTY allocation request failed' <<<"$tty_messages"; then
+  pass "no terminal"
+else
+  fail "a terminal was not refused: $tty_messages"
+fi
+status=0
+forwarded="$(ssh_as_the_pi -W 127.0.0.1:22 turn-certificate@127.0.0.1 2>/dev/null)" || status=$?
+if [ "$status" = 255 ] && ! grep -q 'SSH-2.0' <<<"$forwarded"; then
+  pass "no connection elsewhere (-W)"
+else
+  fail "-W through the proxy: exit status $status"
+fi
+# Accepted, -N would wait until timeout ends it (124); refused, ssh exits at once (255).
+status=0
+timeout 20 sudo ssh -F none -n -N -o BatchMode=yes -o IdentitiesOnly=yes \
+  -i "$CONFIG_DIR/id_ed25519" -o UserKnownHostsFile="$CONFIG_DIR/known_hosts" \
+  -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -R 127.0.0.1:40998:127.0.0.1:22 \
+  turn-certificate@127.0.0.1 2>/dev/null || status=$?
+if [ "$status" = 255 ]; then
+  pass "no forwarded port (-R)"
+else
+  fail "-R through the proxy: exit status $status"
+fi
+print_command=("$PRINT_SCRIPT" "$CONTAINER" "$CERTIFICATE")
+if sudo -u turn-certificate sudo -n "$PRINT_SCRIPT" "$CONTAINER" npm-31 >/dev/null 2>&1 \
+  || sudo -u turn-certificate sudo -n /bin/sh -c id >/dev/null 2>&1; then
+  fail "sudo ran something other than the one command for turn-certificate"
+elif sudo -u turn-certificate sudo -n "${print_command[@]}" >"$work/allowed" \
+  && [ "$(head -n 1 "$work/allowed")" = '-----BEGIN CERTIFICATE-----' ]; then
+  pass "sudo runs exactly the one command line for turn-certificate"
+else
+  fail "sudo does not run the allowed command for turn-certificate"
+fi
+rm -f "$work/allowed"
 
-echo "== Nothing leaked =="
+echo "== Nothing leaked or left behind =="
+sudo journalctl --sync
+sudo journalctl --no-pager -q -o cat --after-cursor "$start_cursor" >"$work/whole-journal"
 for name in first renewed wrong-name; do
   sed '1d;$d' "$work/$name.key" >"$work/$name.key-lines"
-  if grep -qF -f "$work/$name.key-lines" "$work/all-journals"; then
+  if grep -qF -f "$work/$name.key-lines" "$work/whole-journal"; then
     fail "a line of the $name key is in the journal"
   fi
 done
-pass "no key line in the journal"
-if find /dev/shm -maxdepth 1 -mindepth 1 -user root -newer "$work/start" | grep -q .; then
-  fail "the runs left something in the host's /dev/shm"
+pass "no key line anywhere in the journal since the setup"
+if [ -e /run/secure-call-turn-certificate ]; then
+  fail "/run/secure-call-turn-certificate is still there after the runs"
 else
-  pass "nothing in the host's /dev/shm (the unit has its own)"
+  pass "systemd removed the fetch's folder"
 fi
 
 if [ "$failures" -ne 0 ]; then

@@ -346,7 +346,8 @@ def test_the_test_ca_override_is_announced(tmp_path: Path, test_ca: tuple[Path, 
 def test_coturn_dir_option_installs_into_the_resolved_stack_folder(
     tmp_path: Path, test_ca: tuple[Path, Path]
 ) -> None:
-    """How sync-turn-certificate.sh runs it: a copy elsewhere, the folder through a link (#90)."""
+    """How secure-call-turn-certificate.service runs it: a copy elsewhere, the folder through a
+    link (#90)."""
     key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
     stack = tmp_path / "checkout/deploy/raspberry-pi"
     (stack / "coturn").mkdir(parents=True)
@@ -404,3 +405,61 @@ def test_negative_a_folder_that_is_not_the_stacks_or_a_linked_tls_installs_nothi
     assert "is a symbolic link" in result.stderr
     assert list(elsewhere.iterdir()) == []
     assert "install" not in calls
+
+
+def test_negative_linked_inputs_and_the_test_ca_as_root_install_nothing(
+    tmp_path: Path, test_ca: tuple[Path, Path]
+) -> None:
+    """Root reads the inputs from a folder an unprivileged user writes (#90)."""
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    linked_key = tmp_path / "linked.key"
+    linked_key.symlink_to(key)
+    linked_chain = tmp_path / "linked.pem"
+    linked_chain.symlink_to(fullchain)
+    for case, (chain, private_key) in enumerate(((fullchain, linked_key), (linked_chain, key))):
+        result, tls, calls = run_install_script(
+            tmp_path / f"case-{case}", chain, private_key, test_ca[1]
+        )
+        assert result.returncode == 1
+        assert "is a symbolic link; give the file itself" in result.stderr
+        assert not tls.exists()
+        assert "install" not in calls
+
+    as_root = tmp_path / "as-root"
+    (as_root / "bin").mkdir(parents=True)
+    (as_root / "bin/id").write_text(
+        '#!/bin/sh\nif [ "$1" = -u ]; then echo 0; exit 0; fi\nexec /usr/bin/id "$@"\n'
+    )
+    (as_root / "bin/id").chmod(0o755)
+    result, tls, calls = run_install_script(as_root, fullchain, key, test_ca[1])
+    assert result.returncode == 1
+    assert "never honoured as root" in result.stderr
+    assert not tls.exists()
+    assert "docker" not in calls
+
+
+def test_a_root_owned_copy_that_fell_behind_the_checkout_is_named(
+    tmp_path: Path, test_ca: tuple[Path, Path]
+) -> None:
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    stack = tmp_path / "checkout/deploy/raspberry-pi"
+    (stack / "coturn").mkdir(parents=True)
+    (stack / "compose.yaml").write_text("# stand-in\n")
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    for name in ("install-turn-certificate.sh", "fetch-turn-certificate.sh"):
+        shutil.copy2(DEPLOY / "coturn" / name, lib / name)
+        shutil.copy2(DEPLOY / "coturn" / name, stack / "coturn" / name)
+    with (stack / "coturn/fetch-turn-certificate.sh").open("a") as pulled:
+        pulled.write("# a fix pulled into the checkout\n")
+    env, _ = tool_path(tmp_path)
+    env["TURN_CERTIFICATE_TEST_CA_FILE"] = str(test_ca[1])
+    result = subprocess.run(  # noqa: S603 - fixed script, no user input
+        ["/bin/bash", str(lib / "install-turn-certificate.sh"), "--coturn-dir",
+         str(stack / "coturn"), str(fullchain), str(key)],
+        env=env, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+
+    assert result.returncode == 0, result.stderr
+    assert f"WARNING: {lib}/fetch-turn-certificate.sh differs from" in result.stderr
+    assert "install-turn-certificate.sh differs" not in result.stderr
