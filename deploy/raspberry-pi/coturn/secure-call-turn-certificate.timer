@@ -1,0 +1,15 @@
+# Runs secure-call-turn-certificate.service twice a day (secure-call-backend#90). Nginx Proxy
+# Manager renews about 30 days before the certificate expires and install-turn-certificate.sh
+# refuses one with less than 7 days left, so a run that fails has weeks of retries. A run missed
+# while the Pi was off is made up at boot (Persistent=). coturn is told to reload only when the
+# certificate changed, and a reload keeps the calls in progress.
+[Unit]
+Description=Refresh coturn's TLS certificate from Nginx Proxy Manager twice a day
+
+[Timer]
+OnCalendar=*-*-* 04,16:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

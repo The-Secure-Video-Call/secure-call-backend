@@ -1,0 +1,63 @@
+# Fetches the TURN certificate from Nginx Proxy Manager on the proxy machine and installs it for
+# coturn when it changed (secure-call-backend#90). secure-call-turn-certificate.timer starts it.
+# Install it as deploy/raspberry-pi/README.md, TURN step 3b, describes: it is copied unchanged to
+# /etc/systemd/system/, the two scripts are root-owned copies in /usr/local/lib/secure-call/, the
+# user turn-certificate-fetch exists, and /etc/secure-call/turn-certificate/ (root only) holds the
+# SSH key, the proxy's login and host key, and a link to deploy/raspberry-pi/coturn.
+[Unit]
+Description=Refresh coturn's TLS certificate from Nginx Proxy Manager
+Documentation=https://github.com/The-Secure-Video-Call/secure-call-backend/blob/main/deploy/raspberry-pi/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# Two steps, each with only the rights it needs. Everything that handles what the proxy machine
+# (the internet-facing one) sends runs as an unprivileged user with no capabilities: ssh, and the
+# checks that the answer is nothing but certificates and one key. Only installing the result into
+# coturn/tls/ and telling coturn to reload runs as root ("!"), still in this sandbox.
+User=turn-certificate-fetch
+Group=turn-certificate-fetch
+# systemd copies these root-only files to a folder only this run's user can read (%d).
+LoadCredential=proxy:/etc/secure-call/turn-certificate/proxy
+LoadCredential=id_ed25519:/etc/secure-call/turn-certificate/id_ed25519
+LoadCredential=known_hosts:/etc/secure-call/turn-certificate/known_hosts
+# /run/secure-call-turn-certificate (memory), owned by that user, removed when the run ends.
+RuntimeDirectory=secure-call-turn-certificate
+RuntimeDirectoryMode=0700
+# Root-owned copies, never the ones in the repository, which the login user (and anything running
+# as that user) can change. A failed fetch skips the install.
+ExecStart=/usr/local/lib/secure-call/fetch-turn-certificate.sh %d %t/secure-call-turn-certificate
+ExecStartPost=!/usr/local/lib/secure-call/install-turn-certificate.sh --coturn-dir /etc/secure-call/turn-certificate/coturn %t/secure-call-turn-certificate/fullchain.pem %t/secure-call-turn-certificate/privkey.pem
+Environment=PATH=/usr/sbin:/usr/bin:/sbin:/bin
+# `journalctl -u secure-call-turn-certificate.service` shows every run.
+SyslogIdentifier=secure-call-turn
+# A stuck connection must not hold up the next run.
+TimeoutStartSec=5min
+UMask=0077
+# install-turn-certificate.sh's own copy goes to a small /dev/shm (memory) of its own, which no
+# other process sees and which is gone when it ends, even if it is killed.
+TemporaryFileSystem=/dev/shm:mode=0700,nosuid,noexec,size=1M
+PrivateTmp=yes
+# What root needs to install the key for coturn's user (65534) into the login user's checkout:
+# give a file to another user, set its mode, and read and write other users' files.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+# Only the pseudo devices (/dev/null, /dev/urandom and the like), bounded memory, and none of it
+# swapped to the SD card.
+DevicePolicy=closed
+MemoryMax=256M
+MemorySwapMax=0

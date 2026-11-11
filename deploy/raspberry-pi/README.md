@@ -308,33 +308,181 @@ Manual steps (owner):
    On the Pi, use zram or no swap: swapped memory (the secret, and the in-memory log mounts
    below) could otherwise reach the SD card. `ulimits: core: 0` already prevents core dumps.
 3b. **Certificate for TURN over TLS (`turns:`, port 5349):** browsers check it, so it must be
-   publicly trusted. Nginx Proxy Manager gets and renews it (port 80 reaches the proxy):
+   publicly trusted. Nginx Proxy Manager gets and renews it (port 80 reaches the proxy), and a
+   timer on this Pi copies every renewal to coturn (#90).
    - In Nginx Proxy Manager: **SSL Certificates → Add SSL Certificate → Let's Encrypt**,
-     domain `turn.securevideocall.com` (the A record of step 1).
-   - On this Pi, fetch both files straight from the proxy machine into memory (`/dev/shm`), so
-     the key never lands on either SD card. `<proxy>` is your SSH login on the proxy machine;
-     the first line prints the certificate's `npm-<N>`:
+     domain `turn.securevideocall.com` (the A record of step 1). Then, on the proxy machine,
+     this prints the certificate's folder name, `npm-<N>`, which the steps below use:
      ```sh
-     ssh <proxy> "docker exec nginx-proxy-manager-app-1 sh -c 'grep -l turn.securevideocall.com /etc/letsencrypt/renewal/*.conf'"
-     umask 077
-     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem' > /dev/shm/turn-fullchain.pem
-     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem' > /dev/shm/turn-privkey.pem
-     ./coturn/install-turn-certificate.sh /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
-     rm /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     docker exec nginx-proxy-manager-app-1 sh -c 'grep -l turn.securevideocall.com /etc/letsencrypt/renewal/*.conf'
      ```
-     The script refuses a certificate that does not name `turn.securevideocall.com`, does not
-     chain to a trusted CA, expires within 7 days or does not match the key, and a chain file
-     that holds anything but certificates. It installs into `coturn/tls/` (key owner 65534, mode
-     400) and tells a running coturn to reload the certificate (`SIGUSR2`): calls in progress keep
-     their relays.
+   - **How the copy works:** twice a day, `secure-call-turn-certificate.timer` starts
+     `secure-call-turn-certificate.service`, which runs in two steps:
+     1. As `turn-certificate-fetch`, a user with no rights of its own,
+        `coturn/fetch-turn-certificate.sh` logs in to the proxy machine with an SSH key of its own.
+        The proxy machine accepts that key only from this Pi, and only for one command,
+        `coturn/print-turn-certificate.sh`. That command prints the certificate's `fullchain.pem`
+        and `privkey.pem` and nothing else, whatever the client asks for. The key gets no shell
+        and no forwarding. The answer goes into memory (`/run`), and must be nothing but
+        certificates followed by one key.
+     2. Only then, as root, `install-turn-certificate.sh` checks the certificate and installs it
+        if it changed.
+
+     The private key is never printed or logged, and is written nowhere but memory and
+     `coturn/tls/`. The SSH key can fetch only what coturn holds anyway.
+   - **On this Pi (part 1):** the user for the first step, and the SSH key, in a folder only root
+     can read. The key has no passphrase, as the timer runs unattended. Copy the line the last
+     command prints:
+     ```sh
+     sudo adduser --system --group --no-create-home --home /nonexistent turn-certificate-fetch
+     sudo install -d -o root -g root -m 0700 /etc/secure-call/turn-certificate
+     sudo ssh-keygen -q -t ed25519 -N '' -C secure-call-turn-certificate -f /etc/secure-call/turn-certificate/id_ed25519
+     sudo cat /etc/secure-call/turn-certificate/id_ed25519.pub
+     ```
+   - **On the proxy machine:** an account for that key that can run one command only. **Keep a
+     second SSH session open** while you do this, in case a sudo or sshd change goes wrong. Copy
+     `coturn/print-turn-certificate.sh` there (for example with `scp`). Then, in the folder you
+     copied it to, run this, with `npm-<N>` from above, this Pi's LAN IP and the line from part 1:
+     ```sh
+     sudo install -o root -g root -m 0755 print-turn-certificate.sh /usr/local/sbin/secure-call-print-turn-certificate
+     sudo adduser --system --group --shell /bin/sh --home /var/lib/turn-certificate turn-certificate
+     sudo chown root:root /var/lib/turn-certificate
+     sudo chmod 0755 /var/lib/turn-certificate
+     echo 'Defaults!/usr/local/sbin/secure-call-print-turn-certificate !log_output' > turn-certificate.sudoers
+     echo 'turn-certificate ALL=(root) NOPASSWD: /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>' >> turn-certificate.sudoers
+     sudo visudo -cf turn-certificate.sudoers && sudo install -o root -g root -m 0440 turn-certificate.sudoers /etc/sudoers.d/secure-call-turn-certificate
+     sudo install -d -o root -g root -m 0755 /var/lib/turn-certificate/.ssh
+     echo 'restrict,from="<this Pi LAN IP>",command="LC_ALL=C sudo -n /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>" <the line from part 1>' | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys
+     sudo tee -a /etc/ssh/sshd_config <<'EOF'
+
+     # secure-call-backend #90: the coturn Pi's key may only fetch the TURN certificate.
+     Match User turn-certificate
+         AuthenticationMethods publickey
+         DisableForwarding yes
+         PermitTTY no
+         PermitTunnel no
+         PermitUserRC no
+         ForceCommand LC_ALL=C sudo -n /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>
+     Match all
+     EOF
+     sudo sshd -t && sudo systemctl reload ssh
+     sudo sshd -T -C user=turn-certificate,host=pi,addr=<this Pi LAN IP> | grep -Ei '^(forcecommand|disableforwarding|permittty) '
+     sudo sshd -T -C user="$USER",host=pi,addr=<this Pi LAN IP> | grep -i '^forcecommand '
+     ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
+     ```
+     - **The account** has no password. Its only right is that sudo line, which allows exactly
+       that command line, with no other arguments, and never records the command's output
+       (`!log_output`, which would put the key on the disk). The file is installed only if
+       `visudo -cf` accepts it, as a broken file in `/etc/sudoers.d/` would stop sudo working. The
+       account's home, `.ssh` and `authorized_keys` belong to root, so the account cannot change
+       them.
+     - **Two locks:** `restrict` turns off the terminal, every kind of forwarding and `~/.ssh/rc`;
+       `from=` accepts the key only from this Pi; `command=` runs that command whatever the
+       client asks for, in the C locale whatever the client sends (`LC_*`). The `Match` block at
+       the end of `sshd_config` enforces the same again for the account, whatever its
+       `authorized_keys` says. `Match all` closes it, so lines added to the file later apply to
+       everyone again.
+     - **Checks:** `sshd -t` must print nothing, and sshd is reloaded only then; if it prints an
+       error, fix `sshd_config` before you close the other session. The first `sshd -T` command
+       must print the `forcecommand` line above, `disableforwarding yes` and `permittty no`; the
+       second, for your own login, `forcecommand none`. Note the fingerprint the last command
+       prints.
+     - If `/etc/ssh/sshd_config` has an `AllowUsers` or `AllowGroups` line, add
+       `turn-certificate` to it.
+   - **On this Pi (part 2),** in `deploy/raspberry-pi`, with the proxy machine's LAN IP. First the
+     proxy's login and host key:
+     ```sh
+     echo 'turn-certificate@<proxy LAN IP>' | sudo tee /etc/secure-call/turn-certificate/proxy
+     ssh-keyscan -t ed25519 <proxy LAN IP> 2>/dev/null | sudo tee /etc/secure-call/turn-certificate/known_hosts
+     sudo ssh-keygen -lf /etc/secure-call/turn-certificate/known_hosts
+     ```
+     The fingerprint must be the one the proxy machine printed. If it is not, run
+     `sudo rm /etc/secure-call/turn-certificate/known_hosts` and stop. If the proxy's SSH listens
+     on another port, write `turn-certificate@<proxy LAN IP>:<port>` and use
+     `ssh-keyscan -p <port>`. Then root-owned copies of the two scripts (the unit runs them, and
+     your login user can change the repository), a link to this checkout's `coturn/`, the
+     units, and a first run:
+     ```sh
+     sudo install -D -o root -g root -m 0755 -t /usr/local/lib/secure-call coturn/fetch-turn-certificate.sh coturn/install-turn-certificate.sh
+     sudo ln -sfn "$PWD/coturn" /etc/secure-call/turn-certificate/coturn
+     sudo install -o root -g root -m 0644 coturn/secure-call-turn-certificate.service coturn/secure-call-turn-certificate.timer /etc/systemd/system/
+     sudo systemctl daemon-reload
+     sudo systemctl start secure-call-turn-certificate.service
+     journalctl -u secure-call-turn-certificate.service -n 20
+     sudo systemctl enable --now secure-call-turn-certificate.timer
+     ```
+     The journal must end with `Installed the certificate for turn.securevideocall.com, valid
+     until ...` (the first time) or `The certificate is already installed`.
+     `systemctl list-timers secure-call-turn-certificate.timer` shows the next run.
+   - **What is checked:** the fetch refuses an answer that:
+     - is larger than 64 KiB;
+     - holds anything but certificates followed by one private key (a banner, a blank line, text
+       after the key, Windows line ends);
+     - comes from a login that ran the fetch's own command, because neither `command=` nor
+       `ForceCommand` forces one for the key. The message says so.
+
+     Then the install script refuses a certificate that does not name
+     `turn.securevideocall.com`, does not chain to a trusted CA, expires within 7 days or does not
+     match the key, and a chain file that holds anything but certificates. It installs into
+     `coturn/tls/` (key owner 65534, mode 400) and tells a running coturn to reload the
+     certificate (`SIGUSR2`): calls in progress keep their relays. If the certificate has not
+     changed, it does nothing.
+   - **When a run fails,** `journalctl -u secure-call-turn-certificate.service` says why, and
+     `systemctl status secure-call-turn-certificate.service` shows `failed`. Common causes:
+     - `Host key verification failed`: the proxy's host key changed. Repeat the `ssh-keyscan`
+       check.
+     - `Permission denied (publickey)`: check the `authorized_keys` line, its `from=` address,
+       and `AllowUsers`.
+     - `sudo: a password is required`: the sudoers line must match the command after `sudo -n`
+       in `command=` and `ForceCommand` exactly.
+     - `does not belong to the certificate`: a renewal landed between the two files. The next
+       run fixes it.
    - **Renewal:** Nginx Proxy Manager renews the certificate by itself about 30 days before it
-     expires; repeat the fetch and the install after each renewal. Let's Encrypt's certificates
-     get shorter (64 days from February 2027, 45 from February 2028), and nothing else reminds
-     you: if it lapses, browsers quietly fall back to `turn:` over UDP. So add this daily cron
-     line (`crontab -e`), which logs a warning 21 days ahead (`journalctl -t secure-call-turn`):
+     expires, and the next run copies it. Let's Encrypt's certificates get shorter (64 days from
+     February 2027, 45 from February 2028), which changes nothing here. Keep this daily cron line
+     (`crontab -e`) as a check that does not depend on the timer. It asks coturn itself, and logs
+     a warning 21 days ahead (`journalctl -t secure-call-turn`):
      ```
      0 9 * * * echo | openssl s_client -connect turn.securevideocall.com:5349 -servername turn.securevideocall.com 2>/dev/null | openssl x509 -noout -checkend 1814400 >/dev/null || logger -t secure-call-turn "TURN certificate expires within 21 days"
      ```
+   - **After a change** (each run warns in the journal when a root-owned copy differs from the
+     checkout):
+     - a `git pull` that changes `coturn/fetch-turn-certificate.sh` or
+       `coturn/install-turn-certificate.sh`: repeat the `sudo install -D` line;
+     - one that changes a unit: repeat its `sudo install` line, then `sudo systemctl daemon-reload`;
+     - one that changes `coturn/print-turn-certificate.sh`: copy it to the proxy machine again and
+       repeat its `sudo install` line there;
+     - the certificate deleted and added again in Nginx Proxy Manager: it gets a new `npm-<N>`.
+       Change it in the sudoers line, the `authorized_keys` line and `ForceCommand`, then
+       `sudo sshd -t && sudo systemctl reload ssh`;
+     - the checkout moved: repeat the `ln` line.
+   - **By hand** (for example before the proxy machine's account exists): fetch both files
+     straight from the proxy machine into memory, so the key never lands on either SD card.
+     `<proxy>` is your own SSH login on the proxy machine. The install runs with `sudo`, as
+     `coturn/tls/` belongs to root once the timer has created it:
+     ```sh
+     umask 077
+     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem' > /dev/shm/turn-fullchain.pem
+     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem' > /dev/shm/turn-privkey.pem
+     sudo ./coturn/install-turn-certificate.sh /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     rm /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     ```
+   - **Undo,** on both machines (removing only this Pi's side leaves the key working):
+     - on this Pi:
+       ```sh
+       sudo systemctl disable --now secure-call-turn-certificate.timer
+       sudo rm /etc/systemd/system/secure-call-turn-certificate.service /etc/systemd/system/secure-call-turn-certificate.timer
+       sudo systemctl daemon-reload
+       sudo rm -r /etc/secure-call/turn-certificate /usr/local/lib/secure-call
+       sudo deluser --system turn-certificate-fetch
+       ```
+     - on the proxy machine: delete the lines from the `# secure-call-backend #90` comment to
+       `Match all` at the end of `/etc/ssh/sshd_config` (`sudo nano /etc/ssh/sshd_config`), then:
+       ```sh
+       sudo sshd -t && sudo systemctl reload ssh
+       sudo rm /etc/sudoers.d/secure-call-turn-certificate /usr/local/sbin/secure-call-print-turn-certificate
+       sudo deluser --system --remove-home turn-certificate
+       ```
    - **Accepted limit:** TURN over UDP (3478) still sends the TURN username and the peer
      permissions in plaintext (the media itself is DTLS-SRTP either way). UDP is kept for call
      quality; the TCP fallback is TLS only (`turns:`, no plain `turn:` TCP URL).

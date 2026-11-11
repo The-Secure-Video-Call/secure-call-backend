@@ -181,6 +181,22 @@ jobs:
             "$(curl -sk -D - -o /dev/null --max-time 5 https://127.0.0.1:18443/healthz)"
           docker rm -f npm-like >/dev/null
 
+      # The automatic refresh of coturn's certificate (#90), set up with README TURN step 3b's
+      # commands and run by its real unit under systemd (unprivileged fetch, then the install as
+      # root): the runner's sshd, a sudo-only account and a container named like Nginx Proxy
+      # Manager's stand in for the proxy machine. A renewal is installed; a wrong name and a key
+      # with neither forced command are refused; the key opens no shell, terminal or forwarding;
+      # no key line reaches the journal.
+      - name: The TURN certificate refresh (fetch-turn-certificate.sh) on the runner
+        working-directory: deploy/raspberry-pi
+        run: |
+          if command -v shellcheck >/dev/null; then
+            shellcheck --severity=warning ci/test-turn-certificate-sync.sh
+          else
+            echo "shellcheck is not installed on this runner; skipped"
+          fi
+          bash ci/test-turn-certificate-sync.sh
+
       # firewall.sh (#63) applied on the runner for real, with the stack above: the backend reaches
       # only PostgreSQL, only the proxy reaches its published port, coturn's network reaches public
       # addresses only, neither network reaches the runner itself, coturn's TCP ports are limited
