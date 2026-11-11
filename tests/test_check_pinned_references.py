@@ -77,10 +77,34 @@ def test_unpinned_actions_fail(text: str) -> None:
         "          image: tonistiigi/binfmt:latest",  # setup-qemu-action input
         "          driver-opts: image=moby/buildkit:latest",  # setup-buildx-action input
         "    image: ${PG_IMAGE:-postgres:18}",
+        "          sbom: generator=docker/buildkit-syft-scanner:stable-1",  # build-push-action
+        "          sbom: generator=docker/buildkit-syft-scanner@sha256:abc",  # not a full digest
+        "          attests: type=sbom,generator=docker/buildkit-syft-scanner:1",
+        "          sbom: true",  # BuildKit's default scanner, by a moving tag
+        '          sbom: "true" # quoted, with a comment',
+        "          sbom: ${{ inputs.sbom }}",  # cannot be read, so not trusted
+        "          attests: type=sbom",
+        "          attests: type=provenance,mode=max\n          attests: type=sbom",
     ],
 )
 def test_unpinned_yaml_images_fail(text: str) -> None:
     assert len(find_unpinned_images_in_yaml(text)) == 1
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"          sbom: generator=docker/buildkit-syft-scanner:1.12.1@{DIGEST}",
+        f"          attests: type=sbom,generator=docker/buildkit-syft-scanner@{DIGEST}",
+        "          sbom: false",
+        "          sbom: disabled=true",
+        "          provenance: mode=max",
+        "          # sbom: true is what we replaced; comments are not configuration",
+        "          sboms: true",  # another key
+    ],
+)
+def test_pinned_or_disabled_sbom_scanners_pass(text: str) -> None:
+    assert find_unpinned_images_in_yaml(text) == []
 
 
 def test_pinned_yaml_images_and_container_mappings_pass() -> None:

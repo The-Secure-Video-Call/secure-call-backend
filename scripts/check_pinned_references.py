@@ -5,8 +5,11 @@
   their own `uses:` are checked too.
 - Every image must carry an `@sha256:` digest: in Dockerfiles (`# syntax=`, `FROM`,
   `COPY --from=`, `RUN --mount=...from=`, also after `ONBUILD`), in compose files and in
-  workflows (`image:`, a scalar `container:`, `image=` options). Build stages and `scratch` are
-  allowed, and our own images in OWN_IMAGES only in deploy/raspberry-pi/compose.yaml.
+  workflows (`image:`, a scalar `container:`, `image=` options, and the BuildKit SBOM scanner
+  in `generator=` options). Build stages and `scratch` are allowed, and our own images in
+  OWN_IMAGES only in deploy/raspberry-pi/compose.yaml.
+- An SBOM requested without a `generator=` (`sbom: true`, `attests: type=sbom`) runs BuildKit's
+  default scanner image by a moving tag, so it is reported too.
 
 The checks read lines, not YAML, so they are written to fail closed: a `uses`/`image` key is
 found anywhere on a line (flow style, quoted keys, a space before the colon), and an empty value
@@ -38,6 +41,10 @@ YAML_KEY = re.compile(
     r"""(?:^|[\s{,\[])["']?(?P<key>uses|image|container)["']?\s*:(?!:)\s*(?P<value>.*)$"""
 )
 IMAGE_OPTION = re.compile(r"""\bimage=(?P<reference>[^\s,'"]+)""")
+GENERATOR_OPTION = re.compile(r"""\bgenerator=(?P<reference>[^\s,'"]+)""")
+SBOM_KEY = re.compile(r"""(?:^|[\s{,\[])["']?sbom["']?\s*:(?!:)\s*(?P<value>.*)$""")
+SBOM_ATTESTATION_TYPE = re.compile(r"\btype=sbom\b")
+DISABLED_SBOM_VALUES = frozenset({"false", "False", "FALSE", "disabled=true"})
 FULL_COMMIT_SHA_REFERENCE = re.compile(r"^[\w.-]+/[\w.-]+(?:/[^@\s]+)?@[0-9a-f]{40}$")
 DIGEST_IMAGE_REFERENCE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
 YAML_MAPPING_KEY = re.compile(r"""^\s*(?:-\s+)?["']?[\w.-]+["']?\s*:(?:\s|$)""")
@@ -124,7 +131,27 @@ def find_unpinned_images_in_yaml(
         for match in IMAGE_OPTION.finditer(line):  # e.g. buildx driver-opts: image=...
             if not is_pinned_image(match["reference"], own_images):
                 unpinned.append(UnpinnedReference(line_number, match["reference"]))
+        if line.lstrip().startswith("#"):
+            continue
+        for match in GENERATOR_OPTION.finditer(line):  # e.g. sbom: generator=...
+            if not is_pinned_image(match["reference"]):
+                unpinned.append(UnpinnedReference(line_number, match["reference"]))
+        unpinned.extend(
+            UnpinnedReference(line_number, problem) for problem in default_sbom_scanners(line)
+        )
     return unpinned
+
+
+def default_sbom_scanners(line: str) -> list[str]:
+    """An SBOM requested on this line without a generator, so with BuildKit's moving default."""
+    if GENERATOR_OPTION.search(line):
+        return []
+    sbom_key = SBOM_KEY.search(line)
+    if sbom_key is not None and clean_scalar(sbom_key["value"]) not in DISABLED_SBOM_VALUES:
+        return [f"sbom: {clean_scalar(sbom_key['value']) or '(no value)'} (no pinned generator=)"]
+    if SBOM_ATTESTATION_TYPE.search(line):
+        return ["type=sbom (no pinned generator=)"]
+    return []
 
 
 def joined_dockerfile_lines(dockerfile_text: str) -> list[tuple[int, str]]:

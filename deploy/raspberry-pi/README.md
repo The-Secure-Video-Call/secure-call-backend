@@ -1,7 +1,11 @@
 # Raspberry Pi test server
 
-`compose.yaml` runs the backend, PostgreSQL and coturn. Copy `.env.example` to `.env`, fill in
-the values marked "set", then `docker compose up -d`.
+`compose.yaml` runs the backend, PostgreSQL and coturn. First do the one-time setup under
+"Updating the backend" below (gh and its token), then copy `.env.example` to `.env`, fill in the
+values marked "set", and run `docker compose up -d postgres`, `./update.sh` and
+`docker compose up -d`, in that order. compose never pulls the backend image itself
+(`pull_policy: never`): a bare `docker compose up -d` before `update.sh` stops with "No such
+image" instead of running an unverified one.
 
 ## Updating the backend
 
@@ -13,16 +17,26 @@ Run `./update.sh` in this folder, as the user that runs Docker. It:
    was built by this repository's `.github/workflows/publish-image.yml`, from `refs/heads/main`, on
    a GitHub-hosted runner (the attestation is signed with a short-lived Sigstore certificate
    issued for that workflow run, so a registry login alone cannot forge it);
-3. only then pulls the image **by that digest**, points the local `:main` tag at it and runs
-   `docker compose up -d --no-deps --pull never backend` (so compose cannot fetch a newer `:main`
-   in between, and touches only the backend container), and checks that the backend container
-   runs exactly the verified image.
+3. refuses an image built by an older workflow run than the image it deployed last (the run ID
+   comes from the attestation's certificate), so moving `:main` back to an older, possibly
+   vulnerable, attested image does not work;
+4. only then pulls the image **by that digest**, points the local `:main` tag at it and runs
+   `docker compose up -d --no-deps --pull never backend` (only the backend container is
+   touched), checks that the backend container runs exactly the verified image (and stops it if
+   not), and records the run ID.
 
-If `docker` or `gh` is missing, gh is older than 2.102.0, the lookup fails or the verification
-fails, it prints why, exits non-zero and pulls and restarts nothing. `./update.sh --check` does
-steps 1 and 2 only. Do not run `docker compose pull` or `docker compose pull backend` here: that
-moves the local `:main` tag to an image nobody verified, and the next `docker compose up` would
-run it.
+If `docker`, `gh`, `flock` or `timeout` is missing, gh is older than 2.102.0, another update.sh is
+still running, a lookup times out or fails, or a check fails, it prints why, exits non-zero and
+does not restart the backend. `./update.sh --check` does steps 1 to 3 only and changes nothing.
+compose.yaml sets `pull_policy: never` for the backend, so `docker compose pull` and
+`docker compose up` never fetch `:main` themselves; do not `docker pull` it by hand either.
+
+update.sh keeps its lock and the last deployed run ID in `~/.local/state/secure-call-backend/`
+(mode 700, outside the git checkout). The first run accepts any verified image and records it.
+To go back to an older version on purpose, revert the change on `main`: the new run then
+publishes it.
+
+It also warns (and carries on) when gh's token expires within 14 days.
 
 **One-time setup on the Pi** (as the same user):
 
@@ -30,7 +44,8 @@ run it.
    ([install steps](https://github.com/cli/cli/blob/trunk/docs/install_linux.md#debian)); `apt
    upgrade` then keeps it current. Debian's own `gh` package is too old (no `gh attestation`), and
    before 2.102.0 gh checked `--signer-workflow` and `--source-ref` less strictly, so update.sh
-   refuses older versions. Check with `gh --version`.
+   refuses older versions. Check with `gh --version`. `flock` and `timeout` come with Raspberry
+   Pi OS (util-linux and coreutils).
 2. **A read-only GitHub token for gh.** `gh attestation verify` will not run without a login, even
    for a public repository. Do not use the browser login (`gh auth login` without a token): it
    asks for the `repo` scope, write access to every repository you can reach. Instead, on
@@ -43,13 +58,24 @@ run it.
    stored in plain text). `gh auth status` shows the login. When the token expires, update.sh
    refuses with gh's "please run: gh auth login" message: make a new one the same way.
 3. **Registry login.** The image on ghcr.io is not public, so Docker on the Pi is logged in to
-   ghcr.io (`docker login ghcr.io --username <your GitHub user> --password-stdin`, with a classic
-   token that has only `read:packages`). gh reads that same Docker login to look up the image, so
-   run update.sh as that user.
-4. **Check:** `./update.sh --check` prints `Verification succeeded!` and changes nothing.
+   ghcr.io: `docker login ghcr.io --username <your GitHub user> --password-stdin`, with a classic
+   token that has only `read:packages` **and an expiry date** (renew it the same way). Docker
+   stores it in `~/.docker/config.json`; run `chmod 600 ~/.docker/config.json` so only you can
+   read it. gh reads that same Docker login to look up the image, so run update.sh as that user.
+   (Making the package public on GitHub would remove the need for this token, since the image
+   is built from this public repository; that is the owner's decision.)
+4. **Check:** `./update.sh --check` prints `Verified ...` and changes nothing.
 
-update.sh can run from cron too (`README.md` at the repository root, "Automatic updates"), as
-long as gh is logged in for that user; a refusal is then only visible in cron's mail.
+**From cron:** Raspberry Pi OS sends no mail, so send the output to the system journal instead of
+discarding it (with your path):
+
+```
+*/5 * * * * /home/pi/secure-call-backend/deploy/raspberry-pi/update.sh 2>&1 | logger -t secure-call-update
+```
+
+Then `journalctl -t secure-call-update --since today` shows every run, refusals and token expiry
+warnings included. The lock means a run that takes longer than 5 minutes is never overlapped by
+the next one.
 
 To look at what a published image contains, `docker buildx imagetools inspect
 ghcr.io/the-secure-video-call/secure-call-backend:main --format '{{ json .SBOM }}'` shows its
