@@ -15,6 +15,8 @@ BACKEND_REQUIRED = (
     "POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:?",
     "POSTGRES_SSLMODE: verify-full",
     "POSTGRES_SSLROOTCERT: /run/secure-call/local-ca.crt",
+    "BACKEND_TLS_CERTIFICATE: /run/secure-call/backend.crt",
+    "BACKEND_TLS_KEY: /run/secure-call/backend.key",
 )
 POSTGRES_REQUIRED = (
     "- ssl=on",

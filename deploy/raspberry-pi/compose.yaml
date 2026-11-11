@@ -39,6 +39,10 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
       POSTGRES_SSLMODE: verify-full
       POSTGRES_SSLROOTCERT: /run/secure-call/local-ca.crt
+      # HTTPS/WSS only on 8000: the hop from the reverse proxy is encrypted, and the proxy checks
+      # this certificate against our local CA (README.md, setup step 4).
+      BACKEND_TLS_CERTIFICATE: /run/secure-call/backend.crt
+      BACKEND_TLS_KEY: /run/secure-call/backend.key
     depends_on:
       postgres:
         condition: service_healthy
@@ -59,6 +63,21 @@ services:
       - type: bind
         source: ./tls/local-ca.crt
         target: /run/secure-call/local-ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      # The backend's TLS certificate and key. The key belongs to the image's user (uid 10001,
+      # mode 400; make-local-certs.sh sets that), as the container has no capabilities to read
+      # anyone else's file.
+      - type: bind
+        source: ./tls/backend.crt
+        target: /run/secure-call/backend.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls/backend.key
+        target: /run/secure-call/backend.key
         read_only: true
         bind:
           create_host_path: false

@@ -50,4 +50,7 @@ EXPOSE 8000
 # which runs the consumer's disconnect so the peer gets peer-left and the seat is freed.
 # --websocket_timeout caps a socket's total lifetime at 14700 s (4 h room limit + 5 min);
 # Daphne's default is 24 h. The consumer also closes a socket that is out of a room for 10 s.
-CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; exec daphne -v 0 --ping-interval 10 --ping-timeout 20 --websocket_timeout 14700 -b 0.0.0.0 -p 8000 config.asgi:application"]
+# With BACKEND_TLS_CERTIFICATE set (deploy/raspberry-pi/compose.yaml sets it, and
+# BACKEND_TLS_KEY), port 8000 speaks HTTPS/WSS only, so nothing crosses the home network in
+# plaintext between the reverse proxy and this server. Without it, plain HTTP, for local use.
+CMD ["sh", "-c", "if [ -n \"${POSTGRES_HOST:-}\" ]; then python manage.py migrate --noinput; fi; if [ -n \"${BACKEND_TLS_CERTIFICATE:-}\" ]; then set -- -e \"ssl:8000:interface=0.0.0.0:privateKey=${BACKEND_TLS_KEY:-}:certKey=${BACKEND_TLS_CERTIFICATE}\"; else set -- -b 0.0.0.0 -p 8000; fi; exec daphne -v 0 --ping-interval 10 --ping-timeout 20 --websocket_timeout 14700 \"$@\" config.asgi:application"]

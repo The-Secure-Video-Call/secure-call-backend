@@ -84,6 +84,31 @@ jobs:
           "${backend[@]}" python manage.py migrate --noinput
           "${backend[@]}" python -c "import django; django.setup(); from django.db import connection; c = connection.cursor(); c.execute('SELECT current_user, ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()'); row = c.fetchone(); assert row == ('securecall_app', True, 'TLSv1.3'), row; print('The backend image reaches PostgreSQL as', row[0], 'over', row[2])"
 
+      # The same container serving through compose.yaml (#59): HTTPS with TLS 1.3 and a
+      # certificate that passes the proxy's checks (our CA, the name secure-call-backend), and no
+      # answer at all to plain HTTP.
+      - name: The backend serves HTTPS only, as the proxy checks it
+        working-directory: deploy/raspberry-pi
+        run: |
+          docker compose up -d --no-deps --pull never backend
+          proxy_check=(curl -fsS --max-time 5 --tlsv1.3 --cacert tls/local-ca.crt
+            --resolve secure-call-backend:8001:127.0.0.1
+            -H 'Host: signal.example.invalid' -H 'X-Forwarded-Proto: https'
+            https://secure-call-backend:8001/healthz)
+          for attempt in $(seq 1 30); do
+            if health="$("${proxy_check[@]}" 2>/dev/null)"; then break; fi
+            sleep 1
+          done
+          if [ "${health:-}" != '{"status": "ok"}' ]; then
+            echo "The backend did not answer over HTTPS:"; "${proxy_check[@]}"
+            docker compose logs backend | tail -n 20; exit 1
+          fi
+          echo "HTTPS: $health"
+          if curl -sS --max-time 5 -o /dev/null http://127.0.0.1:8001/healthz; then
+            echo "The backend answered plain HTTP"; exit 1
+          fi
+          echo "Plain HTTP gets no answer."
+
       - name: Django production checks
         env:
           DJANGO_ALLOWED_HOSTS: signal.example.invalid
