@@ -35,9 +35,9 @@ SyslogIdentifier=secure-call-turn
 # A stuck connection must not hold up the next run.
 TimeoutStartSec=5min
 UMask=0077
-# install-turn-certificate.sh's own copy goes to a /dev/shm (memory) of its own, which no other
-# process sees and which is gone when it ends, even if it is killed.
-TemporaryFileSystem=/dev/shm:mode=0700,nosuid,noexec
+# install-turn-certificate.sh's own copy goes to a small /dev/shm (memory) of its own, which no
+# other process sees and which is gone when it ends, even if it is killed.
+TemporaryFileSystem=/dev/shm:mode=0700,nosuid,noexec,size=1M
 PrivateTmp=yes
 # What root needs to install the key for coturn's user (65534) into the login user's checkout:
 # give a file to another user, set its mode, and read and write other users' files.
@@ -56,3 +56,8 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+# Only the pseudo devices (/dev/null, /dev/urandom and the like), bounded memory, and none of it
+# swapped to the SD card.
+DevicePolicy=closed
+MemoryMax=256M
+MemorySwapMax=0

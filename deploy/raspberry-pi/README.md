@@ -339,7 +339,8 @@ Manual steps (owner):
      sudo ssh-keygen -q -t ed25519 -N '' -C secure-call-turn-certificate -f /etc/secure-call/turn-certificate/id_ed25519
      sudo cat /etc/secure-call/turn-certificate/id_ed25519.pub
      ```
-   - **On the proxy machine:** an account for that key that can run one command only. Copy
+   - **On the proxy machine:** an account for that key that can run one command only. **Keep a
+     second SSH session open** while you do this, in case a sudo or sshd change goes wrong. Copy
      `coturn/print-turn-certificate.sh` there (for example with `scp`). Then, in the folder you
      copied it to, run this, with `npm-<N>` from above, this Pi's LAN IP and the line from part 1:
      ```sh
@@ -349,10 +350,9 @@ Manual steps (owner):
      sudo chmod 0755 /var/lib/turn-certificate
      echo 'Defaults!/usr/local/sbin/secure-call-print-turn-certificate !log_output' > turn-certificate.sudoers
      echo 'turn-certificate ALL=(root) NOPASSWD: /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>' >> turn-certificate.sudoers
-     sudo visudo -cf turn-certificate.sudoers
-     sudo install -o root -g root -m 0440 turn-certificate.sudoers /etc/sudoers.d/secure-call-turn-certificate
+     sudo visudo -cf turn-certificate.sudoers && sudo install -o root -g root -m 0440 turn-certificate.sudoers /etc/sudoers.d/secure-call-turn-certificate
      sudo install -d -o root -g root -m 0755 /var/lib/turn-certificate/.ssh
-     echo 'restrict,from="<this Pi LAN IP>",command="sudo -n /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>" <the line from part 1>' | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys
+     echo 'restrict,from="<this Pi LAN IP>",command="LC_ALL=C sudo -n /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>" <the line from part 1>' | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys
      sudo tee -a /etc/ssh/sshd_config <<'EOF'
 
      # secure-call-backend #90: the coturn Pi's key may only fetch the TURN certificate.
@@ -362,25 +362,28 @@ Manual steps (owner):
          PermitTTY no
          PermitTunnel no
          PermitUserRC no
-         ForceCommand sudo -n /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>
+         ForceCommand LC_ALL=C sudo -n /usr/local/sbin/secure-call-print-turn-certificate nginx-proxy-manager-app-1 npm-<N>
+     Match all
      EOF
-     sudo sshd -t
-     sudo systemctl reload ssh
+     sudo sshd -t && sudo systemctl reload ssh
      sudo sshd -T -C user=turn-certificate,host=pi,addr=<this Pi LAN IP> | grep -Ei '^(forcecommand|disableforwarding|permittty) '
      sudo sshd -T -C user="$USER",host=pi,addr=<this Pi LAN IP> | grep -i '^forcecommand '
      ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub
      ```
      - **The account** has no password. Its only right is that sudo line, which allows exactly
        that command line, with no other arguments, and never records the command's output
-       (`!log_output`, which would put the key on the disk). `visudo -cf` checks the file before it
-       is installed, as a broken file in `/etc/sudoers.d/` would stop sudo working. The account's
-       home, `.ssh` and `authorized_keys` belong to root, so the account cannot change them.
+       (`!log_output`, which would put the key on the disk). The file is installed only if
+       `visudo -cf` accepts it, as a broken file in `/etc/sudoers.d/` would stop sudo working. The
+       account's home, `.ssh` and `authorized_keys` belong to root, so the account cannot change
+       them.
      - **Two locks:** `restrict` turns off the terminal, every kind of forwarding and `~/.ssh/rc`;
        `from=` accepts the key only from this Pi; `command=` runs that command whatever the
-       client asks for. The `Match` block at the end of `sshd_config` enforces the same again for
-       the account, whatever its `authorized_keys` says.
-     - **Checks:** `sshd -t` must print nothing; if it prints an error, fix `sshd_config` before
-       you close this session. The first `sshd -T` line must show that `forcecommand`,
+       client asks for, in the C locale whatever the client sends (`LC_*`). The `Match` block at
+       the end of `sshd_config` enforces the same again for the account, whatever its
+       `authorized_keys` says. `Match all` closes it, so lines added to the file later apply to
+       everyone again.
+     - **Checks:** `sshd -t` must print nothing, and sshd is reloaded only then; if it prints an
+       error, fix `sshd_config` before you close the other session. The first `sshd -T` line must show that `forcecommand`,
        `disableforwarding yes` and `permittty no`. The second, for your own login, must show
        `forcecommand none`. Note the fingerprint the last command prints.
      - If `/etc/ssh/sshd_config` has an `AllowUsers` or `AllowGroups` line, add
@@ -429,8 +432,8 @@ Manual steps (owner):
        check.
      - `Permission denied (publickey)`: check the `authorized_keys` line, its `from=` address,
        and `AllowUsers`.
-     - `sudo: a password is required`: the sudoers line must match the `command=` and
-       `ForceCommand` ones exactly.
+     - `sudo: a password is required`: the sudoers line must match the command after `sudo -n`
+       in `command=` and `ForceCommand` exactly.
      - `does not belong to the certificate`: a renewal landed between the two files. The next
        run fixes it.
    - **Renewal:** Nginx Proxy Manager renews the certificate by itself about 30 days before it
@@ -450,17 +453,17 @@ Manual steps (owner):
        repeat its `sudo install` line there;
      - the certificate deleted and added again in Nginx Proxy Manager: it gets a new `npm-<N>`.
        Change it in the sudoers line, the `authorized_keys` line and `ForceCommand`, then
-       `sudo sshd -t` and `sudo systemctl reload ssh`;
+       `sudo sshd -t && sudo systemctl reload ssh`;
      - the checkout moved: repeat the `ln` line.
    - **By hand** (for example before the proxy machine's account exists): fetch both files
      straight from the proxy machine into memory, so the key never lands on either SD card.
-     `<proxy>` is your own SSH login on the proxy machine. Once the timer has run, `coturn/tls/`
-     belongs to root, so the install then needs `sudo`:
+     `<proxy>` is your own SSH login on the proxy machine. The install runs with `sudo`, as
+     `coturn/tls/` belongs to root once the timer has created it:
      ```sh
      umask 077
      ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem' > /dev/shm/turn-fullchain.pem
      ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem' > /dev/shm/turn-privkey.pem
-     ./coturn/install-turn-certificate.sh /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     sudo ./coturn/install-turn-certificate.sh /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
      rm /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
      ```
    - **Undo,** on both machines (removing only this Pi's side leaves the key working):
@@ -472,8 +475,8 @@ Manual steps (owner):
        sudo rm -r /etc/secure-call/turn-certificate /usr/local/lib/secure-call
        sudo deluser --system turn-certificate-fetch
        ```
-     - on the proxy machine: delete the `Match User turn-certificate` block at the end of
-       `/etc/ssh/sshd_config` (`sudo nano /etc/ssh/sshd_config`), then:
+     - on the proxy machine: delete the lines from the `# secure-call-backend #90` comment to
+       `Match all` at the end of `/etc/ssh/sshd_config` (`sudo nano /etc/ssh/sshd_config`), then:
        ```sh
        sudo sshd -t && sudo systemctl reload ssh
        sudo rm /etc/sudoers.d/secure-call-turn-certificate /usr/local/sbin/secure-call-print-turn-certificate

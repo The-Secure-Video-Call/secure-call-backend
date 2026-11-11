@@ -421,9 +421,28 @@ def test_negative_linked_inputs_and_the_test_ca_as_root_install_nothing(
             tmp_path / f"case-{case}", chain, private_key, test_ca[1]
         )
         assert result.returncode == 1
-        assert "is a symbolic link; give the file itself" in result.stderr
+        assert "is not a regular file (but a link, a pipe or nothing)" in result.stderr
         assert not tls.exists()
         assert "install" not in calls
+
+    pipe = tmp_path / "pipe.key"
+    os.mkfifo(pipe)  # would block root's copy for good, without a writer
+    oversized = tmp_path / "oversized.pem"
+    oversized.write_text(fullchain.read_text() * (65536 // len(fullchain.read_text()) + 1))
+    for case, (chain, private_key, message) in enumerate(
+        (
+            (fullchain, pipe, "is not a regular file"),
+            (oversized, key, "is larger than 65536 bytes"),
+            (fullchain, tmp_path / "missing.key", "is not a regular file"),
+        )
+    ):
+        result, tls, calls = run_install_script(
+            tmp_path / f"bounded-{case}", chain, private_key, test_ca[1]
+        )
+        assert result.returncode == 1, message
+        assert message in result.stderr
+        assert not tls.exists()
+        assert "docker" not in calls
 
     as_root = tmp_path / "as-root"
     (as_root / "bin").mkdir(parents=True)

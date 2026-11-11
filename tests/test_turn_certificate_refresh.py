@@ -47,6 +47,7 @@ CONFIG_DIR = "/etc/secure-call/turn-certificate"
 RUNTIME_DIR_NAME = "secure-call-turn-certificate"
 INSTALLED_PRINT_SCRIPT = "/usr/local/sbin/secure-call-print-turn-certificate"
 PRINT_COMMAND = f"{INSTALLED_PRINT_SCRIPT} {CONTAINER} npm-<N>"
+FORCED_COMMAND = f"LC_ALL=C sudo -n {PRINT_COMMAND}"
 CREDENTIALS = ("proxy", "id_ed25519", "known_hosts")
 
 # ssh on the coturn Pi: records the call, then answers with a file (or, for a key without a forced
@@ -866,18 +867,19 @@ def test_the_readme_lines_let_the_key_fetch_the_certificate_and_nothing_else(
     # The README's lines for this machine: the test's address, user, certificate and script copy,
     # and the stand-ins for sudo and docker.
     test_command = (
-        f"PATH={proxy.env['PATH']} FAKE_LOG={proxy.log} FAKE_CONTAINER_ROOT={proxy.container_root}"
+        f"LC_ALL=C PATH={proxy.env['PATH']} FAKE_LOG={proxy.log}"
+        f" FAKE_CONTAINER_ROOT={proxy.container_root}"
         f" sudo -n /bin/bash {proxy.script} {CONTAINER} {CERTIFICATE_NAME}"
     )
     options = (
         readme_authorized_keys_options()
         .replace("<this Pi LAN IP>", "127.0.0.1")
-        .replace(f"sudo -n {PRINT_COMMAND}", test_command)
+        .replace(FORCED_COMMAND, test_command)
     )
     match_block = (
         readme_sshd_match_block()
         .replace("Match User turn-certificate", f"Match User {getpass.getuser()}")
-        .replace(f"sudo -n {PRINT_COMMAND}", test_command)
+        .replace(FORCED_COMMAND, test_command)
     )
     assert options == f'restrict,from="127.0.0.1",command="{test_command}"'
     assert f"ForceCommand {test_command}\n" in match_block
@@ -957,7 +959,7 @@ SERVICE_REQUIRED = {
     ],
     "Environment": ["PATH=/usr/sbin:/usr/bin:/sbin:/bin"],
     "UMask": ["0077"],
-    "TemporaryFileSystem": ["/dev/shm:mode=0700,nosuid,noexec"],  # noqa: S108 - its own tmpfs
+    "TemporaryFileSystem": ["/dev/shm:mode=0700,nosuid,noexec,size=1M"],  # noqa: S108 - its own
     "PrivateTmp": ["yes"],
     "CapabilityBoundingSet": ["CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE"],
     "NoNewPrivileges": ["yes"],
@@ -965,6 +967,9 @@ SERVICE_REQUIRED = {
     "RestrictAddressFamilies": ["AF_UNIX AF_INET AF_INET6"],
     "RestrictNamespaces": ["yes"],
     "RestrictSUIDSGID": ["yes"],
+    "DevicePolicy": ["closed"],
+    "MemoryMax": ["256M"],
+    "MemorySwapMax": ["0"],
 }
 TIMER_REQUIRED = {
     "OnCalendar": ["*-*-* 04,16:00:00"],
@@ -1005,7 +1010,9 @@ def test_the_units_fetch_unprivileged_install_as_root_sandboxed_twice_a_day() ->
          "ExecStart"),
         (f"ExecStartPost=!{INSTALLED_LIB_DIR}/install",
          f"ExecStartPost=+{INSTALLED_LIB_DIR}/install", "ExecStartPost"),
-        ("TemporaryFileSystem=/dev/shm:mode=0700,nosuid,noexec\n", "", "TemporaryFileSystem"),
+        ("TemporaryFileSystem=/dev/shm:mode=0700,nosuid,noexec,size=1M\n", "",
+         "TemporaryFileSystem"),
+        ("MemorySwapMax=0\n", "", "MemorySwapMax"),
         ("CAP_DAC_OVERRIDE\n", "CAP_DAC_OVERRIDE CAP_SYS_ADMIN\n", "CapabilityBoundingSet"),
         ("NoNewPrivileges=yes\n", "", "NoNewPrivileges"),
         ("UMask=0077\n", "UMask=0022\n", "UMask"),
@@ -1096,7 +1103,7 @@ def test_readme_sudoers_authorized_keys_and_sshd_config_force_the_same_command()
     readme = README.read_text()
     sudoers = re.search(r"echo 'turn-certificate ALL=\(root\) NOPASSWD: ([^']+)'", readme)
     forced = re.fullmatch(
-        r'restrict,from="<this Pi LAN IP>",command="sudo -n ([^"]+)"',
+        r'restrict,from="<this Pi LAN IP>",command="LC_ALL=C sudo -n ([^"]+)"',
         readme_authorized_keys_options(),
     )
 
@@ -1105,7 +1112,8 @@ def test_readme_sudoers_authorized_keys_and_sshd_config_force_the_same_command()
     assert sudoers[1] == forced[1] == PRINT_COMMAND
     assert readme_sshd_match_block() == (
         "Match User turn-certificate\nAuthenticationMethods publickey\nDisableForwarding yes\n"
-        f"PermitTTY no\nPermitTunnel no\nPermitUserRC no\nForceCommand sudo -n {PRINT_COMMAND}\n"
+        "PermitTTY no\nPermitTunnel no\nPermitUserRC no\n"
+        f"ForceCommand {FORCED_COMMAND}\nMatch all\n"
     )
 
 

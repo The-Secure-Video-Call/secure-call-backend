@@ -8,9 +8,9 @@
 # compose.yaml), by default the one this script is in; secure-call-turn-certificate.service runs a
 # root-owned copy of this script with it, on what fetch-turn-certificate.sh fetched (#90).
 #
-# Browsers check this certificate, so it must be publicly trusted. The two files (never symbolic
-# links) are first copied into a private temporary folder, and only those copies are checked and
-# installed. Nothing is installed unless all of these hold:
+# Browsers check this certificate, so it must be publicly trusted. The two files (regular files
+# of at most 64 KiB, never links or pipes) are first copied into a private temporary folder, and
+# only those copies are checked and installed. Nothing is installed unless all of these hold:
 #   - FULLCHAIN.pem holds certificates only (no key or anything else that would become readable);
 #   - the certificate names turn.securevideocall.com;
 #   - it chains to a CA this machine trusts (the system's CA store) and is for TLS servers;
@@ -26,6 +26,7 @@ export LC_ALL=C
 readonly TURN_HOST_NAME=turn.securevideocall.com
 readonly COTURN_UID=65534          # compose.yaml: user: '65534:65534'
 readonly MIN_VALID_SECONDS=$((7 * 24 * 60 * 60))
+readonly MAX_INPUT_BYTES=65536
 # Only for tests, and never as root: one more CA to trust, on top of the system's CA store.
 readonly TEST_CA_FILE="${TURN_CERTIFICATE_TEST_CA_FILE:-}"
 # The root-owned copies secure-call-turn-certificate.service runs, next to this one, and the units.
@@ -66,7 +67,9 @@ if [ -L "$TLS_DIR" ]; then
 fi
 # Root reads them, and they may come from a folder an unprivileged user can write.
 for input in "$1" "$2"; do
-  if [ -L "$input" ]; then refuse "$input is a symbolic link; give the file itself."; fi
+  if [ -L "$input" ] || [ ! -f "$input" ]; then
+    refuse "$input is not a regular file (but a link, a pipe or nothing); give the file itself."
+  fi
 done
 if [ -n "$TEST_CA_FILE" ]; then
   if [ "$(id -u)" -eq 0 ]; then
@@ -92,10 +95,17 @@ else
 fi
 trap 'rm -rf "$work_dir"' EXIT
 trap 'exit 1' HUP INT TERM
-cp -- "$1" "$work_dir/fullchain.pem" 2>/dev/null || refuse "cannot read $1."
-cp -- "$2" "$work_dir/privkey.pem" 2>/dev/null || refuse "cannot read $2."
+# $1 = input, $2 = its copy: at most one byte more than allowed is read.
+copy_input() {
+  head -c "$((MAX_INPUT_BYTES + 1))" -- "$1" >"$2" 2>/dev/null || refuse "cannot read $1."
+  if [ "$(($(wc -c <"$2")))" -gt "$MAX_INPUT_BYTES" ]; then
+    refuse "$1 is larger than $MAX_INPUT_BYTES bytes."
+  fi
+}
 fullchain="$work_dir/fullchain.pem"
 private_key="$work_dir/privkey.pem"
+copy_input "$1" "$fullchain"
+copy_input "$2" "$private_key"
 
 if grep -E '^-----BEGIN ' "$fullchain" | grep -qvx -- '-----BEGIN CERTIFICATE-----'; then
   refuse "$1 holds something other than certificates."

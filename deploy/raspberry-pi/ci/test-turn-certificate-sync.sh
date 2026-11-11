@@ -12,6 +12,9 @@
 #   - the key opens no shell, terminal or forwarding, and sudo runs nothing else for the account;
 #   - no line of a private key is ever in the journal, and no fetched file is left behind.
 # A test CA is added to the runner's trust store for the run, as Let's Encrypt cannot issue here.
+# The proxy machine runs Raspberry Pi OS (Debian bookworm) with classic sudo, so the runner is
+# switched to classic sudo first (Ubuntu 25.10 and later default to sudo-rs, whose sudoers
+# dialect differs: it has no log_output, for one).
 # Needs Docker, passwordless sudo, systemd, openssl, and the backend image (built by a step
 # before; it stands in for Nginx Proxy Manager's image). Run from deploy/raspberry-pi.
 set -euo pipefail
@@ -25,6 +28,7 @@ readonly PRINT_COMMAND="$PRINT_SCRIPT $CONTAINER $CERTIFICATE"
 readonly STAND_IN_IMAGE=ghcr.io/the-secure-video-call/secure-call-backend:main
 readonly TEST_CA_IN_STORE=/usr/local/share/ca-certificates/secure-call-ci-test-ca.crt
 readonly UNIT=secure-call-turn-certificate.service
+readonly FORCED_COMMAND="LC_ALL=C sudo -n $PRINT_COMMAND"
 work="$(mktemp -d)"
 live="$work/live"
 failures=0
@@ -98,8 +102,38 @@ ssh_as_the_pi() {
     -o ExitOnForwardFailure=yes -o ConnectTimeout=10 "$@"
 }
 
+# Classic sudo for sudo and visudo: through Ubuntu's alternatives if it has them, otherwise
+# through links in /usr/local, which comes first on PATH and in sudo's secure_path.
+use_classic_sudo() {
+  local name classic
+  if [ ! -x /usr/bin/sudo.ws ] && ! sudo -V 2>/dev/null | grep -q '^Sudo version 1\.'; then
+    sudo apt-get update -qq
+    sudo apt-get install -y -qq sudo >/dev/null
+  fi
+  for name in sudo visudo; do
+    classic="$(update-alternatives --list "$name" 2>/dev/null | grep '\.ws$' | head -n 1 || true)"
+    if [ -n "$classic" ]; then sudo update-alternatives --set "$name" "$classic" >/dev/null; fi
+  done
+  if ! sudo -V 2>/dev/null | grep -q '^Sudo version 1\.' && [ -x /usr/bin/sudo.ws ]; then
+    sudo ln -sfn /usr/bin/sudo.ws /usr/local/bin/sudo
+  fi
+  if ! sudo visudo -V 2>/dev/null | grep -q '^visudo version 1\.' && [ -x /usr/sbin/visudo.ws ]; then
+    sudo ln -sfn /usr/sbin/visudo.ws /usr/local/sbin/visudo
+  fi
+  hash -r
+}
+
 echo "== Setup =="
 start_cursor="$(journal_cursor)"
+use_classic_sudo
+sudo_version="$(sudo -V 2>/dev/null | head -n 1 || true)"
+visudo_version="$(sudo visudo -V 2>/dev/null | head -n 1 || true)"
+if [[ $sudo_version == "Sudo version 1."* && $visudo_version == "visudo version 1."* ]]; then
+  pass "classic sudo, as on the proxy machine: $sudo_version, $visudo_version"
+else
+  echo "Classic sudo is needed; sudo says '$sudo_version', visudo '$visudo_version'."
+  exit 1
+fi
 openssl req -x509 -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
   -subj /CN=secure-call-ci-test-ca -addext basicConstraints=critical,CA:TRUE \
   -addext keyUsage=critical,keyCertSign,cRLSign -keyout "$work/ca.key" -out "$work/ca.crt" \
@@ -149,11 +183,11 @@ sudo chown root:root /var/lib/turn-certificate
 sudo chmod 0755 /var/lib/turn-certificate
 echo "Defaults!$PRINT_SCRIPT !log_output" >"$work/turn-certificate.sudoers"
 echo "turn-certificate ALL=(root) NOPASSWD: $PRINT_COMMAND" >>"$work/turn-certificate.sudoers"
-sudo visudo -cf "$work/turn-certificate.sudoers"
-sudo install -o root -g root -m 0440 "$work/turn-certificate.sudoers" \
-  /etc/sudoers.d/secure-call-turn-certificate
+sudo visudo -cf "$work/turn-certificate.sudoers" \
+  && sudo install -o root -g root -m 0440 "$work/turn-certificate.sudoers" \
+    /etc/sudoers.d/secure-call-turn-certificate
 sudo install -d -o root -g root -m 0755 /var/lib/turn-certificate/.ssh
-forced_line="restrict,from=\"127.0.0.1\",command=\"sudo -n $PRINT_COMMAND\" $public_key"
+forced_line="restrict,from=\"127.0.0.1\",command=\"$FORCED_COMMAND\" $public_key"
 echo "$forced_line" | sudo tee /var/lib/turn-certificate/.ssh/authorized_keys >/dev/null
 sudo tee -a /etc/ssh/sshd_config >/dev/null <<EOF
 
@@ -164,13 +198,14 @@ Match User turn-certificate
     PermitTTY no
     PermitTunnel no
     PermitUserRC no
-    ForceCommand sudo -n $PRINT_COMMAND
+    ForceCommand $FORCED_COMMAND
+Match all
 EOF
 sudo cp /etc/ssh/sshd_config "$work/sshd_config.locked"
 reload_sshd
 effective="$(sudo sshd -T -C user=turn-certificate,host=pi,addr=127.0.0.1)"
 others="$(sudo sshd -T -C "user=$USER,host=pi,addr=127.0.0.1")"
-if grep -qx "forcecommand sudo -n $PRINT_COMMAND" <<<"$effective" \
+if grep -qx "forcecommand $FORCED_COMMAND" <<<"$effective" \
   && grep -qx 'disableforwarding yes' <<<"$effective" && grep -qx 'permittty no' <<<"$effective" \
   && grep -qx 'forcecommand none' <<<"$others"; then
   pass "sshd -T: the Match block applies to turn-certificate only"
@@ -286,22 +321,24 @@ else
   fail "a terminal was not refused: $tty_messages"
 fi
 status=0
-forwarded="$(ssh_as_the_pi -W 127.0.0.1:22 turn-certificate@127.0.0.1 2>/dev/null)" || status=$?
-if [ "$status" = 255 ] && ! grep -q 'SSH-2.0' <<<"$forwarded"; then
+forwarded="$(ssh_as_the_pi -W 127.0.0.1:22 turn-certificate@127.0.0.1 2>"$work/messages")" \
+  || status=$?
+if [ "$status" = 255 ] && ! grep -q 'SSH-2.0' <<<"$forwarded" \
+  && grep -Eq 'stdio forwarding failed|administratively prohibited' "$work/messages"; then
   pass "no connection elsewhere (-W)"
 else
-  fail "-W through the proxy: exit status $status"
+  fail "-W through the proxy: exit status $status, $(tr '\n' ' ' <"$work/messages")"
 fi
 # Accepted, -N would wait until timeout ends it (124); refused, ssh exits at once (255).
 status=0
 timeout 20 sudo ssh -F none -n -N -o BatchMode=yes -o IdentitiesOnly=yes \
   -i "$CONFIG_DIR/id_ed25519" -o UserKnownHostsFile="$CONFIG_DIR/known_hosts" \
   -o StrictHostKeyChecking=yes -o ExitOnForwardFailure=yes -R 127.0.0.1:40998:127.0.0.1:22 \
-  turn-certificate@127.0.0.1 2>/dev/null || status=$?
-if [ "$status" = 255 ]; then
+  turn-certificate@127.0.0.1 2>"$work/messages" || status=$?
+if [ "$status" = 255 ] && grep -q 'remote port forwarding failed' "$work/messages"; then
   pass "no forwarded port (-R)"
 else
-  fail "-R through the proxy: exit status $status"
+  fail "-R through the proxy: exit status $status, $(tr '\n' ' ' <"$work/messages")"
 fi
 print_command=("$PRINT_SCRIPT" "$CONTAINER" "$CERTIFICATE")
 allowed_first_line=""
@@ -310,9 +347,13 @@ if sudo -u turn-certificate sudo -n "${print_command[@]}" >"$work/allowed"; then
   allowed_first_line="$(head -n 1 "$work/allowed")"
 fi
 rm -f "$work/allowed"
-if sudo -u turn-certificate sudo -n "$PRINT_SCRIPT" "$CONTAINER" npm-31 >/dev/null 2>&1 \
-  || sudo -u turn-certificate sudo -n /bin/sh -c id >/dev/null 2>&1; then
-  fail "sudo ran something other than the one command for turn-certificate"
+# sudo -l asks sudo itself whether a command line is allowed, without running it.
+if sudo -u turn-certificate sudo -n -l "$PRINT_SCRIPT" "$CONTAINER" npm-31 >/dev/null 2>&1 \
+  || sudo -u turn-certificate sudo -n -l "$PRINT_SCRIPT" >/dev/null 2>&1 \
+  || sudo -u turn-certificate sudo -n -l /bin/sh >/dev/null 2>&1; then
+  fail "sudo allows turn-certificate something other than the one command line"
+elif ! sudo -u turn-certificate sudo -n -l "${print_command[@]}" >/dev/null 2>&1; then
+  fail "sudo does not allow turn-certificate the one command line"
 elif [ "$allowed_first_line" = '-----BEGIN CERTIFICATE-----' ]; then
   pass "sudo runs exactly the one command line for turn-certificate"
 else
@@ -323,13 +364,15 @@ echo "== Nothing leaked or left behind =="
 sudo journalctl --sync
 # shellcheck disable=SC2024 # the runner's own user writes its own file
 sudo journalctl --no-pager -q -o cat --after-cursor "$start_cursor" >"$work/whole-journal"
+leaked=0
 for name in first renewed wrong-name; do
   sed '1d;$d' "$work/$name.key" >"$work/$name.key-lines"
   if grep -qF -f "$work/$name.key-lines" "$work/whole-journal"; then
     fail "a line of the $name key is in the journal"
+    leaked=1
   fi
 done
-pass "no key line anywhere in the journal since the setup"
+if [ "$leaked" = 0 ]; then pass "no key line anywhere in the journal since the setup"; fi
 if [ -e /run/secure-call-turn-certificate ]; then
   fail "/run/secure-call-turn-certificate is still there after the runs"
 else
