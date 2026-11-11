@@ -19,8 +19,9 @@ readonly SECRETS_DIR="$DEPLOY_DIR/secrets"
 readonly COTURN_UID=65534       # compose.yaml: user: '65534:65534'
 readonly BACKEND_IMAGE_UID=10001  # Dockerfile: useradd --uid 10001
 # Base64 (openssl rand -base64 32 gives 44 characters): nothing coturn's config parser or the
-# backend's one-line file could misread, such as spaces, quotes or "#".
-readonly SECRET_PATTERN='^[A-Za-z0-9+/=_-]{32,}$'
+# backend's one-line file could misread, such as spaces, quotes or "#"; no leading "=" (coturn's
+# parser would drop it, the backend not) and at most 256 characters (coturn reads lines in parts).
+readonly SECRET_PATTERN='^[A-Za-z0-9+/_-][A-Za-z0-9+/=_-]{31,255}$'
 
 mode="${1:-new}"
 case "$mode" in

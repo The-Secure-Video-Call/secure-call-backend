@@ -316,7 +316,8 @@ backend image" run (not even a Dependabot one):
    python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # a new password
    nano .env            # add POSTGRES_APP_PASSWORD=<it>, different from POSTGRES_PASSWORD
    ./make-local-certs.sh                       # asks for sudo once
-   ./make-turn-secret.sh --from-env            # the TURN secret from .env into secrets/
+   ./make-turn-secret.sh                       # a NEW TURN secret, into secrets/ (the old one
+                                               # was visible in ps and docker inspect)
    # The TURN certificate (deploy/raspberry-pi/README.md, TURN step 3b), and the router
    # forward of 5349/tcp to this Pi. Then:
    docker compose down --volumes               # pgdata, which holds nothing, is the only volume
@@ -341,12 +342,17 @@ backend image" run (not even a Dependabot one):
    curl https://signal.securevideocall.com/healthz     # {"status": "ok"}
    # On the proxy machine: the three proxy_ssl lines are in the host's config (setup step 4).
    ```
-   Then delete the `TURN_SHARED_SECRET` line from `.env` (nothing reads it any more), add
-   `turns:turn.securevideocall.com:5349?transport=tcp` to `TURN_URLS` there, and run
-   `docker compose up -d backend`. A call should now get a relay over TLS too
-   (deploy/raspberry-pi/README.md, TURN step 5):
+   Then delete the `TURN_SHARED_SECRET` line from `.env` (nothing reads it any more), and in
+   `TURN_URLS` there replace `turn:turn.securevideocall.com:3478?transport=tcp` with
+   `turns:turn.securevideocall.com:5349?transport=tcp`, then run `docker compose up -d
+   backend`. A call should now get a relay over TLS too (deploy/raspberry-pi/README.md, TURN
+   step 5), and the secret must be nowhere to be seen:
    ```sh
    docker compose ps    # coturn running
+   # Prints nothing: the secret is in no process's arguments and in neither container's settings.
+   { ps -eo args; docker inspect secure-call-coturn secure-call-backend; } \
+     | grep -F -f <(sudo cat secrets/turn-shared-secret)
+   stat -c %a .env      # 600
    ```
    and make a test call.
 

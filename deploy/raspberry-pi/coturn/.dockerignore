@@ -1,0 +1,2 @@
+# The TURN certificate and key (install-turn-certificate.sh) never go into an image.
+tls/

@@ -4,15 +4,18 @@
 #   ./coturn/install-turn-certificate.sh FULLCHAIN.pem PRIVKEY.pem
 #
 # for example the files of the Let's Encrypt certificate for turn.securevideocall.com that Nginx
-# Proxy Manager keeps renewed (README.md, "TURN over TLS"). Browsers check this certificate, so it
-# must be publicly trusted. Nothing is installed unless all of these hold:
+# Proxy Manager keeps renewed (README.md, TURN step 3b). Browsers check this certificate, so it
+# must be publicly trusted. The two files are first copied into a private temporary folder, and
+# only those copies are checked and installed. Nothing is installed unless all of these hold:
+#   - FULLCHAIN.pem holds certificates only (no key or anything else that would become readable);
 #   - the certificate names turn.securevideocall.com;
 #   - it chains to a CA this machine trusts (the system's CA store) and is for TLS servers;
 #   - it is valid for at least 7 more days;
-#   - the private key belongs to it.
+#   - PRIVKEY.pem is an unencrypted private key that belongs to it.
 # Then it goes to coturn/tls/ (fullchain.pem mode 444; privkey.pem owned by coturn's user 65534,
-# mode 400, which needs sudo), and coturn is restarted if the certificate changed: coturn reads it
-# only at start. A restart drops the relays of calls in progress, so do this at a quiet time.
+# mode 400, which needs sudo), and a running coturn is told to reload it (SIGUSR2): coturn keeps
+# its relays, so calls in progress are not dropped, and keeps the old certificate if the new one
+# cannot be loaded.
 set -euo pipefail
 
 readonly TURN_HOST_NAME=turn.securevideocall.com
@@ -20,8 +23,9 @@ readonly COTURN_UID=65534          # compose.yaml: user: '65534:65534'
 readonly MIN_VALID_SECONDS=$((7 * 24 * 60 * 60))
 readonly COTURN_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly TLS_DIR="$COTURN_DIR/tls"
-# Only for tests: a CA file to trust instead of the system's CA store.
-readonly CA_FILE="${TURN_CERTIFICATE_TEST_CA_FILE:-}"
+readonly COMPOSE_FILE="$COTURN_DIR/../compose.yaml"
+# Only for tests: one more CA to trust, on top of the system's CA store.
+readonly TEST_CA_FILE="${TURN_CERTIFICATE_TEST_CA_FILE:-}"
 
 refuse() {
   echo "install-turn-certificate.sh: $1 Nothing was installed." >&2
@@ -32,18 +36,29 @@ if [ "$#" -ne 2 ]; then
   echo "Usage: $0 FULLCHAIN.pem PRIVKEY.pem" >&2
   exit 2
 fi
-fullchain="$1"
-private_key="$2"
-[ -r "$fullchain" ] || refuse "cannot read $fullchain."
-[ -r "$private_key" ] || refuse "cannot read $private_key."
+if [ -n "$TEST_CA_FILE" ]; then
+  echo "install-turn-certificate.sh: WARNING: also trusting $TEST_CA_FILE" \
+    "(TURN_CERTIFICATE_TEST_CA_FILE is for tests only)." >&2
+fi
 
 umask 077
-work_dir="$(mktemp -d)"
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+  work_dir="$(mktemp -d -p /dev/shm)"
+else
+  work_dir="$(mktemp -d)"
+fi
 trap 'rm -rf "$work_dir"' EXIT
+cp -- "$1" "$work_dir/fullchain.pem" 2>/dev/null || refuse "cannot read $1."
+cp -- "$2" "$work_dir/privkey.pem" 2>/dev/null || refuse "cannot read $2."
+fullchain="$work_dir/fullchain.pem"
+private_key="$work_dir/privkey.pem"
+
+if grep -E '^-----BEGIN ' "$fullchain" | grep -qvx -- '-----BEGIN CERTIFICATE-----'; then
+  refuse "$1 holds something other than certificates."
+fi
 # The first certificate in the file is the server's own; the rest are intermediates.
 openssl x509 -in "$fullchain" -out "$work_dir/leaf.pem" 2>/dev/null \
-  || refuse "$fullchain holds no certificate."
-
+  || refuse "$1 holds no certificate."
 if ! openssl x509 -in "$work_dir/leaf.pem" -noout -checkhost "$TURN_HOST_NAME" \
   | grep -q 'does match certificate'; then
   refuse "the certificate does not name $TURN_HOST_NAME."
@@ -52,20 +67,27 @@ if ! openssl x509 -in "$work_dir/leaf.pem" -noout -checkend "$MIN_VALID_SECONDS"
   refuse "the certificate expires within 7 days (or already has)."
 fi
 trust=()
-if [ -n "$CA_FILE" ]; then trust=(-CAfile "$CA_FILE"); fi
+if [ -n "$TEST_CA_FILE" ]; then trust=(-CAfile "$TEST_CA_FILE"); fi
 if ! openssl verify ${trust[@]+"${trust[@]}"} -purpose sslserver -untrusted "$fullchain" \
   "$work_dir/leaf.pem" >/dev/null 2>&1; then
   refuse "the certificate does not chain to a trusted CA for TLS servers."
 fi
 certificate_public_key="$(openssl x509 -in "$work_dir/leaf.pem" -noout -pubkey \
   | openssl pkey -pubin -outform DER | openssl dgst -sha256)"
-private_key_public_key="$(openssl pkey -in "$private_key" -pubout -outform DER 2>/dev/null \
-  | openssl dgst -sha256)" || refuse "$private_key is not a private key."
+# -passin pass: makes an encrypted key fail here instead of prompting (coturn could not load it).
+private_key_public_key="$(openssl pkey -in "$private_key" -passin pass: -pubout -outform DER \
+  2>/dev/null | openssl dgst -sha256)" || refuse "$2 is not an unencrypted private key."
 [ "$certificate_public_key" = "$private_key_public_key" ] \
   || refuse "the private key does not belong to the certificate."
 
-if [ -f "$TLS_DIR/fullchain.pem" ] && cmp -s "$fullchain" "$TLS_DIR/fullchain.pem"; then
-  echo "The certificate is already installed; coturn was not restarted."
+# Whether coturn runs decides the reload below; an error from Docker must not pass for "no".
+if ! running_services="$(docker compose -f "$COMPOSE_FILE" ps --status running --services)"; then
+  refuse "cannot ask Docker whether coturn runs (see the error above)."
+fi
+
+if [ -f "$TLS_DIR/fullchain.pem" ] && [ -e "$TLS_DIR/privkey.pem" ] \
+  && cmp -s "$fullchain" "$TLS_DIR/fullchain.pem"; then
+  echo "The certificate is already installed; coturn was not told to reload."
   exit 0
 fi
 
@@ -79,10 +101,9 @@ install -m 444 "$fullchain" "$TLS_DIR/fullchain.pem"
 echo "Installed the certificate for $TURN_HOST_NAME, valid until" \
   "$(openssl x509 -in "$work_dir/leaf.pem" -noout -enddate | cut -d= -f2)."
 
-if docker compose -f "$COTURN_DIR/../compose.yaml" ps --status running --services 2>/dev/null \
-  | grep -qx coturn; then
-  docker compose -f "$COTURN_DIR/../compose.yaml" restart coturn
-  echo "Restarted coturn."
+if grep -qx coturn <<<"$running_services"; then
+  docker compose -f "$COMPOSE_FILE" kill -s SIGUSR2 coturn
+  echo "Told coturn to reload its certificate (calls in progress keep their relays)."
 else
   echo "coturn is not running; it uses the certificate when it starts."
 fi

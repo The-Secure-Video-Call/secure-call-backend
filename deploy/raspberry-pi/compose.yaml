@@ -205,7 +205,8 @@ services:
     networks:
       turn:
         ipv4_address: 172.30.200.2
-    # Published on the Pi's LAN address only, never on 0.0.0.0. The router forwards stay the same.
+    # Published on the Pi's LAN address only, never on 0.0.0.0; the router forwards these to the
+    # Pi (README.md, TURN step 2).
     ports:
       - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:3478:3478/udp'
       - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:3478:3478/tcp'
@@ -248,7 +249,10 @@ services:
       - sh
       - -c
       - >-
-        umask 077 && { cat /etc/coturn/turnserver.conf && echo &&
+        umask 077 && [ -s /run/secrets/turn-static-auth-secret.conf ] &&
+        grep -q "^static-auth-secret=[A-Za-z0-9+/_-]" /run/secrets/turn-static-auth-secret.conf ||
+        { echo "coturn: the TURN secret file is missing or malformed" >&2; exit 1; };
+        { cat /etc/coturn/turnserver.conf && echo &&
         cat /run/secrets/turn-static-auth-secret.conf; } > /run/coturn/turnserver.conf &&
         exec turnserver -c /run/coturn/turnserver.conf "$$@"
       - coturn-start

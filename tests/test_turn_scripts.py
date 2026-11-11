@@ -26,7 +26,11 @@ exec "${args[@]}"
 """
 FAKE_DOCKER = """#!/usr/bin/env bash
 echo "docker $*" >>"$FAKE_LOG"
-case "$*" in *" ps "*) [ -n "${FAKE_COTURN_RUNNING:-}" ] && echo coturn ;; esac
+case "$*" in
+  *" ps "*)
+    if [ -n "${FAKE_DOCKER_PS_FAILS:-}" ]; then echo "permission denied" >&2; exit 1; fi
+    if [ -n "${FAKE_COTURN_RUNNING:-}" ]; then echo coturn; fi ;;
+esac
 exit 0
 """
 
@@ -52,7 +56,11 @@ def tool_path(tmp_path: Path) -> tuple[dict[str, str], Path]:
     log = tmp_path / "calls.log"
     log.touch()
     env = {
-        **{k: v for k, v in os.environ.items() if k not in ("FAKE_COTURN_RUNNING",)},
+        **{
+            k: v
+            for k, v in os.environ.items()
+            if k not in ("FAKE_COTURN_RUNNING", "FAKE_DOCKER_PS_FAILS")
+        },
         "PATH": f"{bin_dir}:{openssl_dir}:/usr/bin:/bin",
         "FAKE_LOG": str(log),
     }
@@ -125,6 +133,8 @@ def test_from_env_moves_the_existing_secret(tmp_path: Path) -> None:
         "TURN_SHARED_SECRET=short",
         "TURN_SHARED_SECRET=has spaces in it but is long enough to pass the length",
         "TURN_SHARED_SECRET=hash#sign-would-start-a-comment-in-coturns-config",
+        "TURN_SHARED_SECRET==leading-equals-sign-that-coturns-parser-would-drop-here",
+        "TURN_SHARED_SECRET=" + "a" * 257,
         "OTHER=no turn secret here at all",
     ],
 )
@@ -194,7 +204,13 @@ def make_certificate(
 
 
 def run_install_script(
-    tmp_path: Path, fullchain: Path, key: Path, ca_certificate: Path | None, *, running: bool = True
+    tmp_path: Path,
+    fullchain: Path,
+    key: Path,
+    ca_certificate: Path | None,
+    *,
+    running: bool = True,
+    docker_ps_fails: bool = False,
 ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
     coturn_copy = tmp_path / "pi/coturn"
     coturn_copy.mkdir(parents=True, exist_ok=True)
@@ -204,6 +220,8 @@ def run_install_script(
         env["TURN_CERTIFICATE_TEST_CA_FILE"] = str(ca_certificate)
     if running:
         env["FAKE_COTURN_RUNNING"] = "1"
+    if docker_ps_fails:
+        env["FAKE_DOCKER_PS_FAILS"] = "1"
     log.write_text("")
     result = subprocess.run(  # noqa: S603 - fixed script, no user input
         ["/bin/bash", str(coturn_copy / "install-turn-certificate.sh"), str(fullchain), str(key)],
@@ -229,12 +247,13 @@ def test_valid_certificate_is_installed_and_coturn_restarted_once(
     assert stat.S_IMODE((tls / "privkey.pem").stat().st_mode) == 0o400
     assert stat.S_IMODE((tls / "fullchain.pem").stat().st_mode) == 0o444
     assert "sudo install -m 400 -o 65534 -g 65534" in calls
-    assert re.search(r"docker compose -f \S+/compose\.yaml restart coturn", calls)
+    assert re.search(r"docker compose -f \S+/compose\.yaml kill -s SIGUSR2 coturn", calls)
+    assert "restart" not in calls  # a reload keeps the relays of calls in progress
 
     again, _, calls_again = run_install_script(tmp_path, fullchain, key, test_ca[1])
     assert again.returncode == 0
     assert "already installed" in again.stdout
-    assert "restart" not in calls_again
+    assert "kill" not in calls_again
 
 
 def test_coturn_not_running_is_not_started(tmp_path: Path, test_ca: tuple[Path, Path]) -> None:
@@ -243,7 +262,7 @@ def test_coturn_not_running_is_not_started(tmp_path: Path, test_ca: tuple[Path, 
 
     assert result.returncode == 0, result.stderr
     assert (tls / "fullchain.pem").exists()
-    assert "restart" not in calls
+    assert "kill" not in calls
 
 
 def test_negative_wrong_certificates_install_nothing(
@@ -261,7 +280,7 @@ def test_negative_wrong_certificates_install_nothing(
         (good_fullchain, other_key, test_ca[1], "does not belong"),
         (good_fullchain, good_key, other_ca[1], "does not chain"),
         (good_fullchain, good_key, None, "does not chain"),  # the system CAs don't know our CA
-        (good_key, good_key, test_ca[1], "holds no certificate"),
+        (good_key, good_key, test_ca[1], "holds something other than certificates"),
     ]
     for case_number, (fullchain, key, ca_certificate, message) in enumerate(cases):
         case_dir = tmp_path / f"case-{case_number}"
@@ -273,3 +292,51 @@ def test_negative_wrong_certificates_install_nothing(
         assert not tls.exists(), message
         assert "docker" not in calls, message
         assert "install" not in calls, message
+
+
+def test_negative_a_chain_file_with_a_key_or_an_encrypted_key_installs_nothing(
+    tmp_path: Path, test_ca: tuple[Path, Path]
+) -> None:
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    chain_with_key = tmp_path / "chain-with-key.pem"
+    chain_with_key.write_text(fullchain.read_text() + key.read_text())
+    encrypted_key = tmp_path / "encrypted.key"
+    subprocess.run(  # noqa: S603 - fixed command, no user input
+        [openssl_3(), "pkey", "-in", str(key), "-aes256", "-passout", "pass:not-empty",
+         "-out", str(encrypted_key)],
+        check=True, capture_output=True,
+    )  # fmt: skip
+    cases = [
+        (chain_with_key, key, "holds something other than certificates"),
+        (fullchain, encrypted_key, "is not an unencrypted private key"),
+    ]
+    for case_number, (chain, private_key, message) in enumerate(cases):
+        result, tls, calls = run_install_script(
+            tmp_path / f"case-{case_number}", chain, private_key, test_ca[1]
+        )
+
+        assert result.returncode == 1, message
+        assert message in result.stderr
+        assert not tls.exists()
+        assert "install" not in calls
+
+
+def test_negative_docker_unreachable_installs_nothing(
+    tmp_path: Path, test_ca: tuple[Path, Path]
+) -> None:
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    result, tls, calls = run_install_script(
+        tmp_path, fullchain, key, test_ca[1], docker_ps_fails=True
+    )
+
+    assert result.returncode == 1
+    assert "cannot ask Docker whether coturn runs" in result.stderr
+    assert not tls.exists()
+    assert "kill" not in calls
+
+
+def test_the_test_ca_override_is_announced(tmp_path: Path, test_ca: tuple[Path, Path]) -> None:
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    result, _, _ = run_install_script(tmp_path, fullchain, key, test_ca[1])
+
+    assert "WARNING: also trusting" in result.stderr

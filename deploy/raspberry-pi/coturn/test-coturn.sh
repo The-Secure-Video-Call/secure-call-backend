@@ -31,7 +31,7 @@ turn_host_name="turn.securevideocall.com"
 # Extra turnutils_uclient arguments; the TLS group sets them to -t -S -p 5349.
 uclient_transport_args=()
 
-cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; docker network rm "$network_name" >/dev/null 2>&1; rm -f "$usernames_file" "$failed_login_usernames_file" "$peers_file" "$denied_ranges_file"; if [ -n "$test_files_dir" ]; then rm -rf "$test_files_dir"; fi; }
+cleanup() { docker rm -f "$container_name" >/dev/null 2>&1; docker network rm "$network_name" >/dev/null 2>&1; rm -f "$usernames_file" "$failed_login_usernames_file" "$peers_file" "$denied_ranges_file"; if [ -n "$test_files_dir" ]; then rm -rf "$test_files_dir" 2>/dev/null || ${as_root_if_possible[@]+"${as_root_if_possible[@]}"} rm -rf "$test_files_dir"; fi; }
 trap cleanup EXIT
 
 # $1 = seconds until the credential expires (negative = already expired). Prints
@@ -221,30 +221,58 @@ printf '%s\n' "$host_lan_ip" "$gateway_ip" >>"$peers_file"
 # Test stand-ins for what compose.yaml mounts on the Pi: a TLS certificate for the TURN host name
 # from a throwaway CA (the Pi uses the publicly trusted one, coturn/install-turn-certificate.sh),
 # and the "static-auth-secret=..." file (make-turn-secret.sh). On the Pi the key and the secret
-# file are owned by coturn's user with mode 400; this test runs without root, so they are 0444.
+# file are owned by coturn's user with mode 400. With passwordless sudo (as on GitHub's runners)
+# the test does the same; otherwise the files are 0444 (a NOTE says so).
+# The chain is root, intermediate, leaf, as Let's Encrypt's, so the test also shows that coturn
+# serves the intermediate (clients trust only the root).
 test_files_dir="$(mktemp -d)"
-mkdir -p "$test_files_dir/tls"
+mkdir -p "$test_files_dir/tls" "$test_files_dir/make"
+if sudo -n true 2>/dev/null; then as_root_if_possible=(sudo -n); else as_root_if_possible=(); fi
+# $1 source, $2 destination, $3 mode for coturn's own files (owner 65534 when sudo works).
+put_coturn_file() {
+  if [ "${#as_root_if_possible[@]}" -gt 0 ]; then
+    "${as_root_if_possible[@]}" install -m "$3" -o 65534 -g 65534 "$1" "$2"
+  else
+    install -m 0444 "$1" "$2"
+  fi
+}
 test_ec_key=(-newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes)
-openssl req -x509 "${test_ec_key[@]}" -keyout "$test_files_dir/ca.key" -subj "/CN=coturn test CA" \
+# $1 name, $2 serial: a key and a leaf for the TURN host name, signed by the intermediate.
+make_test_leaf() {
+  openssl req "${test_ec_key[@]}" -keyout "$test_files_dir/make/$1.key" -subj "/CN=$turn_host_name" \
+    -out "$test_files_dir/make/$1.csr" 2>/dev/null \
+  && printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
+    'extendedKeyUsage=serverAuth' "subjectAltName=DNS:$turn_host_name" >"$test_files_dir/make/leaf.ext" \
+  && openssl x509 -req -in "$test_files_dir/make/$1.csr" -CA "$test_files_dir/make/intermediate.crt" \
+    -CAkey "$test_files_dir/make/intermediate.key" -set_serial "$2" -days 1 \
+    -extfile "$test_files_dir/make/leaf.ext" -out "$test_files_dir/make/$1.crt" 2>/dev/null \
+  && cat "$test_files_dir/make/$1.crt" "$test_files_dir/make/intermediate.crt" \
+    >"$test_files_dir/make/$1.fullchain.pem"
+}
+openssl req -x509 "${test_ec_key[@]}" -keyout "$test_files_dir/make/ca.key" -subj "/CN=coturn test CA" \
   -days 1 -addext 'basicConstraints=critical,CA:TRUE' -addext 'keyUsage=critical,keyCertSign,cRLSign' \
   -out "$test_files_dir/ca.crt" 2>/dev/null \
-  && openssl req "${test_ec_key[@]}" -keyout "$test_files_dir/tls/privkey.pem" -subj "/CN=$turn_host_name" \
-    -out "$test_files_dir/leaf.csr" 2>/dev/null \
-  && printf '%s\n' 'basicConstraints=critical,CA:FALSE' 'keyUsage=critical,digitalSignature' \
-    'extendedKeyUsage=serverAuth' "subjectAltName=DNS:$turn_host_name" >"$test_files_dir/leaf.ext" \
-  && openssl x509 -req -in "$test_files_dir/leaf.csr" -CA "$test_files_dir/ca.crt" \
-    -CAkey "$test_files_dir/ca.key" -set_serial 1 -days 1 -extfile "$test_files_dir/leaf.ext" \
-    -out "$test_files_dir/leaf.crt" 2>/dev/null \
-  && cat "$test_files_dir/leaf.crt" "$test_files_dir/ca.crt" >"$test_files_dir/tls/fullchain.pem" \
+  && openssl req "${test_ec_key[@]}" -keyout "$test_files_dir/make/intermediate.key" \
+    -subj "/CN=coturn test intermediate" -out "$test_files_dir/make/intermediate.csr" 2>/dev/null \
+  && printf '%s\n' 'basicConstraints=critical,CA:TRUE,pathlen:0' 'keyUsage=critical,keyCertSign,cRLSign' \
+    >"$test_files_dir/make/intermediate.ext" \
+  && openssl x509 -req -in "$test_files_dir/make/intermediate.csr" -CA "$test_files_dir/ca.crt" \
+    -CAkey "$test_files_dir/make/ca.key" -set_serial 100 -days 1 \
+    -extfile "$test_files_dir/make/intermediate.ext" -out "$test_files_dir/make/intermediate.crt" 2>/dev/null \
+  && make_test_leaf first 1 \
   || { echo "FAIL: could not make the test TLS certificate"; exit 1; }
-printf 'static-auth-secret=%s\n' "$test_secret" >"$test_files_dir/turn-static-auth-secret.conf"
+printf 'static-auth-secret=%s\n' "$test_secret" >"$test_files_dir/make/secret.conf"
 chmod 0755 "$test_files_dir/tls"
-chmod 0444 "$test_files_dir/tls/fullchain.pem" "$test_files_dir/tls/privkey.pem" \
-  "$test_files_dir/turn-static-auth-secret.conf"
+install -m 0444 "$test_files_dir/make/first.fullchain.pem" "$test_files_dir/tls/fullchain.pem"
+put_coturn_file "$test_files_dir/make/first.key" "$test_files_dir/tls/privkey.pem" 0400
+put_coturn_file "$test_files_dir/make/secret.conf" "$test_files_dir/turn-static-auth-secret.conf" 0400
+if [ "${#as_root_if_possible[@]}" -eq 0 ]; then
+  echo "NOTE: no passwordless sudo: the test key and secret file are 0444, not 0400 owned by 65534"
+fi
 # How compose.yaml starts coturn (tests/test_compose_hardening.py keeps the two identical): the
 # secret is joined to the config in memory, readable by coturn's user only, and turnserver
 # becomes pid 1 with no secret on its command line.
-coturn_start_script='umask 077 && { cat /etc/coturn/turnserver.conf && echo && cat /run/secrets/turn-static-auth-secret.conf; } > /run/coturn/turnserver.conf && exec turnserver -c /run/coturn/turnserver.conf "$@"'
+coturn_start_script='umask 077 && [ -s /run/secrets/turn-static-auth-secret.conf ] && grep -q "^static-auth-secret=[A-Za-z0-9+/_-]" /run/secrets/turn-static-auth-secret.conf || { echo "coturn: the TURN secret file is missing or malformed" >&2; exit 1; }; { cat /etc/coturn/turnserver.conf && echo && cat /run/secrets/turn-static-auth-secret.conf; } > /run/coturn/turnserver.conf && exec turnserver -c /run/coturn/turnserver.conf "$@"'
 echo "== Build the derived image (coturn/Dockerfile) =="
 docker build -q -t "$image" "$here" || { echo "FAIL: docker build"; exit 1; }
 docker network create --driver bridge --subnet "$network_subnet" --gateway "$gateway_ip" "$network_name" >/dev/null \
@@ -324,10 +352,14 @@ fi
 # and environment nor `docker inspect` contains it. The config that holds it is in memory, mode
 # 600, owned by coturn's user. (That coturn uses it is shown by the valid logins below.)
 pid1_command_line="$(docker exec -u 0 "$container_name" sh -c 'tr "\000" " " </proc/1/cmdline' 2>&1)"
-secret_places="$(printf '%s\n' "$pid1_command_line"; docker exec -u 0 "$container_name" sh -c 'tr "\000" "\n" </proc/1/environ' 2>&1; docker inspect "$container_name" 2>&1)"
+pid1_environment="$(docker exec -u 65534:65534 "$container_name" sh -c 'tr "\000" "\n" </proc/1/environ' 2>&1)"
+secret_places="$(printf '%s\n' "$pid1_command_line" "$pid1_environment"; docker inspect "$container_name" 2>&1)"
 secret_config_owner="$(docker exec -u 0 "$container_name" stat -c '%a %u' /run/coturn/turnserver.conf 2>&1)"
 if grep -Fq -- "$test_secret" <<<"$secret_places"; then
   echo "FAIL: the TURN secret appears on pid 1's command line, in its environment or in docker inspect"
+  failures=$((failures + 1))
+elif ! grep -q '^PATH=' <<<"$pid1_environment"; then
+  echo "FAIL: could not read turnserver's environment to check it for the secret"
   failures=$((failures + 1))
 elif ! grep -Eq '^turnserver -c /run/coturn/turnserver\.conf ' <<<"$pid1_command_line"; then
   echo "FAIL: turnserver does not run with the config made in memory (/run/coturn/turnserver.conf)"
@@ -534,7 +566,9 @@ for tls_version in -tls1_3 -tls1_2; do
   fi
 done
 # Each must fail: TLS 1.1 (the client allows it here, so the server must refuse), a TLS 1.2
-# cipher without forward secrecy or AEAD, and a certificate check for another host name.
+# cipher without AEAD, and a certificate check for another host name. (Key exchange without
+# ECDHE is impossible with an ECDSA certificate; the exact cipher-list check below covers RSA
+# certificates.) -CAfile is the root only, so a success also shows coturn sends the intermediate.
 while IFS='|' read -r tls_label tls_arguments; do
   # shellcheck disable=SC2086 # the arguments are fixed words, split on purpose
   tls_output="$(tls_handshake $tls_arguments)"
@@ -546,13 +580,38 @@ while IFS='|' read -r tls_label tls_arguments; do
 done <<EOF
 TLS 1.1|-tls1_1 -cipher DEFAULT:@SECLEVEL=0 -verify_hostname $turn_host_name
 TLS 1.2 with AES-CBC and SHA-1 (no AEAD)|-tls1_2 -cipher ECDHE-ECDSA-AES128-SHA -verify_hostname $turn_host_name
-TLS 1.2 without ECDHE (no forward secrecy)|-tls1_2 -cipher AES128-GCM-SHA256 -verify_hostname $turn_host_name
 a certificate check for another host name|-verify_hostname not-the-turn-host.example
 EOF
 uclient_transport_args=(-t -S -p 5349)
 expect "valid credential allocates over TLS" bound "$(run_client 600 "$public_peer")"
 expect "wrong credential refused over TLS" no_allocation "$(run_client 600 "$public_peer" "wrong-password")"
 uclient_transport_args=()
+served_serial() {
+  timeout 10 openssl s_client -connect "$container_ip:5349" -servername "$turn_host_name" </dev/null 2>/dev/null \
+    | openssl x509 -noout -serial 2>/dev/null
+}
+serial_before="$(served_serial)"
+started_before="$(docker inspect -f '{{.State.StartedAt}}' "$container_name")"
+log_lines_before="$(docker logs "$container_name" 2>&1 | wc -l)"
+make_test_leaf second 2 \
+  && install -m 0444 "$test_files_dir/make/second.fullchain.pem" "$test_files_dir/tls/fullchain.pem" \
+  && put_coturn_file "$test_files_dir/make/second.key" "$test_files_dir/tls/privkey.pem" 0400 \
+  && docker kill -s USR2 "$container_name" >/dev/null
+sleep 2
+serial_after="$(served_serial)"
+if [ "$serial_before" = "serial=01" ] && [ "$serial_after" = "serial=02" ] \
+  && [ "$(docker inspect -f '{{.State.Running}} {{.State.StartedAt}}' "$container_name")" = "true $started_before" ]; then
+  echo "PASS: on SIGUSR2 coturn serves the new certificate, without a restart"
+else
+  echo "FAIL: certificate reload on SIGUSR2 (before: $serial_before, after: $serial_after)"
+  failures=$((failures + 1))
+fi
+# Lines coturn prints while reloading count as banner lines if they name no user or peer.
+reload_lines="$(docker logs "$container_name" 2>&1 | tail -n +"$((log_lines_before + 1))" | strip_log_prefix)"
+if [ -n "$reload_lines" ] && grep -Fwq -f "$usernames_file" -f "$peers_file" <<<"$reload_lines"; then
+  echo "FAIL: coturn named a user or peer while reloading its certificate"; failures=$((failures + 1))
+fi
+startup_banner="$(printf '%s\n%s\n' "$startup_banner" "$reload_lines" | grep -v '^$' | sort -u)"
 
 # Refresh-after-expiry probe (asserted against expected_refresh_after_expiry below, see README.md):
 # allocate with a credential that expires 5 s later, wait 25 s (longer than the test-only
@@ -701,11 +760,13 @@ fi
 # whitelisted peers, mobility, server relay and multiplexed peers are all opt-in in 4.18
 # (mainrelay.c defaults), so the absence of these words is what keeps them off. TLS is on (#58),
 # with exactly the settings below.
-opt_in_options='verbose|Verbose|syslog|log-binding|dtls|cli|web-admin|prometheus|rfc5780|allow-loopback-peers|allowed-peer-ip|mobility|server-relay|multiplex-peer'
-tls_settings="$(grep -E '^[[:space:]]*(tls-listening-port|alt-tls-listening-port|cert|pkey|pkey-pwd|no-tlsv1|no-tlsv1_1|no-tlsv1_2|no-tls|cipher-list|dh-file|ec-curve-name|ca-file)([=[:space:]]|$)' "$here/turnserver.conf" | sort)"
+opt_in_options='verbose|Verbose|syslog|log-binding|dtls|cli|web-admin|prometheus|rfc5780|allow-loopback-peers|allowed-peer-ip|mobility|server-relay|multiplex-peer|tlsv1|tlsv1_1|raw-public-keys'
+# TLS is configured in turnserver.conf only, never on compose's command line.
+tls_command_line_options='tls-listening-port|alt-tls-listening-port|cert|pkey|pkey-pwd|cipher-list|CA-file|dh-file|ec-curve-name|no-tlsv1_2|no-tls'
+tls_settings="$(grep -E '^[[:space:]]*(tls-listening-port|alt-tls-listening-port|cert|pkey|pkey-pwd|no-tlsv1|no-tlsv1_1|no-tlsv1_2|tlsv1|tlsv1_1|raw-public-keys|no-tls|cipher-list|dh-file|ec-curve-name|CA-file)([=[:space:]]|$)' "$here/turnserver.conf" | sort)"
 expected_tls_settings="$(printf '%s\n' 'tls-listening-port=5349' 'cert=/etc/coturn/tls/fullchain.pem' \
   'pkey=/etc/coturn/tls/privkey.pem' \
-  'cipher-list="ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"' | sort)"
+  'cipher-list="ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256"' | sort)"
 if [ "$tls_settings" = "$expected_tls_settings" ]; then
   echo "PASS: turnserver.conf has exactly the expected TLS settings (5349, the mounted certificate, TLS 1.2+, AEAD ciphers)"
 else
@@ -717,7 +778,7 @@ if grep -Ev '^[[:space:]]*#' "$here/turnserver.conf" \
   | grep -Eq "^[[:space:]]*($opt_in_options)([[:space:]]|=|\$)"; then
   echo "FAIL: turnserver.conf enables an option that must stay off"; failures=$((failures + 1))
 elif grep -Ev '^[[:space:]]*#' "$here/../compose.yaml" \
-  | grep -Eq -- "--($opt_in_options)(['\"=[:space:]]|\$)|'-v'|'-V'"; then
+  | grep -Eq -- "--($opt_in_options|$tls_command_line_options)(['\"=[:space:]]|\$)|'-v'|'-V'"; then
   echo "FAIL: compose.yaml passes an option that must stay off"; failures=$((failures + 1))
 else
   echo "PASS: no verbose or syslog logging, and no opt-in TLS/DTLS, CLI, web-admin or peer option"

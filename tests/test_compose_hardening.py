@@ -106,7 +106,9 @@ def test_coturn_reads_the_secret_from_a_file_and_serves_tls() -> None:
     coturn = service_block((DEPLOY / "compose.yaml").read_text(), "coturn")
 
     assert missing(coturn, COTURN_REQUIRED) == []
-    assert "static-auth-secret=" not in coturn.replace('"static-auth-secret=..."', "")
+    # No secret value anywhere in the service: only the file path and the check of its format.
+    assert "--static-auth-secret" not in coturn
+    assert not re.search(r"static-auth-secret=[A-Za-z0-9+/=_-]{8,}", coturn)
     assert "TURN_SHARED_SECRET" not in coturn
     assert "env_file:" not in coturn
 

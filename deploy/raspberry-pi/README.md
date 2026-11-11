@@ -158,28 +158,36 @@ Manual steps (owner):
    publicly trusted. Nginx Proxy Manager gets and renews it (port 80 reaches the proxy):
    - In Nginx Proxy Manager: **SSL Certificates → Add SSL Certificate → Let's Encrypt**,
      domain `turn.securevideocall.com` (the A record of step 1).
-   - On the proxy machine, find its folder (`npm-<N>`) and copy the two files out, the key
-     readable by you only:
+   - On this Pi, fetch both files straight from the proxy machine into memory (`/dev/shm`), so
+     the key never lands on either SD card. `<proxy>` is your SSH login on the proxy machine;
+     the first line prints the certificate's `npm-<N>`:
      ```sh
-     docker exec nginx-proxy-manager-app-1 sh -c \
-       'grep -l turn.securevideocall.com /etc/letsencrypt/renewal/*.conf'   # npm-<N>.conf
+     ssh <proxy> "docker exec nginx-proxy-manager-app-1 sh -c 'grep -l turn.securevideocall.com /etc/letsencrypt/renewal/*.conf'"
      umask 077
-     docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem > fullchain.pem
-     docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem > privkey.pem
+     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem' > /dev/shm/turn-fullchain.pem
+     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem' > /dev/shm/turn-privkey.pem
+     ./coturn/install-turn-certificate.sh /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     rm /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
      ```
-   - Copy both to this Pi over SSH (`scp`), then in `deploy/raspberry-pi`:
-     `./coturn/install-turn-certificate.sh fullchain.pem privkey.pem`. It refuses a certificate
-     that does not name `turn.securevideocall.com`, does not chain to a trusted CA, expires
-     within 7 days or does not match the key; it installs into `coturn/tls/` (key owner 65534,
-     mode 400) and restarts coturn if the certificate changed. Then delete both copies on both
-     machines (`rm fullchain.pem privkey.pem`).
+     The script refuses a certificate that does not name `turn.securevideocall.com`, does not
+     chain to a trusted CA, expires within 7 days or does not match the key, and a chain file
+     that holds anything but certificates. It installs into `coturn/tls/` (key owner 65534, mode
+     400) and tells a running coturn to reload the certificate (`SIGUSR2`): calls in progress keep
+     their relays.
    - **Renewal:** Nginx Proxy Manager renews the certificate by itself about 30 days before it
-     expires; repeat the copy and the install script after each renewal (about every 60 days,
-     sooner if Let's Encrypt shortens its certificates). The restart drops the relays of calls
-     in progress, so do it at a quiet time.
+     expires; repeat the fetch and the install after each renewal. Let's Encrypt's certificates
+     get shorter (64 days from February 2027, 45 from February 2028), and nothing else reminds
+     you: if it lapses, browsers quietly fall back to `turn:` over UDP. So add this daily cron
+     line (`crontab -e`), which logs a warning 21 days ahead (`journalctl -t secure-call-turn`):
+     ```
+     0 9 * * * echo | openssl s_client -connect turn.securevideocall.com:5349 -servername turn.securevideocall.com 2>/dev/null | openssl x509 -noout -checkend 1814400 >/dev/null || logger -t secure-call-turn "TURN certificate expires within 21 days"
+     ```
+   - **Accepted limit:** TURN over UDP (3478) still sends the TURN username and the peer
+     permissions in plaintext (the media itself is DTLS-SRTP either way). UDP is kept for call
+     quality; the TCP fallback is TLS only (`turns:`, no plain `turn:` TCP URL).
    - **Check:** `openssl s_client -brief -connect turn.securevideocall.com:5349 -servername
      turn.securevideocall.com </dev/null` shows `Verification: OK` and `TLSv1.3`.
-4. **Backend `TURN_*`:** keep `TURN_SHARED_SECRET`/`TURN_URLS` unset for the backend until
+4. **Backend `TURN_URLS`:** it is the switch (the secret file is always there); keep it unset until
    The-Secure-Video-Call/secure-call#47 is live. `TURN_URLS` is commented out in `.env.example`:
    uncomment it only after the rate limits (#35) are live and DNS and the router forwards are done.
 5. **Check it works:**
@@ -223,7 +231,8 @@ This is intended; the test restarts coturn between groups of checks so it never 
 #### Why `user-quota=6` (reasoned, not yet measured)
 
 GitHub Actions has no Safari and I could not run Chrome against the container, so the number comes
-from how browsers gather relay candidates: one allocation per TURN URL (we send two: UDP and TCP)
+from how browsers gather relay candidates: one allocation per TURN URL (we send two: UDP on 3478
+and TLS on 5349)
 per network interface they use. That is 2 on one interface, and an ICE restart briefly keeps the
 old allocations next to the new ones: 4. `6` is that plus a margin of 2; `4` would leave none. A
 phone on Wi-Fi and mobile data at once could reach 8 during a restart; it would then get `486`
@@ -365,7 +374,8 @@ turnserver must be able to read the mounted config: keep `coturn/turnserver.conf
 (`chmod 644`) on the Pi, or it fails at startup as a non-root user.
 
 turnserver runs as `65534:65534` (`user:` in compose, `--user` in the test, `USER` in the
-Dockerfile): with `entrypoint: ['turnserver']` the upstream image's own switch to an unprivileged
+Dockerfile): with compose's own entrypoint (the start script ending in `exec turnserver`) the
+upstream image's own switch to an unprivileged
 user is skipped, and CI run 42770315949 showed `CapEff 0x400`, a root process.
 
 ### IPv6
@@ -405,7 +415,8 @@ it if that capability is not in the bounding set (CI run 42757878869), and Docke
 `coturn/Dockerfile` removes the file capability (`setcap -r`, or a plain `cp` of the binary, which
 does not copy the capability attribute), and the test asserts that turnserver has none, starts
 with every capability dropped, and runs with `CapEff` 0 and `no-new-privileges:true`. It is also
-started directly (`entrypoint: ['turnserver']`), so no shell ever expands the secret.
+started by a short `sh -c` script that only copies the secret file into its config in memory
+and then `exec`s turnserver, so no shell ever expands the secret and turnserver is pid 1.
 
 Earlier CI runs showed: `/dev/shm/mongoc-1` holds only binary counters, and
 `/var/tmp/turnserver.pid` is the pid. The test prints any file it finds on the tmpfs mounts
