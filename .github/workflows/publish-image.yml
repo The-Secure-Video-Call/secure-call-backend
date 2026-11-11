@@ -1,9 +1,12 @@
 # CD for the backend: builds the Docker image and publishes it to GitHub's container registry,
 # where the Raspberry Pi picks it up (deploy/raspberry-pi/update.sh).
 #
-# - Pull requests: build the image and smoke-test it (nothing is published).
-# - Push to main: the same test, then, after approval in the "production" environment, build
-#   for arm64 (Raspberry Pi) and amd64 and publish as :main and :sha-<commit>.
+# - Pull requests: build the image, smoke-test it and scan its packages (nothing is published).
+# - Push to main: the same checks, then, after approval in the "production" environment, build
+#   for arm64 (Raspberry Pi) and amd64 with an SBOM and provenance and without any build cache,
+#   publish it as :sha-<commit> only, sign a build provenance attestation for its digest, check
+#   that attestation exactly as update.sh does, and only then point :main at that digest.
+#   update.sh on the Pi runs an image only after `gh attestation verify` has checked it.
 name: Publish backend image
 
 on:
@@ -17,7 +20,8 @@ permissions:
 
 concurrency:
   group: image-${{ github.ref }}
-  cancel-in-progress: true
+  # A publish on main is never cut off halfway; pull request runs give way to newer pushes.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   IMAGE: ghcr.io/the-secure-video-call/secure-call-backend
@@ -36,6 +40,8 @@ jobs:
           # A pinned BuildKit daemon instead of the moving buildx-stable-1 tag.
           driver-opts: image=moby/buildkit:v0.34.2@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
 
+      # The cache only speeds up this throwaway test image; the published image (publish job)
+      # is built without any cache.
       - name: Build the image (amd64)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -61,17 +67,45 @@ jobs:
           docker logs smoke
           exit 1
 
+      # Fails on a HIGH or CRITICAL vulnerability that has a fixed version, in the image's Debian
+      # packages or its Python packages (the dependencies from uv.lock, which pip-audit also
+      # checks, and the pip that the python base image ships). Unfixed ones are left out
+      # (--ignore-unfixed): no rebuild or base image bump can remove them, so failing on them
+      # would block every release with nothing to do but add ignores. A failure here is
+      # actionable: merge the Dependabot bump of the python base image or of the dependency (or
+      # wait for the official image to be rebuilt with the fix). The arm64 image is built from
+      # the same base image and uv.lock, so it has the same packages.
+      # Trivy v0.70.0, the default of this action release. Both are GitHub immutable releases
+      # published after the March 2026 trivy-action tag hijacking (GHSA-69fq-xp46-6x23). No
+      # Actions cache (a cached Trivy binary or database could be planted by another job), no
+      # telemetry and no version-check call home.
+      - name: Scan the image's packages
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        env:
+          TRIVY_DISABLE_TELEMETRY: "true"
+          TRIVY_SKIP_VERSION_CHECK: "true"
+        with:
+          image-ref: secure-call-backend:test
+          scanners: vuln
+          vuln-type: os,library
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+          cache: "false"
+
   publish:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     needs: test-image
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     environment:
       name: production
       url: https://signal.securevideocall.com/healthz
     permissions:
       contents: read
-      packages: write
+      packages: write # push the image and its attestation to ghcr.io
+      id-token: write # an OIDC token, for the Sigstore certificate that signs the attestation
+      attestations: write # store the attestation on GitHub, where gh attestation verify finds it
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -93,18 +127,82 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # No build cache at all: the GitHub Actions cache index of main can be written by other
+      # jobs, and a planted layer would end up in the image that gets attested. Only the commit
+      # tag is pushed here; :main moves last, after the attestation is signed and checked.
       - name: Build and publish (arm64 + amd64)
+        id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           platforms: linux/arm64,linux/amd64
           push: true
-          tags: |
-            ${{ env.IMAGE }}:main
-            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          no-cache: true
+          # An SBOM (SPDX, from BuildKit's Syft scanner) for each platform, stored in the image
+          # index. This is `sbom: true` with the scanner pinned by digest instead of BuildKit's
+          # moving default tag (stable-1).
+          sbom: generator=docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+          # Full BuildKit provenance (build steps, base image digests, source commit) in the
+          # image index. The build has no build args or secrets, and the repository is public.
+          provenance: mode=max
+          tags: ${{ env.IMAGE }}:sha-${{ github.sha }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-only
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+
+      # A signed SLSA build provenance attestation for the published image index. Signed with a
+      # Sigstore certificate naming this repository, this workflow file, refs/heads/main and
+      # this run, stored on GitHub and pushed next to the image on ghcr.io. update.sh checks it
+      # with `gh attestation verify` before running an image. actions/attest is what
+      # actions/attest-build-provenance (v4) wraps; GitHub recommends it directly for new
+      # workflows. No storage record, so no artifact-metadata permission is needed.
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      # The same policy flags as update.sh (tests/test_publish_image_workflow.py keeps them
+      # identical), so an attestation the Pi would refuse never reaches :main. The run with a
+      # wrong --source-ref must fail, or the check is not checking anything.
+      - name: Verify the attestation as update.sh does
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          gh --version
+          verify() {
+            gh attestation verify "oci://${IMAGE}@${IMAGE_DIGEST}" \
+              --repo The-Secure-Video-Call/secure-call-backend \
+              --signer-workflow The-Secure-Video-Call/secure-call-backend/.github/workflows/publish-image.yml \
+              --predicate-type https://slsa.dev/provenance/v1 \
+              --deny-self-hosted-runners \
+              "$@"
+          }
+          verify --source-ref refs/heads/main
+          if wrong_ref_output="$(verify --source-ref refs/heads/not-main 2>&1)"; then
+            echo "::error::gh attestation verify accepted a wrong --source-ref"
+            exit 1
+          fi
+          if [[ "$wrong_ref_output" != *"expected SourceRepositoryRef"* ]]; then
+            echo "::error::the wrong --source-ref failed for another reason: $wrong_ref_output"
+            exit 1
+          fi
+
+      # A single image index as the only source keeps its exact bytes, so :main gets the attested
+      # digest; checked anyway, because update.sh would refuse any other.
+      - name: Point :main at the verified image
+        env:
+          IMAGE_DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          docker buildx imagetools create --tag "${IMAGE}:main" "${IMAGE}@${IMAGE_DIGEST}"
+          main_digest="$(docker buildx imagetools inspect "${IMAGE}:main" --format '{{.Manifest.Digest}}')"
+          if [[ "$main_digest" != "$IMAGE_DIGEST" ]]; then
+            echo "::error::${IMAGE}:main points to ${main_digest}, not the attested ${IMAGE_DIGEST}"
+            exit 1
+          fi

@@ -20,6 +20,22 @@ COPY signaling ./signaling
 
 # --- Runtime stage: same Python, no build tools, non-root user --------------------------------
 FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+# Security fix not yet in the pinned base image: zlib1g from Debian's trixie-security (DSA-6613-1:
+# CVE-2026-85091, CVE-2026-76844; the base has 1:1.3.dfsg+really1.3.1-1+b1). The exact version is
+# pinned, so the build stays reproducible and fails loudly if Debian replaces it; apt checks the
+# archive's signature. Remove this block once Dependabot bumps the base to a rebuild that contains
+# the fix (test-image's Trivy scan fails while a fixable HIGH/CRITICAL package is left).
+ARG ZLIB1G_FIXED_VERSION=1:1.3.dfsg+really1.3.1-1+deb13u1
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends --only-upgrade "zlib1g=${ZLIB1G_FIXED_VERSION}" \
+    && dpkg-query --showformat='${Version}' --show zlib1g | grep -qxF "${ZLIB1G_FIXED_VERSION}" \
+    && rm -rf /var/lib/apt/lists/*
+# No pip at run time: the app's packages come from uv.lock at build time (/app/.venv), and the
+# base image's pip carries its own copies of urllib3, msgpack and setuptools code that the image
+# scan flags (and that nothing here uses). The bundled wheel for re-creating pip goes too.
+RUN python -m pip uninstall --yes --root-user-action=ignore pip \
+    && rm -rf /usr/local/lib/python3.14/ensurepip/_bundled \
+    && ! python -c "import pip" 2>/dev/null
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 WORKDIR /app
 COPY --from=build /app /app

@@ -2,8 +2,10 @@
 #
 # On the Pi, in this folder:
 #   cp .env.example .env      # then fill in the values marked "set"
+#   docker compose up -d postgres
+#   ./update.sh               # after its one-time setup (README.md); starts a verified backend
 #   docker compose up -d
-# and add update.sh to cron (see README.md) so new images are picked up automatically.
+# The backend is updated only by update.sh, by hand or from cron (see README.md).
 #
 # Network layout:
 #   - The backend is published on BACKEND_PUBLISH_ADDR:BACKEND_PUBLISH_PORT (default
@@ -17,6 +19,8 @@
 services:
   backend:
     image: ghcr.io/the-secure-video-call/secure-call-backend:main
+    # Never pulled by compose: update.sh pulls a verified image by digest and tags it :main.
+    pull_policy: never
     container_name: secure-call-backend
     restart: unless-stopped
     env_file: .env
