@@ -365,19 +365,20 @@ configuration, so without a reload it keeps refusing the new certificate:
 TLS only with the backend's own role (#57, #62), TLS from the proxy to the backend (#59), the
 TURN secret in root-only files and TURN over TLS (#64, #58), the proxy refusing plain HTTP and
 sending the security headers on its own pages (#56, #61), the firewall (#63), and `update.sh`
-running only verified images (#67). The database holds nothing yet, so its volume is recreated
-(the backend's role is made only when the database is first created). The image before this
-set speaks plain HTTP and cannot read the TURN secret from its file; the new one speaks HTTPS
-only. So between steps 3 and 5 calls get no TURN relay (calls that need it, such as privacy
-mode, fail), and in step 5 signaling is down for the minute between the update and the proxy
-change: do steps 3 to 5 in one sitting, at a quiet time.
+running only verified images (#67). The Pi goes straight from its current image to the new one.
+The new image needs the new files and certificates, and the proxy must switch to `https` with it,
+so signaling is down from the `down` in step 6 until the proxy switch at its end: a few minutes.
+Do steps 4 to 6 in one sitting, at a quiet time. The database holds nothing yet, so its volume is
+recreated (the backend's role is made only when the database is first created).
 
-1. **Before you merge anything of this set:** the "Publish backend image" run of #80 must have
-   finished (it makes the first attested image). Approve no other publish run until step 5. On
-   this Pi, comment out the `update.sh` line in `crontab -e`.
-2. **Merge, in this order:** #77, #79, #85, #86, #87. Their "Publish backend image" run waits for
-   your approval: **don't approve it yet.**
-3. **On this Pi**, in `deploy/raspberry-pi`:
+1. **First, on this Pi:** comment out the `update.sh` line in `crontab -e`. The old `update.sh`
+   would install any newly published image at once, and the new image cannot start with the old
+   files.
+2. **Merge** the remaining PRs of the set in order, each with "Create a merge commit".
+3. **Publish:** in Actions, "Publish backend image", approve only the newest run (from the last
+   merge) and reject any older one still waiting. Wait until it finishes: it makes the first
+   attested image, which `update.sh` checks.
+4. **On this Pi**, in `deploy/raspberry-pi`:
    ```sh
    git pull
    # update.sh's one-time setup (deploy/raspberry-pi/README.md, "Updating the backend"): gh
@@ -390,29 +391,27 @@ change: do steps 3 to 5 in one sitting, at a quiet time.
    ```
    Then the TURN certificate (deploy/raspberry-pi/README.md, TURN step 3b: fetch it from the
    proxy machine into `/dev/shm` and run `./coturn/install-turn-certificate.sh`), and on the
-   router forward **5349/tcp** to this Pi. Then:
+   router forward **5349/tcp** to this Pi.
+5. **On the proxy machine**, copy `tls/local-ca.crt` into the proxy (setup step 4), but don't
+   change the host yet.
+6. **Switch over.** On this Pi:
    ```sh
    docker compose down --volumes    # pgdata, which holds nothing, is the only volume; this also
                                     # gives the networks their new bridge names (#63)
    docker compose up -d postgres
-   ./update.sh                      # starts the verified image of #80 (still plain HTTP)
+   ./update.sh                      # starts the verified new image (HTTPS only)
    docker compose up -d --build     # coturn with TLS and its secret file
    ```
-   Signaling keeps working: that image ignores the new TLS settings (its start-up migration fails
-   harmlessly, and signaling does not use the database).
-4. **On the proxy machine**, copy `tls/local-ca.crt` into the proxy (setup step 4), but don't
-   change the host yet.
-5. **Approve the publish** of step 2 and wait until it finishes. Then `./update.sh` on this Pi,
    and **at once**, in Nginx Proxy Manager: switch the signal host to `https`, turn its **Force
    SSL** and **HSTS** off, paste all of `npm-advanced.conf` into the Advanced tab, and run setup
    step 4's checks (the three `proxy_ssl` lines, the header counts, the dry-run renewal).
-6. **Firewall** (deploy/raspberry-pi/README.md, "Firewall", setup steps 2 to 5; step 1 was the
+7. **Firewall** (deploy/raspberry-pi/README.md, "Firewall", setup steps 2 to 5; step 1 was the
    `down`/`up` above): check `TRUSTED_PROXY_IPS` and `TURN_PUBLIC_IP` in `.env`, apply by hand,
    check, then install the systemd unit. Keep a second SSH session open while you do it.
-7. **In `.env`:** delete the `TURN_SHARED_SECRET` line (nothing reads it any more), and in
+8. **In `.env`:** delete the `TURN_SHARED_SECRET` line (nothing reads it any more), and in
    `TURN_URLS` replace `turn:turn.securevideocall.com:3478?transport=tcp` with
    `turns:turn.securevideocall.com:5349?transport=tcp`. Then `docker compose up -d backend`.
-8. **Check:**
+9. **Check:**
    ```sh
    docker compose ps    # backend, postgres and coturn running
    docker compose exec postgres psql -U securecall -d securecall -Atc \
@@ -428,8 +427,8 @@ change: do steps 3 to 5 in one sitting, at a quiet time.
    ```
    Then make a test call, one in privacy mode too (it needs the relay), and check the TURN
    certificate from outside (TURN step 3b's `openssl s_client` line).
-9. **Put the cron line back,** in its new form with the journal (deploy/raspberry-pi/README.md,
-   "Updating the backend"), and add the TURN certificate's expiry warning (TURN step 3b).
+10. **Put the cron line back,** in its new form with the journal (deploy/raspberry-pi/README.md,
+    "Updating the backend"), and add the TURN certificate's expiry warning (TURN step 3b).
 
 If PostgreSQL's first start fails (see `docker compose logs postgres`),
 the half-created database must be removed before trying again: `docker compose down
