@@ -305,14 +305,30 @@ services:
         bind:
           create_host_path: false
 
+# Both networks have a fixed Linux bridge name, so firewall.sh (README.md "Firewall") can scope
+# every rule to them: the Pi runs other Docker projects too, and their bridges are never matched.
+# Renaming a bridge or changing a subnet needs `docker compose down && docker compose up -d`, and
+# firewall.sh changed to match (tests/test_firewall.py keeps the two equal).
 networks:
-  internal: {}
+  # The backend and PostgreSQL. A fixed small subnet next to "turn", IPv4 only. 172.30.200.17 is
+  # the gateway (the Pi). Must not overlap another Docker network.
+  internal:
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-securecall
+    ipam:
+      config:
+        - subnet: 172.30.200.16/28
+          gateway: 172.30.200.17
   # coturn only. A fixed small subnet inside 172.16.0.0/12 (denied as a peer by turnserver.conf),
   # no IPv6. 172.30.200.1 is the gateway (the Pi), 172.30.200.2 is coturn. Keep identical to the
   # network the test creates in coturn/test-coturn.sh.
   turn:
     driver: bridge
     enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.name: br-turn
     ipam:
       config:
         - subnet: 172.30.200.0/29

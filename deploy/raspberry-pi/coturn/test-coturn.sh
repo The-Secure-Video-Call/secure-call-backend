@@ -275,7 +275,7 @@ fi
 coturn_start_script='umask 077 && [ -s /run/secrets/turn-static-auth-secret.conf ] && grep -q "^static-auth-secret=[A-Za-z0-9+/_-]" /run/secrets/turn-static-auth-secret.conf || { echo "coturn: the TURN secret file is missing or malformed" >&2; exit 1; }; { cat /etc/coturn/turnserver.conf && echo && cat /run/secrets/turn-static-auth-secret.conf; } > /run/coturn/turnserver.conf && exec turnserver -c /run/coturn/turnserver.conf "$@"'
 echo "== Build the derived image (coturn/Dockerfile) =="
 docker build -q -t "$image" "$here" || { echo "FAIL: docker build"; exit 1; }
-docker network create --driver bridge --subnet "$network_subnet" --gateway "$gateway_ip" "$network_name" >/dev/null \
+docker network create --driver bridge --opt com.docker.network.bridge.name=br-turn --subnet "$network_subnet" --gateway "$gateway_ip" "$network_name" >/dev/null \
   || { echo "FAIL: could not create the docker network"; exit 1; }
 # Same hardening as compose.yaml: own bridge network with a fixed address (no host networking),
 # read-only root filesystem, small tmpfs mounts only, no capabilities at all (the derived image has
