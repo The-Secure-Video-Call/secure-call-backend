@@ -204,6 +204,8 @@ Manager already running.
                                # POSTGRES_APP_PASSWORD
    ./make-local-certs.sh       # TLS certificates for the database and the backend, into
                                # ./tls/ (asks for sudo once)
+   ./make-turn-secret.sh       # the TURN secret, into ./secrets/ (deploy/raspberry-pi/README.md)
+   # and the TURN certificate: deploy/raspberry-pi/README.md, TURN step 3b
    docker compose up -d postgres
    ./update.sh                 # pulls and starts only a verified backend image
    docker compose up -d
@@ -314,11 +316,17 @@ backend image" run (not even a Dependabot one):
    python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # a new password
    nano .env            # add POSTGRES_APP_PASSWORD=<it>, different from POSTGRES_PASSWORD
    ./make-local-certs.sh                       # asks for sudo once
+   ./make-turn-secret.sh                       # a NEW TURN secret, into secrets/ (the old one
+                                               # was visible in ps and docker inspect)
+   # The TURN certificate (deploy/raspberry-pi/README.md, TURN step 3b), and the router
+   # forward of 5349/tcp to this Pi. Then:
    docker compose down --volumes               # pgdata, which holds nothing, is the only volume
-   docker compose up -d                        # the old image still serves plain HTTP
+   docker compose up -d --build                # the old image still serves plain HTTP
    ```
    Signaling keeps working: the old image ignores the new TLS settings (its start-up migration
-   fails harmlessly, and signaling does not use the database).
+   fails harmlessly, and signaling does not use the database). It cannot read the TURN secret
+   from its file, though, so until step 3 calls get no TURN relay (most still connect; calls
+   that need the relay, such as privacy mode, fail): keep steps 1 to 3 close together.
 2. **On the proxy machine**, copy `tls/local-ca.crt` into the proxy (setup step 4), but don't
    change the host yet.
 3. **Approve the publish** and wait until it finishes. Then, without waiting for cron:
@@ -333,6 +341,18 @@ backend image" run (not even a Dependabot one):
    docker compose exec backend python manage.py migrate --check && echo database reachable
    curl https://signal.securevideocall.com/healthz     # {"status": "ok"}
    # On the proxy machine: the three proxy_ssl lines are in the host's config (setup step 4).
+   ```
+   Then delete the `TURN_SHARED_SECRET` line from `.env` (nothing reads it any more), and in
+   `TURN_URLS` there replace `turn:turn.securevideocall.com:3478?transport=tcp` with
+   `turns:turn.securevideocall.com:5349?transport=tcp`, then run `docker compose up -d
+   backend`. A call should now get a relay over TLS too (deploy/raspberry-pi/README.md, TURN
+   step 5), and the secret must be nowhere to be seen:
+   ```sh
+   docker compose ps    # coturn running
+   # Prints nothing: the secret is in no process's arguments and in neither container's settings.
+   { ps -eo args; docker inspect secure-call-coturn secure-call-backend; } \
+     | grep -F -f <(sudo cat secrets/turn-shared-secret)
+   stat -c %a .env      # 600
    ```
    and make a test call.
 

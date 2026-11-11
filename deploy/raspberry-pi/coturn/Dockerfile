@@ -1,7 +1,7 @@
 # coturn 4.18.0 without the file capability on the turnserver binary.
 #
 # The official image puts CAP_NET_BIND_SERVICE=+ep on turnserver so an unprivileged user can bind
-# low ports. We listen on 3478 and 49160-49200 only, so we do not need it; and with the capability
+# low ports. We listen on 3478, 5349 and 49160-49200 only, so we do not need it; and with the capability
 # present the container needs `cap_add: NET_BIND_SERVICE` to start at all (the kernel refuses to
 # exec a binary whose file capability is not in the bounding set), which Docker then grants to the
 # non-root process too (CapEff 0x400). Stripping it lets us run with `cap_drop: ALL`, no cap_add and
@@ -26,7 +26,8 @@ RUN set -eu; \
     fi; \
     ls -l "$binary"
 
-# Never root, and start turnserver directly as pid 1 (no shell entrypoint that could expand the
-# secret). compose.yaml and coturn/test-coturn.sh set the same user and entrypoint.
+# Never root. compose.yaml and coturn/test-coturn.sh set the same user, and replace this
+# entrypoint with a short start script that joins the secret file to the config in memory and
+# then execs turnserver as pid 1 (the secret is never on a command line).
 USER 65534:65534
 ENTRYPOINT ["turnserver"]

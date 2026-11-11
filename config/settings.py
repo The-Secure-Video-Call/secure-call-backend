@@ -167,8 +167,21 @@ for _trusted_proxy_ip in TRUSTED_PROXY_IPS:
 
 # Short-lived HMAC credentials for coturn (PLAN.md 3.5). The feature is off unless BOTH
 # TURN_SHARED_SECRET and TURN_URLS are set; then `joined` has no `turn` field. The secret
-# comes from the environment only and is never logged or sent to clients.
-TURN_SHARED_SECRET = os.environ.get("TURN_SHARED_SECRET", "")
+# comes from a file (TURN_SHARED_SECRET_FILE, as on the Pi, so it is not in the container's
+# environment, `docker inspect` or the process list) or from the environment, never both, and it
+# is never logged or sent to clients.
+TURN_SHARED_SECRET_FILE = os.environ.get("TURN_SHARED_SECRET_FILE", "")
+if TURN_SHARED_SECRET_FILE:
+    if os.environ.get("TURN_SHARED_SECRET"):
+        raise ImproperlyConfigured("Set TURN_SHARED_SECRET or TURN_SHARED_SECRET_FILE, not both.")
+    try:
+        TURN_SHARED_SECRET = Path(TURN_SHARED_SECRET_FILE).read_text(encoding="utf-8").strip()
+    except OSError, UnicodeDecodeError:
+        raise ImproperlyConfigured("TURN_SHARED_SECRET_FILE cannot be read.") from None
+    if not TURN_SHARED_SECRET or any(character.isspace() for character in TURN_SHARED_SECRET):
+        raise ImproperlyConfigured("TURN_SHARED_SECRET_FILE must hold the secret on one line.")
+else:
+    TURN_SHARED_SECRET = os.environ.get("TURN_SHARED_SECRET", "")
 TURN_URLS = env_list("TURN_URLS", default=[])
 # Never longer than a room can live (signaling.rooms.TOTAL_LIFETIME_LIMIT_SECONDS, 4 h); the
 # consumer also shortens each credential to the time its room has left. tests/test_settings.py

@@ -43,6 +43,10 @@ services:
       # this certificate against our local CA (README.md, setup step 4).
       BACKEND_TLS_CERTIFICATE: /run/secure-call/backend.crt
       BACKEND_TLS_KEY: /run/secure-call/backend.key
+      # The TURN secret from a file (make-turn-secret.sh), so it is in neither the container's
+      # environment nor `docker inspect`. The empty value replaces any old one left in .env.
+      TURN_SHARED_SECRET: ''
+      TURN_SHARED_SECRET_FILE: /run/secure-call/turn-shared-secret
     depends_on:
       postgres:
         condition: service_healthy
@@ -78,6 +82,13 @@ services:
       - type: bind
         source: ./tls/backend.key
         target: /run/secure-call/backend.key
+        read_only: true
+        bind:
+          create_host_path: false
+      # Owned by the image's user (uid 10001), mode 400 (make-turn-secret.sh).
+      - type: bind
+        source: ./secrets/turn-shared-secret
+        target: /run/secure-call/turn-shared-secret
         read_only: true
         bind:
           create_host_path: false
@@ -194,10 +205,13 @@ services:
     networks:
       turn:
         ipv4_address: 172.30.200.2
-    # Published on the Pi's LAN address only, never on 0.0.0.0. The router forwards stay the same.
+    # Published on the Pi's LAN address only, never on 0.0.0.0; the router forwards these to the
+    # Pi (README.md, TURN step 2).
     ports:
       - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:3478:3478/udp'
       - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:3478:3478/tcp'
+      # TURN over TLS (turns:): usernames and permissions encrypted on the way (#58).
+      - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:5349:5349/tcp'
       - '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:49160-49200:49160-49200/udp'
     # Nothing coturn writes can reach the Pi's disk: read-only root filesystem, and small
     # in-memory mounts (world-writable, as coturn runs as an unprivileged user) for the
@@ -207,6 +221,8 @@ services:
       - /var/tmp:size=1m,mode=1777,noexec,nosuid,nodev
       - /tmp:size=1m,mode=1777,noexec,nosuid,nodev
       - /var/log:size=1m,mode=1777,noexec,nosuid,nodev
+      # The config with the secret, made at start (below), readable by coturn's user only.
+      - /run/coturn:size=64k,mode=1777,noexec,nosuid,nodev
     # No capabilities at all, and no-new-privileges. The upstream image puts the file capability
     # CAP_NET_BIND_SERVICE=+ep on turnserver, which made the container need `cap_add` (CI runs
     # 42757878869, 48e8d0b: Docker grants cap_add to the non-root process too, CapEff 0x400).
@@ -223,20 +239,29 @@ services:
     # in coturn/test-coturn.sh, which asserts that turnserver's Uid and Gid are not 0 and that
     # CapEff is 0.
     user: '65534:65534'
-    # Start turnserver directly as pid 1, so no shell ever expands the secret (the Dockerfile sets
-    # the same entrypoint). Found through PATH.
-    entrypoint: ['turnserver']
-    # The secret comes from .env (compose substitution), never from a file in the repo.
-    # No env_file here: coturn must not receive the backend's other secrets.
+    # The secret is on no command line and in no environment, so neither the process list nor
+    # `docker inspect` shows it (#64): it is read from a file only root and coturn's user can
+    # read (make-turn-secret.sh), and joined to the tracked config in memory, mode 600. The shell
+    # only copies bytes and never expands the secret, then exec makes turnserver pid 1.
+    # No env_file here: coturn must not receive the backend's other secrets. Keep identical to
+    # coturn/test-coturn.sh.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        umask 077 && [ -s /run/secrets/turn-static-auth-secret.conf ] &&
+        grep -q "^static-auth-secret=[A-Za-z0-9+/_-]" /run/secrets/turn-static-auth-secret.conf ||
+        { echo "coturn: the TURN secret file is missing or malformed" >&2; exit 1; };
+        { cat /etc/coturn/turnserver.conf && echo &&
+        cat /run/secrets/turn-static-auth-secret.conf; } > /run/coturn/turnserver.conf &&
+        exec turnserver -c /run/coturn/turnserver.conf "$$@"
+      - coturn-start
     command:
-      - '-c'
-      - '/etc/coturn/turnserver.conf'
       # Logging to stdout only (discarded below). coturn reads command-line log options before
       # the config file, so no early warning can make it open a log file. Keep identical to
       # coturn/test-coturn.sh.
       - '--log-file=stdout'
       - '--no-stdout-log'
-      - '--static-auth-secret=${TURN_SHARED_SECRET:?Set TURN_SHARED_SECRET in .env}'
       # Behind the home NAT (and Docker's) the relay must advertise the public IP:
       # "<public-ip>/<container address>". 172.30.200.2 is this container's fixed address.
       - '--external-ip=${TURN_PUBLIC_IP:?Set TURN_PUBLIC_IP in .env}/172.30.200.2'
@@ -255,12 +280,30 @@ services:
     # TURN username on every failed login (for example internet scanners trying random logins),
     # and PLAN.md section 3 says usernames are never logged. To debug a coturn that will not
     # start, switch this to json-file temporarily and switch it back afterwards.
-    # (The secret is visible in `docker inspect` and the process list on the Pi; keep the Pi's
-    # users trusted.)
     logging:
       driver: none
     volumes:
-      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+      - type: bind
+        source: ./coturn/turnserver.conf
+        target: /etc/coturn/turnserver.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      # "static-auth-secret=...", owned by coturn's user (65534), mode 400 (make-turn-secret.sh).
+      - type: bind
+        source: ./secrets/turn-static-auth-secret.conf
+        target: /run/secrets/turn-static-auth-secret.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      # The certificate for turn.securevideocall.com (coturn/install-turn-certificate.sh):
+      # fullchain.pem, and privkey.pem owned by 65534, mode 400.
+      - type: bind
+        source: ./coturn/tls
+        target: /etc/coturn/tls
+        read_only: true
+        bind:
+          create_host_path: false
 
 networks:
   internal: {}

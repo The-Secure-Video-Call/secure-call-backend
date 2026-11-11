@@ -14,3 +14,7 @@ htmlcov/
 .reference/
 # Certificates and keys made on the Pi by deploy/raspberry-pi/make-local-certs.sh
 deploy/raspberry-pi/tls/
+# The TURN secret files (make-turn-secret.sh) and the TURN TLS certificate
+# (coturn/install-turn-certificate.sh), on the Pi only
+deploy/raspberry-pi/secrets/
+deploy/raspberry-pi/coturn/tls/

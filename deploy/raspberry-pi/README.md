@@ -91,7 +91,7 @@ relay to private, loopback, link-local and multicast addresses, so a credential 
 your home network. Do not remove those lines.
 
 Published ports (only on the Pi's LAN address, `TURN_RELAY_IP`, never on every interface):
-`3478` UDP and TCP, and `49160-49200` UDP. The router forwards are unchanged.
+`3478` UDP and TCP, `5349` TCP (TURN over TLS), and `49160-49200` UDP.
 
 **Why not host networking:** coturn exempts its own addresses from the deny list (two clients on
 one relay must reach each other's relay addresses). On the host network its own address is the
@@ -134,27 +134,65 @@ after `time-sync.target` (`sudo systemctl edit docker`, add `[Unit]` `After=time
 Manual steps (owner):
 
 1. **DNS at ServerByt:** add an A record `turn.securevideocall.com` pointing to the home static IP.
-2. **Router port forwards to the Pi:** `3478` UDP and TCP, and `49160-49200` UDP.
-   Forward nothing else for TURN (no 5349, no 443).
-3. **Secret:** on the Pi run `openssl rand -base64 32` and put the result in `.env` as
-   `TURN_SHARED_SECRET`. The same value goes to the backend
-   later (#26). Never commit it.
+2. **Router port forwards to the Pi:** `3478` UDP and TCP, `5349` TCP, and `49160-49200` UDP.
+   Forward nothing else for TURN (no 5349 UDP: DTLS is off; no 443, which is the proxy's).
+3. **Secret:** in `deploy/raspberry-pi`, run `./make-turn-secret.sh` (it asks for sudo). It
+   makes a random secret and writes it, never printing it, to the two files compose mounts:
+   `secrets/turn-static-auth-secret.conf` for coturn (owner 65534, mode 400) and
+   `secrets/turn-shared-secret` for the backend (owner 10001, mode 400). coturn joins it to
+   its config in memory at start, so it is on no command line and in no environment: neither
+   `ps` nor `docker inspect` shows it (CI checks that). It also makes `.env` mode 600.
+   **Rotating:** run it again, then `docker compose up -d --force-recreate coturn backend` at a
+   quiet time (credentials issued with the old secret stop working). Never commit `secrets/`.
    Also set `TURN_PUBLIC_IP` (the home's public IPv4, which must be static: if it changes, update
    `.env` and restart coturn). Compose passes it as `--external-ip=<public IP>/172.30.200.2` and also as
    `--denied-peer-ip=<public IP>` (defence in depth; relay-to-relay still works with it).
    And set `TURN_RELAY_IP` to the Pi's LAN IPv4 (its default-route address, since Docker's NAT
    sends outgoing relay traffic from there): the ports are published on that address only.
    Compose refuses to start without either value; as it checks the whole file, a `.env` missing
-   any of the three `TURN_*` values (or `POSTGRES_APP_PASSWORD`) also makes `update.sh` fail. Then `docker compose up -d --build coturn`.
-   Note the secret is visible to local users of the Pi via `docker inspect`.
+   either `TURN_*` value (or `POSTGRES_APP_PASSWORD`) also makes `update.sh` fail. Then do step
+   3b and `docker compose up -d --build coturn`.
    On the Pi, use zram or no swap: swapped memory (the secret, and the in-memory log mounts
    below) could otherwise reach the SD card. `ulimits: core: 0` already prevents core dumps.
-4. **Backend `TURN_*`:** keep `TURN_SHARED_SECRET`/`TURN_URLS` unset for the backend until
+3b. **Certificate for TURN over TLS (`turns:`, port 5349):** browsers check it, so it must be
+   publicly trusted. Nginx Proxy Manager gets and renews it (port 80 reaches the proxy):
+   - In Nginx Proxy Manager: **SSL Certificates → Add SSL Certificate → Let's Encrypt**,
+     domain `turn.securevideocall.com` (the A record of step 1).
+   - On this Pi, fetch both files straight from the proxy machine into memory (`/dev/shm`), so
+     the key never lands on either SD card. `<proxy>` is your SSH login on the proxy machine;
+     the first line prints the certificate's `npm-<N>`:
+     ```sh
+     ssh <proxy> "docker exec nginx-proxy-manager-app-1 sh -c 'grep -l turn.securevideocall.com /etc/letsencrypt/renewal/*.conf'"
+     umask 077
+     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem' > /dev/shm/turn-fullchain.pem
+     ssh <proxy> 'docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem' > /dev/shm/turn-privkey.pem
+     ./coturn/install-turn-certificate.sh /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     rm /dev/shm/turn-fullchain.pem /dev/shm/turn-privkey.pem
+     ```
+     The script refuses a certificate that does not name `turn.securevideocall.com`, does not
+     chain to a trusted CA, expires within 7 days or does not match the key, and a chain file
+     that holds anything but certificates. It installs into `coturn/tls/` (key owner 65534, mode
+     400) and tells a running coturn to reload the certificate (`SIGUSR2`): calls in progress keep
+     their relays.
+   - **Renewal:** Nginx Proxy Manager renews the certificate by itself about 30 days before it
+     expires; repeat the fetch and the install after each renewal. Let's Encrypt's certificates
+     get shorter (64 days from February 2027, 45 from February 2028), and nothing else reminds
+     you: if it lapses, browsers quietly fall back to `turn:` over UDP. So add this daily cron
+     line (`crontab -e`), which logs a warning 21 days ahead (`journalctl -t secure-call-turn`):
+     ```
+     0 9 * * * echo | openssl s_client -connect turn.securevideocall.com:5349 -servername turn.securevideocall.com 2>/dev/null | openssl x509 -noout -checkend 1814400 >/dev/null || logger -t secure-call-turn "TURN certificate expires within 21 days"
+     ```
+   - **Accepted limit:** TURN over UDP (3478) still sends the TURN username and the peer
+     permissions in plaintext (the media itself is DTLS-SRTP either way). UDP is kept for call
+     quality; the TCP fallback is TLS only (`turns:`, no plain `turn:` TCP URL).
+   - **Check:** `openssl s_client -brief -connect turn.securevideocall.com:5349 -servername
+     turn.securevideocall.com </dev/null` shows `Verification: OK` and `TLSv1.3`.
+4. **Backend `TURN_URLS`:** it is the switch (the secret file is always there); keep it unset until
    The-Secure-Video-Call/secure-call#47 is live. `TURN_URLS` is commented out in `.env.example`:
    uncomment it only after the rate limits (#35) are live and DNS and the router forwards are done.
 5. **Check it works:**
-   - **On the Pi**, create a short-lived test credential. Read the secret from `.env` there
-     (`SECRET=$(grep '^TURN_SHARED_SECRET=' .env | cut -d= -f2-)`), then:
+   - **On the Pi**, create a short-lived test credential. Read the secret there
+     (`SECRET=$(sudo cat secrets/turn-shared-secret)`), then:
      `user=$(( $(date +%s) + 600 )); pass=$(printf %s "$user" | openssl dgst -sha1 -hmac "$SECRET" -binary | openssl base64); echo "$user $pass"`.
      Copy only that username and password to the other machine, never the shared secret. They
      stop working after 10 minutes.
@@ -162,7 +200,8 @@ Manual steps (owner):
      `turnutils_uclient -u "$user" -w "$pass" -e 8.8.8.8 -n 1 -m 1 turn.securevideocall.com`.
    - Or open https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/, add
      `turn:turn.securevideocall.com:3478` with that username and password, and gather: a
-     `relay` candidate should appear.
+     `relay` candidate should appear. Then the same with
+     `turns:turn.securevideocall.com:5349?transport=tcp` (TURN over TLS).
 6. **Image pin:** `coturn/Dockerfile` pins the base to `4.18.0` plus its `@sha256:` digest.
    Dependabot proposes upgrades (it watches `deploy/raspberry-pi/coturn`); the CI `coturn` job must
    pass before one is merged. After merging, rebuild on the Pi when no call is running:
@@ -192,7 +231,8 @@ This is intended; the test restarts coturn between groups of checks so it never 
 #### Why `user-quota=6` (reasoned, not yet measured)
 
 GitHub Actions has no Safari and I could not run Chrome against the container, so the number comes
-from how browsers gather relay candidates: one allocation per TURN URL (we send two: UDP and TCP)
+from how browsers gather relay candidates: one allocation per TURN URL (we send two: UDP on 3478
+and TLS on 5349)
 per network interface they use. That is 2 on one interface, and an ICE restart briefly keeps the
 old allocations next to the new ones: 4. `6` is that plus a margin of 2; `4` would leave none. A
 phone on Wi-Fi and mobile data at once could reach 8 during a restart; it would then get `486`
@@ -334,7 +374,8 @@ turnserver must be able to read the mounted config: keep `coturn/turnserver.conf
 (`chmod 644`) on the Pi, or it fails at startup as a non-root user.
 
 turnserver runs as `65534:65534` (`user:` in compose, `--user` in the test, `USER` in the
-Dockerfile): with `entrypoint: ['turnserver']` the upstream image's own switch to an unprivileged
+Dockerfile): with compose's own entrypoint (the start script ending in `exec turnserver`) the
+upstream image's own switch to an unprivileged
 user is skipped, and CI run 42770315949 showed `CapEff 0x400`, a root process.
 
 ### IPv6
@@ -374,7 +415,8 @@ it if that capability is not in the bounding set (CI run 42757878869), and Docke
 `coturn/Dockerfile` removes the file capability (`setcap -r`, or a plain `cp` of the binary, which
 does not copy the capability attribute), and the test asserts that turnserver has none, starts
 with every capability dropped, and runs with `CapEff` 0 and `no-new-privileges:true`. It is also
-started directly (`entrypoint: ['turnserver']`), so no shell ever expands the secret.
+started by a short `sh -c` script that only copies the secret file into its config in memory
+and then `exec`s turnserver, so no shell ever expands the secret and turnserver is pid 1.
 
 Earlier CI runs showed: `/dev/shm/mongoc-1` holds only binary counters, and
 `/var/tmp/turnserver.pid` is the pid. The test prints any file it finds on the tmpfs mounts

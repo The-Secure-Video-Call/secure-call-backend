@@ -46,13 +46,13 @@ jobs:
         working-directory: deploy/raspberry-pi
         run: |
           ./make-local-certs.sh
+          ./make-turn-secret.sh
           printf '%s\n' \
             POSTGRES_PASSWORD=ci-only-throwaway \
             POSTGRES_APP_PASSWORD=ci-only-throwaway-app \
             DJANGO_SECRET_KEY=ci-only-throwaway-secret-key-not-used-anywhere-else-0123456789 \
             DJANGO_ALLOWED_HOSTS=signal.example.invalid \
             SIGNALING_ALLOWED_ORIGINS=https://call.example.invalid \
-            TURN_SHARED_SECRET=ci-only-throwaway \
             TURN_PUBLIC_IP=203.0.113.7 \
             TURN_RELAY_IP=127.0.0.1 > .env
           docker compose up -d --wait postgres || { docker compose logs postgres; exit 1; }
