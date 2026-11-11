@@ -34,6 +34,7 @@ readonly PROXY_PATTERN='^([a-z_][a-z0-9_-]{0,31})@([A-Za-z0-9][A-Za-z0-9.-]{0,25
 
 # The proxy's answer, line by line: certificates (fullchain.pem), then one private key
 # (privkey.pem), and nothing else. Messages name line numbers only, never their contents.
+# shellcheck disable=SC2016 # an awk program: its $0 is awk's, not the shell's
 readonly PEM_GRAMMAR='
 function fail(reason) { problem = reason; exit 1 }
 BEGIN { state = "outside" }

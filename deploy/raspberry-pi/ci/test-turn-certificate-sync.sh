@@ -83,6 +83,7 @@ run_unit() {
   cursor="$(journal_cursor)"
   sudo systemctl start "$UNIT" || status=$?
   sudo journalctl --sync
+  # shellcheck disable=SC2024 # the runner's own user writes its own file
   sudo journalctl --no-pager -q -o cat -u "$UNIT" --after-cursor "$cursor" >"$work/journal"
   sed 's/^/    journal: /' "$work/journal"
   return "$status"
@@ -303,19 +304,24 @@ else
   fail "-R through the proxy: exit status $status"
 fi
 print_command=("$PRINT_SCRIPT" "$CONTAINER" "$CERTIFICATE")
+allowed_first_line=""
+# shellcheck disable=SC2024 # the runner's own user writes its own file
+if sudo -u turn-certificate sudo -n "${print_command[@]}" >"$work/allowed"; then
+  allowed_first_line="$(head -n 1 "$work/allowed")"
+fi
+rm -f "$work/allowed"
 if sudo -u turn-certificate sudo -n "$PRINT_SCRIPT" "$CONTAINER" npm-31 >/dev/null 2>&1 \
   || sudo -u turn-certificate sudo -n /bin/sh -c id >/dev/null 2>&1; then
   fail "sudo ran something other than the one command for turn-certificate"
-elif sudo -u turn-certificate sudo -n "${print_command[@]}" >"$work/allowed" \
-  && [ "$(head -n 1 "$work/allowed")" = '-----BEGIN CERTIFICATE-----' ]; then
+elif [ "$allowed_first_line" = '-----BEGIN CERTIFICATE-----' ]; then
   pass "sudo runs exactly the one command line for turn-certificate"
 else
   fail "sudo does not run the allowed command for turn-certificate"
 fi
-rm -f "$work/allowed"
 
 echo "== Nothing leaked or left behind =="
 sudo journalctl --sync
+# shellcheck disable=SC2024 # the runner's own user writes its own file
 sudo journalctl --no-pager -q -o cat --after-cursor "$start_cursor" >"$work/whole-journal"
 for name in first renewed wrong-name; do
   sed '1d;$d' "$work/$name.key" >"$work/$name.key-lines"

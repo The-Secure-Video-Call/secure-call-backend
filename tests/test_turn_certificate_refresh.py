@@ -709,7 +709,8 @@ def test_print_prints_exactly_the_two_files_whatever_the_client_asks_for(
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == proxy.fullchain + proxy.key
-    assert result.stderr == b""
+    # Only bash's own warning, before the script runs, where that locale is not installed.
+    assert [line for line in result.stderr.splitlines() if b"setlocale" not in line] == []
     assert proxy.log.read_text() == (
         f"docker exec {CONTAINER} cat -- {LIVE_DIR}/fullchain.pem {LIVE_DIR}/privkey.pem\n"
     )
