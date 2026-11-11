@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator
 
 import pytest
@@ -270,6 +271,19 @@ async def test_person_waiting_alone_gets_room_expired_and_is_closed(
     await assert_told_room_expired_and_closed(client)
     assert registry.room_count() == 0
     await client.disconnect()
+
+
+async def test_idle_close_of_a_lone_member_logs_no_identifier(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    use_short_registry(monkeypatch, 0.2, LONG_SECONDS)
+    caplog.set_level(logging.DEBUG)
+    client = await join_client()
+    assert json.loads(await client.receive_from()) == JOINED_FIRST
+    await assert_told_room_expired_and_closed(client)
+    await client.disconnect()
+    assert ROOM_ID not in caplog.text
+    assert group_name_for_room(ROOM_ID) not in caplog.text
 
 
 async def test_second_person_joining_stops_the_waiting_timer(
