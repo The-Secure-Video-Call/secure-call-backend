@@ -30,6 +30,12 @@ RUN apt-get update \
     && apt-get install --yes --no-install-recommends --only-upgrade "zlib1g=${ZLIB1G_FIXED_VERSION}" \
     && dpkg-query --showformat='${Version}' --show zlib1g | grep -qxF "${ZLIB1G_FIXED_VERSION}" \
     && rm -rf /var/lib/apt/lists/*
+# No pip at run time: the app's packages come from uv.lock at build time (/app/.venv), and the
+# base image's pip carries its own copies of urllib3, msgpack and setuptools code that the image
+# scan flags (and that nothing here uses). The bundled wheel for re-creating pip goes too.
+RUN python -m pip uninstall --yes --root-user-action=ignore pip \
+    && rm -rf /usr/local/lib/python3.14/ensurepip/_bundled \
+    && ! python -c "import pip" 2>/dev/null
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 WORKDIR /app
 COPY --from=build /app /app

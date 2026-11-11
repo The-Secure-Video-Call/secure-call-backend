@@ -48,3 +48,12 @@ def test_negative_an_unpinned_apt_install_is_caught() -> None:
     assert apt_upgrades_without_exact_versions(
         "RUN apt-get install --yes --only-upgrade zlib1g curl=8.0\n"
     ) == ["zlib1g"]
+
+
+def test_runtime_image_has_no_pip() -> None:
+    # pip is not needed to serve (the venv is built by uv), and its vendored libraries are flagged
+    # by the image scan; the runtime stage removes it and checks that it is gone.
+    runtime_stage = DOCKERFILE_TEXT.rsplit("\nFROM ", 1)[1]
+
+    assert "pip uninstall --yes" in runtime_stage
+    assert '! python -c "import pip"' in runtime_stage
