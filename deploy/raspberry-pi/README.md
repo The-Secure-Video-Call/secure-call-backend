@@ -274,6 +274,14 @@ internet scanners trying random logins), and Docker would otherwise save that on
 So `docker compose logs coturn` shows nothing. To debug a coturn that will not start, set the
 driver to `json-file` temporarily, look, and set it back.
 
+**Decision (#70, ASVS V16.3.4): coturn's errors stay discarded.** coturn has no setting that
+prints errors but leaves out the username: the failed-login line is a normal error line and
+carries the username, which holds a timestamp and a value derived from the room. Dropping only
+those lines would need a filter between coturn and Docker, and a new moving part that handles
+that output is worse than the gap. So no `turnserver.conf` change is made. A coturn that does
+not start is still visible: the container exits, and `docker compose ps` shows it. Revisit if
+coturn gains an option to leave usernames out of its error lines.
+
 The test inspects the container (as root, before each restart and at the end): a log file on the
 real filesystem fails, and a file on the tmpfs mounts is printed (masked) and fails if it contains
 a test username or peer IP. The test container keeps Docker's default logs only so it can check
