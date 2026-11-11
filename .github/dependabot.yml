@@ -1,29 +1,42 @@
 version: 2
 updates:
+  # Every entry waits 7 days after a release before proposing it, as in the web repo: a
+  # compromised release is usually found and pulled within days, and every version here is pinned
+  # exactly. Security updates for a known vulnerability do not wait (see SECURITY.md).
   - package-ecosystem: uv
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   # Base images in the Dockerfile (python, uv), pinned by digest.
   - package-ecosystem: docker
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   # The coturn base image, pinned by digest.
   - package-ecosystem: docker
     directory: /deploy/raspberry-pi/coturn
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
   # postgres in compose.yaml, pinned by digest. After merging a bump, update the Pi by hand
   # (see "PostgreSQL updates" in README.md): update.sh only updates the backend.
   - package-ecosystem: docker-compose
     directory: /deploy/raspberry-pi
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     ignore:
       # A new PostgreSQL major needs a data migration (pg_upgrade), never a plain image bump.
       - dependency-name: postgres
