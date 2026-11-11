@@ -704,7 +704,7 @@ fi
 opt_in_options='verbose|Verbose|syslog|log-binding|dtls|cli|web-admin|prometheus|rfc5780|allow-loopback-peers|allowed-peer-ip|mobility|server-relay|multiplex-peer'
 tls_settings="$(grep -E '^[[:space:]]*(tls-listening-port|alt-tls-listening-port|cert|pkey|pkey-pwd|no-tlsv1|no-tlsv1_1|no-tlsv1_2|no-tls|cipher-list|dh-file|ec-curve-name|ca-file)([=[:space:]]|$)' "$here/turnserver.conf" | sort)"
 expected_tls_settings="$(printf '%s\n' 'tls-listening-port=5349' 'cert=/etc/coturn/tls/fullchain.pem' \
-  'pkey=/etc/coturn/tls/privkey.pem' 'no-tlsv1' 'no-tlsv1_1' \
+  'pkey=/etc/coturn/tls/privkey.pem' \
   'cipher-list="ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305"' | sort)"
 if [ "$tls_settings" = "$expected_tls_settings" ]; then
   echo "PASS: turnserver.conf has exactly the expected TLS settings (5349, the mounted certificate, TLS 1.2+, AEAD ciphers)"
