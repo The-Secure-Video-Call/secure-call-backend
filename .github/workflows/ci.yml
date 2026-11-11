@@ -51,7 +51,7 @@ jobs:
             POSTGRES_PASSWORD=ci-only-throwaway \
             POSTGRES_APP_PASSWORD=ci-only-throwaway-app \
             DJANGO_SECRET_KEY=ci-only-throwaway-secret-key-not-used-anywhere-else-0123456789 \
-            DJANGO_ALLOWED_HOSTS=signal.example.invalid \
+            DJANGO_ALLOWED_HOSTS=signal.example.invalid,127.0.0.1 \
             SIGNALING_ALLOWED_ORIGINS=https://call.example.invalid \
             TURN_PUBLIC_IP=203.0.113.7 \
             TURN_RELAY_IP=127.0.0.1 > .env
@@ -110,39 +110,76 @@ jobs:
           echo "Plain HTTP gets no answer."
 
       # The proxy lines users paste into Nginx Proxy Manager (npm-advanced.conf), in an nginx
-      # server block shaped like Nginx Proxy Manager's: the health check and a signaling
-      # WebSocket pass through to the backend container, and with another CA trusted the proxy
-      # refuses the backend (502), so the certificate really is checked.
-      - name: The proxy's lines check the backend's certificate
+      # server block shaped like Nginx Proxy Manager's, in front of the real backend container:
+      #   - over HTTPS the health check and a signaling WebSocket pass, each security header once;
+      #   - plain HTTP gets 400 with the security headers, except the ACME challenge (#56);
+      #   - TRACE gets the proxy's own 405, with the security headers (#61);
+      #   - with another CA trusted, the proxy refuses the backend (502): the certificate is checked.
+      - name: The proxy's lines, in front of the backend
         working-directory: deploy/raspberry-pi
         run: |
+          mkdir -p "$RUNNER_TEMP/acme/.well-known/acme-challenge"
+          echo 'acme challenge served' >"$RUNNER_TEMP/acme/.well-known/acme-challenge/test-token"
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=front \
+            -days 1 -keyout "$RUNNER_TEMP/front.key" -out "$RUNNER_TEMP/front.crt" 2>/dev/null
           run_proxy() {
             docker rm -f npm-like >/dev/null 2>&1 || true
             docker run -d --name npm-like --network host \
               -v "$PWD/ci/npm-like-nginx.conf:/etc/nginx/nginx.conf:ro" \
               -v "$PWD/npm-advanced.conf:/etc/nginx/npm-advanced.conf:ro" \
+              -v "$PWD/ci/npm-2.16.0:/etc/nginx/npm:ro" \
+              -v "$RUNNER_TEMP/acme:/data/letsencrypt-acme-challenge:ro" \
+              -v "$RUNNER_TEMP/front.crt:/etc/nginx/front.crt:ro" \
+              -v "$RUNNER_TEMP/front.key:/etc/nginx/front.key:ro" \
               -v "$1:/data/secure-call/local-ca.crt:ro" \
               nginx:1.30-alpine@sha256:583b7f2fce1cdb8da5ad5c39ebd3c33b98b87d493190e548bdee1fa8c619c311 >/dev/null
             for attempt in $(seq 1 20); do
-              curl -s -o /dev/null --max-time 2 http://127.0.0.1:18080/ && return 0
+              curl -sk -o /dev/null --max-time 2 https://127.0.0.1:18443/healthz && return 0
               sleep 0.5
             done
             docker logs npm-like; return 1
           }
+          security_headers=(strict-transport-security x-content-type-options x-frame-options
+            referrer-policy cross-origin-opener-policy cross-origin-resource-policy
+            content-security-policy permissions-policy)
+          # $1 label, $2 expected status, $3 expected Content-Type, $4 response headers: each
+          # security header exactly once.
+          expect_response() {
+            local status_line content_type count header problems=""
+            status_line="$(head -n 1 <<<"$4" | tr -d '\r')"
+            content_type="$(grep -i '^content-type:' <<<"$4" | head -n 1 | cut -d' ' -f2- | tr -d '\r')"
+            [[ "$status_line" =~ ^HTTP/[0-9.]+\ $2([[:space:]]|$) ]] || problems+=" status '$status_line'"
+            [ "$content_type" = "$3" ] || problems+=" content-type '$content_type'"
+            for header in "${security_headers[@]}"; do
+              count="$(grep -ci "^$header:" <<<"$4" || true)"
+              [ "$count" = 1 ] || problems+=" $header x$count"
+            done
+            if [ -n "$problems" ]; then echo "FAIL: $1:$problems"; echo "$4"; return 1; fi
+            echo "PASS: $1 ($2, each security header once)"
+          }
           run_proxy "$PWD/tls/local-ca.crt"
-          health="$(curl -sS --max-time 5 http://127.0.0.1:18080/healthz)"
-          if [ "$health" != '{"status": "ok"}' ]; then
-            echo "Through the proxy: $health"; docker logs npm-like; exit 1
-          fi
-          echo "Through the proxy: $health"
-          uv run python ci/websocket_join.py ws://127.0.0.1:18080/ws/signal/ https://call.example.invalid
-          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -subj /CN=other-ca \
-            -days 1 -keyout "$RUNNER_TEMP/other-ca.key" -out "$RUNNER_TEMP/other-ca.crt" 2>/dev/null
-          run_proxy "$RUNNER_TEMP/other-ca.crt"
-          status="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 http://127.0.0.1:18080/healthz)"
+          health="$(curl -sk --max-time 5 https://127.0.0.1:18443/healthz)"
+          [ "$health" = '{"status": "ok"}' ] || { echo "Through the proxy: $health"; docker logs npm-like; exit 1; }
+          expect_response "proxied health check over HTTPS" 200 application/json \
+            "$(curl -sk -D - -o /dev/null --max-time 5 https://127.0.0.1:18443/healthz)"
+          uv run python ci/websocket_join.py wss://127.0.0.1:18443/ws/signal/ https://call.example.invalid
+          html='text/html; charset=utf-8'
+          expect_response "plain HTTP refused" 400 "$html" \
+            "$(curl -s -D - -o /dev/null --max-time 5 http://127.0.0.1:18080/healthz)"
+          expect_response "plain HTTP WebSocket path refused" 400 "$html" \
+            "$(curl -s -D - -o /dev/null --max-time 5 http://127.0.0.1:18080/ws/signal/)"
+          # The ACME exception goes by the normalised path, so a dot-segment cannot reach past it.
+          expect_response "plain HTTP with ../ after the ACME path refused" 400 "$html" \
+            "$(curl -s --path-as-is -D - -o /dev/null --max-time 5 http://127.0.0.1:18080/.well-known/acme-challenge/../healthz)"
+          acme="$(curl -s --max-time 5 http://127.0.0.1:18080/.well-known/acme-challenge/test-token)"
+          [ "$acme" = "acme challenge served" ] || { echo "FAIL: the ACME challenge over HTTP: $acme"; exit 1; }
+          echo "PASS: the ACME challenge still answers over plain HTTP"
+          expect_response "TRACE answered by the proxy" 405 "$html" \
+            "$(curl -sk -X TRACE -D - -o /dev/null --max-time 5 https://127.0.0.1:18443/)"
+          run_proxy "$RUNNER_TEMP/front.crt"   # any other CA
+          expect_response "with another CA trusted, the proxy refuses the backend" 502 "$html" \
+            "$(curl -sk -D - -o /dev/null --max-time 5 https://127.0.0.1:18443/healthz)"
           docker rm -f npm-like >/dev/null
-          if [ "$status" != 502 ]; then echo "With another CA the proxy answered $status, not 502"; exit 1; fi
-          echo "With another CA trusted, the proxy refuses the backend: $status"
 
       - name: Django production checks
         env:

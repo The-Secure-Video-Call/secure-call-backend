@@ -80,8 +80,9 @@ def test_readme_shows_exactly_the_proxy_lines_ci_tests() -> None:
     readme = (ROOT / "README.md").read_text()
 
     assert "proxy_ssl_verify on;" in advanced_lines
-    for line in advanced_lines:
-        assert f"   {line}\n" in readme, line
+    # One block, in this order: swapped if-blocks would refuse every ACME challenge.
+    block = "   ```nginx\n" + "".join(f"   {line}\n" for line in advanced_lines) + "   ```\n"
+    assert block in readme
 
 
 COTURN_REQUIRED = (

@@ -223,11 +223,43 @@ Manager already running.
    Then **Add Proxy Host:** domain `signal.securevideocall.com`; scheme **`https`**, forward
    hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
    machine), port `8001`; **Websockets Support** and **Block
-   Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **Force SSL**, **HTTP/2**
-   and **HSTS** on. **Advanced tab**, Custom Nginx Configuration: the lines of
-   `deploy/raspberry-pi/npm-advanced.conf` (CI runs exactly these against the backend):
+   Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **HTTP/2** on, and
+   **Force SSL** and **HSTS** **off**: the lines below replace both. They answer plain HTTP
+   with an error instead of a redirect, so a client wrongly using `http://` or `ws://` is
+   noticed (#56), but still let Let's Encrypt's challenge through for renewals; and they send
+   the backend's security headers (HSTS among them) on the pages the proxy makes itself, such
+   as that error and its 405 for TRACE (#61). **Advanced tab**, Custom Nginx Configuration: the
+   lines of `deploy/raspberry-pi/npm-advanced.conf` (CI runs exactly these against the
+   backend; its comments explain each part). Add no Custom Locations to this host:
    ```nginx
    access_log off;
+   set $refuse_plain_http "";
+   if ($scheme = "http") {
+     set $refuse_plain_http "1";
+   }
+   if ($uri ~ "^/\.well-known/acme-challenge/") {
+     set $refuse_plain_http "";
+   }
+   if ($refuse_plain_http) {
+     return 400;
+   }
+   add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+   add_header X-Content-Type-Options "nosniff" always;
+   add_header X-Frame-Options "DENY" always;
+   add_header Referrer-Policy "no-referrer" always;
+   add_header Cross-Origin-Opener-Policy "same-origin" always;
+   add_header Cross-Origin-Resource-Policy "same-origin" always;
+   add_header Content-Security-Policy "default-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'" always;
+   add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), display-capture=()" always;
+   charset utf-8;
+   error_page 502 @proxy_502;
+   error_page 504 @proxy_504;
+   location @proxy_502 {
+     return 502;
+   }
+   location @proxy_504 {
+     return 504;
+   }
    proxy_ssl_verify on;
    proxy_ssl_trusted_certificate /data/secure-call/local-ca.crt;
    proxy_ssl_name secure-call-backend;
@@ -243,6 +275,28 @@ Manager already running.
    docker exec nginx-proxy-manager-app-1 sh -c \
      'grep -E "proxy_ssl_(verify on|trusted_certificate|name)" /data/nginx/proxy_host/5.conf'
    ```
+   Then, from anywhere, each of these must print its status and `8` (the 8 security headers,
+   each once; a `9` or more means one came twice, for example with Force SSL or HSTS left on):
+   ```sh
+   headers='^(strict-transport-security|x-content-type-options|x-frame-options|referrer-policy|cross-origin-opener-policy|cross-origin-resource-policy|content-security-policy|permissions-policy):'
+   for check in 'http://signal.securevideocall.com/healthz' '-X TRACE https://signal.securevideocall.com/' 'https://signal.securevideocall.com/healthz'; do
+     curl -sS -o /dev/null -D - $check | tee >(head -n 1 >&2) | grep -ciE "$headers"
+   done   # 400 then 8, 405 then 8, 200 then 8
+   ```
+   and a renewal must still work (Let's Encrypt's challenge comes over plain HTTP). With the
+   host's id from step 6 (5 here), as Nginx Proxy Manager runs it itself:
+   ```sh
+   cert=$(docker exec nginx-proxy-manager-app-1 grep -o 'npm-[0-9]*' /data/nginx/proxy_host/5.conf | head -n 1)
+   docker exec nginx-proxy-manager-app-1 certbot renew --dry-run --config /etc/letsencrypt.ini \
+     --work-dir /tmp/letsencrypt-lib --logs-dir /data/logs --cert-name "$cert" --preferred-challenges http
+   ```
+   (If you set `PUID`/`PGID` for the proxy's container, add `-u <PUID>:<PGID>` after `exec`.)
+   The CDN in front of the static site (StackCDN) makes two responses of its own, its `http://`
+   to `https://` redirect and its 405 for TRACE, and they carry none of the site's headers. Its
+   "Security Headers" panel cannot change that: tested on 2026-11-11, a header set there was
+   added a second time to every response from the site and did not reach those two (#61). So
+   the panel stays empty: the site's headers come only from its `.htaccess`, and the two CDN
+   responses have no body worth protecting.
 
    `access_log off;` means the proxy keeps no record of who connected when (PLAN.md §3.5: no request logging of IP
    addresses; this app's own logs never contain them). The proxy still writes this host's error
@@ -330,8 +384,9 @@ backend image" run (not even a Dependabot one):
 2. **On the proxy machine**, copy `tls/local-ca.crt` into the proxy (setup step 4), but don't
    change the host yet.
 3. **Approve the publish** and wait until it finishes. Then, without waiting for cron:
-   `./update.sh` on this Pi, and **at once** switch the proxy host to `https` and add the
-   Advanced lines from setup step 4.
+   `./update.sh` on this Pi, and **at once** switch the proxy host to `https`, turn its
+   **Force SSL** and **HSTS** off and paste the Advanced lines from setup step 4 (all of
+   `npm-advanced.conf`), and run that step's checks.
 4. **Check**, then put the cron line back:
    ```sh
    docker compose ps    # backend and postgres running
