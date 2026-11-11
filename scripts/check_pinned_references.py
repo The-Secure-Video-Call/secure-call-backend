@@ -23,7 +23,8 @@ from pathlib import Path
 from typing import NamedTuple
 
 # Images we build ourselves, on purpose referenced by a moving tag, and only where they are used:
-# update.sh pulls `main`, and the coturn image is built on the Pi from a pinned Dockerfile.
+# update.sh points the local `main` tag at the digest it verified, and the coturn image is built
+# on the Pi from a pinned Dockerfile.
 OWN_IMAGES_BY_FILE = {
     "deploy/raspberry-pi/compose.yaml": frozenset(
         {

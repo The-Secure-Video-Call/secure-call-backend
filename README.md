@@ -155,15 +155,21 @@ Browser --wss://signal.securevideocall.com--> router :443 --> Nginx Proxy Manage
         --> Pi :8001 (secure-call-backend container) --> PostgreSQL container
 ```
 
-**How updates arrive:** every merge to `main` runs **Publish backend image**
-(`.github/workflows/publish-image.yml`). After approval in the repo's **production**
-environment, it builds the image for arm64 (the Pi) and amd64 and publishes it as
-`ghcr.io/the-secure-video-call/secure-call-backend:main`. On the Pi, `update.sh` (run by cron)
-pulls a new image and restarts the backend. GitHub never connects to the Pi.
+**How updates arrive:** every pull request and every merge to `main` runs **Publish backend
+image** (`.github/workflows/publish-image.yml`), which builds the image, smoke-tests it and scans
+its Debian packages with Trivy: a HIGH or CRITICAL vulnerability that has a fix fails the run
+(those Debian has no fixed package for yet are left out: no rebuild could remove them). On
+`main`, after approval in the repo's **production** environment, it builds the image for arm64
+(the Pi) and amd64 with an SBOM and BuildKit provenance in the image index, publishes it as
+`ghcr.io/the-secure-video-call/secure-call-backend:main`, and signs a build provenance attestation
+for its digest. On the Pi, `update.sh` verifies that attestation with `gh attestation verify` and
+only then runs that exact digest and restarts the backend (see "Updating the backend" in
+`deploy/raspberry-pi/README.md`). GitHub never connects to the Pi.
 
 ### One-time setup on the Pi
 
-Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager already running.
+Requirements: 64-bit OS, Docker with the Compose and buildx plugins (both come with Docker's
+own packages), gh 2.102.0 or newer (step 5), Nginx Proxy Manager already running.
 
 1. **DNS:** in ServerByt's DNS editor, point `signal.securevideocall.com` (A record) at your
    home's static IP.
@@ -175,8 +181,13 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
    git clone https://github.com/The-Secure-Video-Call/secure-call-backend.git
    cd secure-call-backend/deploy/raspberry-pi
    cp .env.example .env        # set BACKEND_PUBLISH_ADDR, DJANGO_SECRET_KEY, POSTGRES_PASSWORD
+   docker compose up -d postgres
+   ./update.sh                 # after the gh setup in step 5: pulls only a verified backend image
    docker compose up -d
    ```
+   Run `update.sh` before the first full `docker compose up -d`: compose would otherwise pull
+   `:main` itself, without verifying it. Once `update.sh` has put the verified image there,
+   compose uses it and pulls no backend image.
 4. **Nginx Proxy Manager, Add Proxy Host:** domain `signal.securevideocall.com`; scheme `http`,
    forward hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
    machine), port `8001`; **Websockets Support** and **Block
@@ -192,10 +203,15 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
    destination). Either accept that (it holds failures only), or keep all of the proxy's logs in
    memory by adding `tmpfs: ["/data/logs:size=16m"]` to its service in its own compose file (this
    affects every host on that proxy, and the logs then vanish on restart).
-5. **Automatic updates:** `crontab -e`, then add (with your path):
+5. **Updates:** install gh and give it a read-only token once (the one-time setup in
+   `deploy/raspberry-pi/README.md`, "Updating the backend"), check with
+   `deploy/raspberry-pi/update.sh --check`, then run `deploy/raspberry-pi/update.sh` whenever a new
+   image is published. **Automatic updates** (optional): `crontab -e`, then add (with your path):
    ```
    */5 * * * * /home/pi/secure-call-backend/deploy/raspberry-pi/update.sh >/dev/null 2>&1
    ```
+   This discards the output, so an image that fails verification is skipped silently (the
+   backend keeps running the last verified one); drop `>/dev/null 2>&1` to get cron's mail.
 6. **Check:** `curl https://signal.securevideocall.com/healthz` returns `{"status": "ok"}`.
    Then make a short call and, on the proxy machine, check that this host's access log stays
    empty (replace the container name and look up the host's `<id>` first):
