@@ -165,8 +165,9 @@ session takes them all out. Until step 4, a reboot removes them too.
 
 1. **Give the networks their bridge names** (right after the `git pull` that brings this, at a
    quiet time: calls drop for a moment): `docker compose down && docker compose up -d`. Never add
-   `--volumes`, which deletes the database. Check: `ip -br addr show br-securecall br-turn` shows
-   `172.30.200.17/28` and `172.30.200.1/29`. Later `down`/`up` runs need nothing: the rules match
+   `--volumes`, which deletes the database. Check (`ip` takes one device at a time):
+   `ip -br addr show br-securecall` shows `172.30.200.17/28` and `ip -br addr show br-turn` shows
+   `172.30.200.1/29`. Later `down`/`up` runs need nothing: the rules match
    the bridges by name.
 2. **Check `.env`:** `TRUSTED_PROXY_IPS` is the proxy machine's LAN IP (the backend uses it too)
    and `TURN_PUBLIC_IP` is set. Then look at the rules: `./firewall.sh --print` must end without
