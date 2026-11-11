@@ -7,7 +7,7 @@ from channels.layers import get_channel_layer
 from channels.testing import WebsocketCommunicator
 
 from config.asgi import application
-from signaling import consumers
+from signaling import consumers, rooms
 from signaling.consumers import CLOSE_MESSAGE_TOO_BIG, CLOSE_POLICY_VIOLATION
 from signaling.rooms import (
     TOTAL_LIFETIME_LIMIT_SECONDS,
@@ -400,3 +400,38 @@ async def test_stale_room_expired_event_after_leave_and_rejoin_is_ignored(
     assert await first.receive_nothing()
     assert registry.room_count() == 1
     await first.disconnect()
+
+
+class FailingChannelLayer:
+    """Channel layer whose calls fail with messages that contain identifiers."""
+
+    async def group_discard(self, group_name: str, channel_name: str) -> None:
+        raise RuntimeError(f"secret-room-id {group_name} {channel_name}")
+
+    async def send(self, channel_name: str, message: dict[str, str]) -> None:
+        raise RuntimeError(f"secret-room-id {channel_name}")
+
+
+async def test_room_expiry_failures_are_logged_with_fixed_text_and_no_identifiers(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(rooms, "get_channel_layer", FailingChannelLayer)
+    caplog.set_level("WARNING", logger="signaling.rooms")
+    await rooms.send_room_expired_to_channels("secret-room-id", ["specific.channel!name"])
+    assert [record.getMessage() for record in caplog.records] == [
+        "Room expiry: removing a connection from its room group failed.",
+        "Room expiry: telling a connection its room expired failed.",
+    ]
+    assert all(record.exc_info is None for record in caplog.records)
+    assert "secret-room-id" not in caplog.text
+    assert "specific.channel!name" not in caplog.text
+    assert group_name_for_room("secret-room-id") not in caplog.text
+
+
+async def test_room_expiry_failure_for_one_connection_does_not_stop_the_next(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(rooms, "get_channel_layer", FailingChannelLayer)
+    caplog.set_level("WARNING", logger="signaling.rooms")
+    await rooms.send_room_expired_to_channels("r", ["a", "b"])
+    assert len(caplog.records) == 4

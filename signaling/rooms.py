@@ -12,14 +12,16 @@ creates a new room (no list of old room IDs is kept).
 """
 
 import asyncio
-import contextlib
 import hashlib
+import logging
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Final, Literal
 
 from channels.layers import get_channel_layer
+
+logger = logging.getLogger(__name__)
 
 MAX_MEMBERS_PER_ROOM: Final = 2
 # Production expiry limits (PLAN.md section 7). Fixed in code on purpose: not environment variables.
@@ -47,12 +49,18 @@ async def send_room_expired_to_channels(room_id: str, channel_names: list[str]) 
         return
     group_name = group_name_for_room(room_id)
     for channel_name in channel_names:
-        with contextlib.suppress(Exception):
+        # Fixed texts only, and no `exc_info`: neither the room ID, the group name, the channel
+        # name nor the exception text (which may contain them) may reach the log.
+        try:
             await channel_layer.group_discard(group_name, channel_name)
-        with contextlib.suppress(Exception):
+        except Exception:
+            logger.warning("Room expiry: removing a connection from its room group failed.")
+        try:
             await channel_layer.send(
                 channel_name, {"type": "room_expired", "group_name": group_name}
             )
+        except Exception:
+            logger.warning("Room expiry: telling a connection its room expired failed.")
 
 
 @dataclass
