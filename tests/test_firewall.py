@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -185,39 +186,63 @@ OTHER_IPV6_RULES: dict[str, list[str]] = {
 }
 
 COTURN_TCP = "-d 172.30.200.2/32 -o br-turn -p tcp -m multiport --dports 3478,5349"
-EXPECTED_FORWARD_RULES = [
-    "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN",
-    "-i br-securecall -o br-securecall -j RETURN",
-    "-i br-securecall -j DROP",
-    f"-s {PROXY_IP}/32 -o br-securecall -p tcp -m tcp --dport 8000 -m conntrack --ctstate DNAT"
-    " -j RETURN",
-    "-o br-securecall -p tcp -m tcp --dport 5432 -m conntrack --ctstate DNAT -j RETURN",
-    "-o br-securecall -j DROP",
-    f"{COTURN_TCP} -m conntrack --ctstate NEW -m connlimit --connlimit-above 24"
-    " --connlimit-mask 32 --connlimit-saddr -j DROP",
-    f"{COTURN_TCP} -m conntrack --ctstate NEW -m hashlimit --hashlimit-above 60/minute"
-    " --hashlimit-burst 30 --hashlimit-mode srcip --hashlimit-name securecall-turn"
-    " --hashlimit-htable-expire 60000 -j DROP",
-    "-d 172.30.200.2/32 -o br-turn -p udp -m multiport --dports 3478,49160:49200"
-    " -m conntrack --ctstate DNAT -j RETURN",
-    f"{COTURN_TCP} -m conntrack --ctstate DNAT -j RETURN",
-    "-o br-turn -j DROP",
-    *(
-        f"-d {denied} -i br-turn -j DROP"
-        for denied in (
-            "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
-            "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24",
-            "192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24",
-            "224.0.0.0/4", "240.0.0.0/4", f"{PUBLIC_IP}/32",
-        )
-    ),
-]  # fmt: skip
+DENIED_FOR_COTURN = (
+    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+    "192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15",
+    "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+)  # fmt: skip
+HASHLIMIT_NAME = re.compile(r"--hashlimit-name (sc-turn-[0-9a-f]{4}) ")
+
+
+def expected_forward_rules(
+    hashlimit_name: str, proxies: tuple[str, ...] = (PROXY_IP,), public_ip: str | None = PUBLIC_IP
+) -> list[str]:
+    """SECURE-CALL-FWD as it must be, in this order."""
+    return [
+        "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN",
+        # The backend's bridge starts nothing outside itself (rejected: fails fast).
+        "-i br-securecall -o br-securecall -j RETURN",
+        "-i br-securecall -p tcp -j REJECT --reject-with tcp-reset",
+        "-i br-securecall -j REJECT --reject-with icmp-port-unreachable",
+        # coturn's bridge reaches public addresses only, before anything is let into a bridge.
+        "-i br-turn -o br-securecall -j DROP",
+        *(f"-d {denied} -i br-turn -j DROP" for denied in DENIED_FOR_COTURN),
+        *([f"-d {public_ip}/32 -i br-turn -j DROP"] if public_ip else []),
+        # Into the backend's bridge: the proxy to 8000, and PostgreSQL's published port.
+        *(
+            f"-s {proxy}/32 -o br-securecall -p tcp -m tcp --dport 8000"
+            " -m conntrack --ctstate DNAT -j RETURN"
+            for proxy in proxies
+        ),
+        "-o br-securecall -p tcp -m tcp --dport 5432 -m conntrack --ctstate DNAT -j RETURN",
+        "-o br-securecall -j DROP",
+        # Into coturn's bridge: its published ports, TCP limited per source address.
+        f"{COTURN_TCP} -m conntrack --ctstate NEW -m connlimit --connlimit-above 64"
+        " --connlimit-mask 32 --connlimit-saddr -j DROP",
+        f"{COTURN_TCP} -m conntrack --ctstate NEW -m hashlimit --hashlimit-above 60/minute"
+        f" --hashlimit-burst 30 --hashlimit-mode srcip --hashlimit-name {hashlimit_name}"
+        " --hashlimit-htable-size 65536 --hashlimit-htable-max 262144"
+        " --hashlimit-htable-expire 35000 -j DROP",
+        "-d 172.30.200.2/32 -o br-turn -p udp -m multiport --dports 3478,49160:49200"
+        " -m conntrack --ctstate DNAT -j RETURN",
+        f"{COTURN_TCP} -m conntrack --ctstate DNAT -j RETURN",
+        "-o br-turn -j DROP",
+    ]
+
+
 EXPECTED_INPUT_RULES = [
     "-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN",
-    "-i br-securecall -j DROP",
+    "-i br-securecall -p tcp -j REJECT --reject-with tcp-reset",
+    "-i br-securecall -j REJECT --reject-with icmp-port-unreachable",
     "-i br-turn -j DROP",
 ]
 EXPECTED_IPV6_INPUT_RULES = ["-i br-securecall -j DROP", "-i br-turn -j DROP"]
+
+
+def hashlimit_name_in(rules: str | list[str]) -> str:
+    match = HASHLIMIT_NAME.search(rules if isinstance(rules, str) else " ".join(rules) + " ")
+    assert match is not None, rules
+    return match[1]
 
 
 class FakeHost:
@@ -303,7 +328,7 @@ def test_print_shows_exactly_these_rules_and_touches_nothing(tmp_path: Path) -> 
 
     assert result.returncode == 0, result.stderr
     assert printed_rules(result.stdout) == {
-        f"4 {FORWARD_CHAIN}": EXPECTED_FORWARD_RULES,
+        f"4 {FORWARD_CHAIN}": expected_forward_rules(hashlimit_name_in(result.stdout)),
         f"4 {INPUT_CHAIN}": EXPECTED_INPUT_RULES,
         f"6 {INPUT_CHAIN}": EXPECTED_IPV6_INPUT_RULES,
     }
@@ -316,7 +341,8 @@ def test_applies_its_own_chains_and_leaves_everything_else_alone(tmp_path: Path)
 
     assert result.returncode == 0, result.stderr
     ipv4, ipv6 = host.table("4"), host.table("6")
-    assert applied(ipv4, FORWARD_CHAIN) == EXPECTED_FORWARD_RULES
+    forward = applied(ipv4, FORWARD_CHAIN)
+    assert forward == expected_forward_rules(hashlimit_name_in(forward))
     assert applied(ipv4, INPUT_CHAIN) == EXPECTED_INPUT_RULES
     assert applied(ipv6, INPUT_CHAIN) == EXPECTED_IPV6_INPUT_RULES
     assert ipv4["DOCKER-USER"] == [f"-j {FORWARD_CHAIN}", *OTHER_IPV4_RULES["DOCKER-USER"]]
@@ -327,6 +353,7 @@ def test_applies_its_own_chains_and_leaves_everything_else_alone(tmp_path: Path)
     for chain in ("FORWARD", "OUTPUT", "DOCKER-USER"):
         assert ipv6[chain] == OTHER_IPV6_RULES[chain]
     assert f"Only {PROXY_IP} may connect" in result.stdout
+    assert "ERROR" not in result.stderr
 
 
 def test_running_twice_leaves_exactly_one_jump_and_the_same_rules(tmp_path: Path) -> None:
@@ -353,39 +380,116 @@ def test_stale_rules_and_extra_or_moved_jumps_are_replaced(tmp_path: Path) -> No
     result = host.run()
 
     assert result.returncode == 0, result.stderr
+    forward = host.table("4")[FORWARD_CHAIN]
     assert host.table("4")["DOCKER-USER"] == [f"-j {FORWARD_CHAIN}", "-i br-x -j ACCEPT"]
-    assert host.table("4")[FORWARD_CHAIN] == EXPECTED_FORWARD_RULES
+    assert forward == expected_forward_rules(hashlimit_name_in(forward))
+
+
+# Which rule first decides a new packet, by the parts of a rule that these tests use (bridges,
+# destination, port, DNAT). A small model of iptables' first match, to check the order.
+class Packet(NamedTuple):
+    in_bridge: str
+    out_bridge: str
+    destination: str
+    protocol: str = "tcp"
+    port: int = 0
+    source: str = "198.51.100.50"
+    dnat: bool = False
+
+
+def first_verdict(rules: list[str], packet: Packet) -> str:
+    for rule in rules:
+        words = rule.split()
+
+        def value(option: str, rule_words: list[str] = words) -> str | None:
+            return rule_words[rule_words.index(option) + 1] if option in rule_words else None
+
+        if "RELATED,ESTABLISHED" in rule or "NEW" in words or "limit" in rule:
+            continue  # neither an established packet nor a limit applies to one new packet
+        checks = [
+            value("-i") in (None, packet.in_bridge),
+            value("-o") in (None, packet.out_bridge),
+            value("-p") in (None, packet.protocol),
+            "DNAT" not in words or packet.dnat,
+        ]
+        if destination := value("-d"):
+            checks.append(
+                ipaddress.ip_address(packet.destination) in ipaddress.ip_network(destination)
+            )
+        if source := value("-s"):
+            checks.append(ipaddress.ip_address(packet.source) in ipaddress.ip_network(source))
+        if port := value("--dport"):
+            checks.append(str(packet.port) == port)
+        if ports := value("--dports"):
+            checks.append(packet.port in multiport_ports(ports))
+        if all(checks):
+            return str(value("-j"))
+    return "RETURN"
+
+
+# coturn reaching PostgreSQL's port published on the Pi's address (DNAT'd into the backend's
+# bridge), or the backend's port, or a LAN address; and what must still work.
+COTURN_TO_POSTGRES = Packet("br-turn", "br-securecall", "172.30.200.18", port=5432, dnat=True)
+COTURN_TO_BACKEND = Packet("br-turn", "br-securecall", "172.30.200.18", port=8000, dnat=True)
+
+
+def test_coturn_cannot_reach_the_backend_bridge_through_a_published_port() -> None:
+    rules = expected_forward_rules("sc-turn-0000")
+    lan_to_postgres = Packet("eth0", "br-securecall", "172.30.200.19", port=5432, dnat=True)
+    proxy_to_backend = COTURN_TO_BACKEND._replace(in_bridge="eth0", source=PROXY_IP)
+    lan_to_backend = proxy_to_backend._replace(source="192.168.1.77")
+    internet_to_coturn = Packet("eth0", "br-turn", "172.30.200.2", "udp", 49160, dnat=True)
+
+    assert first_verdict(rules, COTURN_TO_POSTGRES) == "DROP"
+    assert first_verdict(rules, COTURN_TO_BACKEND) == "DROP"
+    assert first_verdict(rules, Packet("br-turn", "eth0", "192.168.1.1", port=80)) == "DROP"
+    assert first_verdict(rules, Packet("br-turn", "eth0", PUBLIC_IP, port=443)) == "DROP"
+    assert first_verdict(rules, Packet("br-turn", "eth0", "1.1.1.1", port=443)) == "RETURN"
+    assert first_verdict(rules, Packet("br-securecall", "eth0", "1.1.1.1", port=443)) == "REJECT"
+    assert first_verdict(rules, lan_to_postgres) == "RETURN"  # as POSTGRES_PUBLISH_ADDR allows
+    assert first_verdict(rules, proxy_to_backend) == "RETURN"
+    assert first_verdict(rules, lan_to_backend) == "DROP"
+    assert first_verdict(rules, internet_to_coturn) == "RETURN"
+
+
+def test_negative_the_old_order_would_let_coturn_into_postgresql() -> None:
+    rules = expected_forward_rules("sc-turn-0000")
+    turn_egress = [rule for rule in rules if "-i br-turn" in rule]
+    old_order = [rule for rule in rules if rule not in turn_egress] + turn_egress
+
+    assert first_verdict(old_order, COTURN_TO_POSTGRES) == "RETURN"
+    assert first_verdict(rules, COTURN_TO_POSTGRES) == "DROP"
+
+
+def script_constant(script: str, name: str) -> int:
+    match = re.search(rf"^{name}=(\d+)", script, re.M)
+    assert match is not None, name
+    return int(match[1])
 
 
 def test_coturn_tcp_limits_come_before_its_accept_and_spare_a_callers_connections() -> None:
-    rules = EXPECTED_FORWARD_RULES
+    rules = expected_forward_rules("sc-turn-0000")
     tcp_return = rules.index(f"{COTURN_TCP} -m conntrack --ctstate DNAT -j RETURN")
     limits = [index for index, rule in enumerate(rules) if "limit-" in rule]
     script = (DEPLOY / "firewall.sh").read_text()
 
     def constant(name: str) -> int:
-        match = re.search(rf"^{name}=(\d+)", script, re.M)
-        assert match is not None, name
-        return int(match[1])
+        return script_constant(script, name)
 
     assert len(limits) == 2
-    assert all(rules.index("-m conntrack --ctstate RELATED,ESTABLISHED -j RETURN") < index
-               for index in limits)  # fmt: skip
     assert max(limits) < tcp_return
     assert all(COTURN_TCP in rules[index] and "-j DROP" in rules[index] for index in limits)
     assert not any("limit-" in rule for rule in rules if "-p udp" in rule or "8000" in rule)
     # One caller: 2 TCP URLs (TCP and TLS) x 2 network interfaces x 2 during an ICE restart.
     connections_per_caller = 2 * 2 * 2
-    assert constant("turn_tcp_max_connections_per_source") >= 2 * connections_per_caller
+    assert constant("turn_tcp_max_connections_per_source") >= 8 * connections_per_caller
     assert constant("turn_tcp_new_connections_burst") >= 2 * connections_per_caller
     expire_seconds = constant("turn_tcp_hashlimit_expire_milliseconds") / 1000
     refill_seconds = constant("turn_tcp_new_connections_burst") / (
         constant("turn_tcp_new_connections_per_minute") / 60
     )
-    assert expire_seconds > refill_seconds
-    hashlimit_name = re.search(r"^turn_tcp_hashlimit_name=(\S+)$", script, re.M)
-    assert hashlimit_name is not None
-    assert len(hashlimit_name[1]) <= 15  # the kernel's limit for a hashlimit table name
+    assert refill_seconds < expire_seconds <= refill_seconds + 10
+    assert constant("turn_tcp_hashlimit_max") >= constant("turn_tcp_hashlimit_size")
 
 
 def test_negative_limits_after_the_accept_would_be_caught() -> None:
@@ -396,13 +500,41 @@ def test_negative_limits_after_the_accept_would_be_caught() -> None:
             "limit-" in rule for rule in rules
         )
 
-    limits = [rule for rule in EXPECTED_FORWARD_RULES if "limit-" in rule]
-    moved = [rule for rule in EXPECTED_FORWARD_RULES if "limit-" not in rule] + limits
-    without = [rule for rule in EXPECTED_FORWARD_RULES if "limit-" not in rule]
+    rules = expected_forward_rules("sc-turn-0000")
+    limits = [rule for rule in rules if "limit-" in rule]
+    moved = [rule for rule in rules if "limit-" not in rule] + limits
+    without = [rule for rule in rules if "limit-" not in rule]
 
-    assert limits_apply(EXPECTED_FORWARD_RULES)
+    assert limits_apply(rules)
     assert not limits_apply(moved)
     assert not limits_apply(without)
+
+
+@pytest.mark.parametrize(
+    ("constant", "new_value"),
+    [
+        ("turn_tcp_new_connections_burst", "31"),
+        ("turn_tcp_new_connections_per_minute", "61"),
+        ("turn_tcp_hashlimit_expire_milliseconds", "36000"),
+        ("turn_tcp_hashlimit_size", "32768"),
+        ("turn_tcp_hashlimit_max", "131072"),
+    ],
+)
+def test_changed_limit_values_get_a_new_hashlimit_table(
+    tmp_path: Path, constant: str, new_value: str
+) -> None:
+    host = FakeHost(tmp_path)
+    original = hashlimit_name_in(host.run("--print").stdout)
+    script = host.deploy / "firewall.sh"
+    text = script.read_text()
+    old_line = re.search(rf"^{constant}=\d+", text, re.M)
+    assert old_line is not None
+    script.write_text(text.replace(old_line[0], f"{constant}={new_value}", 1))
+    changed = hashlimit_name_in(host.run("--print").stdout)
+
+    assert len(original) <= 15  # the kernel's limit for a hashlimit table name
+    assert hashlimit_name_in(host.run("--print").stdout) == changed
+    assert changed != original
 
 
 # --- Removing, checking --------------------------------------------------------------------------
@@ -480,31 +612,18 @@ def test_check_passes_only_when_everything_is_in_place(tmp_path: Path) -> None:
 # --- Where the values come from ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "env_text",
-    [
-        None,
-        f"TURN_PUBLIC_IP={PUBLIC_IP}\n",
-        f"TRUSTED_PROXY_IPS=\nTURN_PUBLIC_IP={PUBLIC_IP}\n",
-        f"TRUSTED_PROXY_IPS= , ,\nTURN_PUBLIC_IP={PUBLIC_IP}\n",
-        f"TRUSTED_PROXY_IPS={PROXY_IP}\n",
-    ],
-    ids=["no-env-file", "no-proxy-line", "empty-proxy", "only-commas", "no-public-ip"],
-)
-def test_negative_refuses_to_run_without_the_proxy_or_public_ip(
-    tmp_path: Path, env_text: str | None
-) -> None:
-    host = FakeHost(tmp_path, env_text=env_text)
+def test_ipv6_proxy_entries_are_skipped_with_a_warning(tmp_path: Path) -> None:
+    # The backend accepts this list (config/settings.py); only IPv4 reaches the published port.
+    host = FakeHost(tmp_path, env_text=f"TRUSTED_PROXY_IPS={PROXY_IP}, fd00::1\n"
+                                       f"TURN_PUBLIC_IP={PUBLIC_IP}\n")  # fmt: skip
     result = host.run()
-    printed = host.run("--print")
 
-    assert result.returncode == 1
-    assert re.search(r"TRUSTED_PROXY_IPS|TURN_PUBLIC_IP|--env-file", result.stderr)
-    assert "Nothing was changed." in result.stderr
-    assert printed.returncode == 1
-    assert host.table("4") == OTHER_IPV4_RULES
-    assert host.table("6") == OTHER_IPV6_RULES
-    assert not any(call.split()[0].endswith("-restore") for call in host.calls())
+    assert result.returncode == 0, result.stderr
+    assert "WARNING" in result.stderr
+    assert "'fd00::1' skipped" in result.stderr
+    assert "ERROR" not in result.stderr
+    forward = host.table("4")[FORWARD_CHAIN]
+    assert forward == expected_forward_rules(hashlimit_name_in(forward))
 
 
 NOT_IPV4 = [
@@ -519,40 +638,98 @@ NOT_IPV4 = [
     "192.168.1.2 -j ACCEPT",
     "192.168.1.2;reboot",
     "$(touch pwned)",
+    "${PROXY_IP}",
 ]
 
 
-@pytest.mark.parametrize("value", NOT_IPV4)
-@pytest.mark.parametrize("where", ["--proxy-ip", "TRUSTED_PROXY_IPS", "TURN_PUBLIC_IP"])
-def test_negative_refuses_a_value_that_is_not_an_ipv4_address(
-    tmp_path: Path, value: str, where: str
+@pytest.mark.parametrize(
+    "proxy_lines",
+    [
+        "",
+        "TRUSTED_PROXY_IPS=\n",
+        "TRUSTED_PROXY_IPS= , ,\n",
+        "TRUSTED_PROXY_IPS=fd00::1, fe80::1\n",
+        *(f"TRUSTED_PROXY_IPS={value}\n" for value in NOT_IPV4),
+    ],
+)
+def test_negative_without_a_usable_proxy_address_the_backend_port_is_closed_to_everyone(
+    tmp_path: Path, proxy_lines: str
 ) -> None:
-    proxy_value = value if where == "TRUSTED_PROXY_IPS" else PROXY_IP
-    public_value = value if where == "TURN_PUBLIC_IP" else PUBLIC_IP
-    host = FakeHost(
-        tmp_path,
-        env_text=f"TRUSTED_PROXY_IPS={proxy_value}\nTURN_PUBLIC_IP={public_value}\n",
-    )
-    result = host.run(*(["--proxy-ip", value] if where == "--proxy-ip" else []))
+    host = FakeHost(tmp_path, env_text=f"{proxy_lines}TURN_PUBLIC_IP={PUBLIC_IP}\n")
+    result = host.run()
+    printed = host.run("--print")
 
-    assert result.returncode == 1, result.stdout
-    assert "is not an IPv4 address" in result.stderr
-    assert host.table("4") == OTHER_IPV4_RULES
-    assert host.calls() == []
+    # Applied anyway, failing closed, and exit 1 so the unit shows as failed.
+    assert result.returncode == 1
+    assert "NOBODY may connect to the backend's published port" in result.stderr
+    assert "with 1 problem" in result.stderr or "with 2 problem" in result.stderr
+    forward = host.table("4")[FORWARD_CHAIN]
+    assert forward == expected_forward_rules(hashlimit_name_in(forward), proxies=())
+    assert host.table("4")[INPUT_CHAIN] == EXPECTED_INPUT_RULES
+    assert host.table("4")["DOCKER-USER"][0] == f"-j {FORWARD_CHAIN}"
+    assert host.table("6")[INPUT_CHAIN] == EXPECTED_IPV6_INPUT_RULES
+    assert printed.returncode == 1
+    assert printed_rules(printed.stdout)[f"4 {FORWARD_CHAIN}"] == forward
     assert not (host.deploy / "pwned").exists()
     assert not (tmp_path / "pwned").exists()
 
 
-@pytest.mark.parametrize("option", ["--proxy-ip", "--turn-public-ip"])
-def test_negative_a_second_line_in_a_command_line_value_is_refused(
-    tmp_path: Path, option: str
-) -> None:
-    host = FakeHost(tmp_path)
-    result = host.run(option, "192.168.1.2\n-A INPUT -j ACCEPT")
+def test_negative_a_malformed_entry_is_left_out_and_the_rest_applied(tmp_path: Path) -> None:
+    env_text = (
+        f"TRUSTED_PROXY_IPS={PROXY_IP}, proxy.lan, 192.168.1.300\nTURN_PUBLIC_IP={PUBLIC_IP}\n"
+    )
+    host = FakeHost(tmp_path, env_text=env_text)
+    result = host.run()
 
     assert result.returncode == 1
+    assert "'proxy.lan' is not an IPv4 address" in result.stderr
+    assert "'192.168.1.300' is not an IPv4 address" in result.stderr
+    forward = host.table("4")[FORWARD_CHAIN]
+    assert forward == expected_forward_rules(hashlimit_name_in(forward))
+
+
+@pytest.mark.parametrize(
+    "public_line",
+    ["", "TURN_PUBLIC_IP=\n", "TURN_PUBLIC_IP=fd00::1\n", "TURN_PUBLIC_IP=1.2.3.0/24\n"],
+)
+def test_negative_without_a_usable_public_ip_only_its_rule_is_left_out(
+    tmp_path: Path, public_line: str
+) -> None:
+    host = FakeHost(tmp_path, env_text=f"TRUSTED_PROXY_IPS={PROXY_IP}\n{public_line}")
+    result = host.run()
+
+    assert result.returncode == 1
+    assert "TURN_PUBLIC_IP" in result.stderr
+    forward = host.table("4")[FORWARD_CHAIN]
+    assert forward == expected_forward_rules(hashlimit_name_in(forward), public_ip=None)
+    assert host.table("4")[INPUT_CHAIN] == EXPECTED_INPUT_RULES
+
+
+def test_negative_without_the_env_file_it_still_fails_closed(tmp_path: Path) -> None:
+    host = FakeHost(tmp_path, env_text=None)
+    result = host.run()
+
+    assert result.returncode == 1
+    assert "cannot read" in result.stderr
+    forward = host.table("4")[FORWARD_CHAIN]
+    assert forward == expected_forward_rules(hashlimit_name_in(forward), proxies=(), public_ip=None)
+
+
+@pytest.mark.parametrize("value", [*NOT_IPV4, "192.168.1.2\n-A INPUT -j ACCEPT"])
+@pytest.mark.parametrize("option", ["--proxy-ip", "--turn-public-ip"])
+def test_negative_a_bad_command_line_value_is_refused_and_nothing_changes(
+    tmp_path: Path, option: str, value: str
+) -> None:
+    host = FakeHost(tmp_path)
+    result = host.run(option, value)
+
+    assert result.returncode == 1, result.stdout
     assert "is not an IPv4 address" in result.stderr
+    assert "Nothing was changed." in result.stderr
     assert host.calls() == []
+    assert host.table("4") == OTHER_IPV4_RULES
+    assert not (host.deploy / "pwned").exists()
+    assert not (tmp_path / "pwned").exists()
 
 
 def test_values_are_read_from_the_env_file_without_running_it(tmp_path: Path) -> None:
@@ -560,7 +737,7 @@ def test_values_are_read_from_the_env_file_without_running_it(tmp_path: Path) ->
         "TRUSTED_PROXY_IPS=192.168.1.9\n"
         f"DJANGO_SECRET_KEY=$(touch {tmp_path}/pwned)\n"
         f"`touch {tmp_path}/pwned`\n"
-        'TRUSTED_PROXY_IPS="192.168.1.201, 192.168.1.202,192.168.1.201" # the proxy\n'
+        'export TRUSTED_PROXY_IPS="192.168.1.201, 192.168.1.202,192.168.1.201" # the proxy\n'
         "TURN_PUBLIC_IP='203.0.113.7'\n"
         "# TURN_PUBLIC_IP=198.51.100.1\n"
     )
@@ -600,6 +777,7 @@ def test_command_line_values_need_no_env_file(tmp_path: Path) -> None:
         ["--remove", "--proxy-ip", PROXY_IP],
         ["--check", "--env-file", ".env"],
         ["--proxy-ip"],
+        ["--turn-public-ip", ""],
         ["192.168.1.201"],
     ],
 )
@@ -652,7 +830,8 @@ def test_a_missing_bridge_is_a_warning_not_a_failure(tmp_path: Path) -> None:
 
     assert result.returncode == 0, result.stderr
     assert "WARNING: no interface named br-securecall br-turn yet" in result.stderr
-    assert host.table("4")[FORWARD_CHAIN] == EXPECTED_FORWARD_RULES
+    forward = host.table("4")[FORWARD_CHAIN]
+    assert forward == expected_forward_rules(hashlimit_name_in(forward))
 
 
 # --- The same values as compose.yaml, turnserver.conf and test-coturn.sh ------------------------
@@ -661,14 +840,12 @@ def test_a_missing_bridge_is_a_warning_not_a_failure(tmp_path: Path) -> None:
 def network_block(compose_text: str, network: str) -> str:
     networks = compose_text.split("\nnetworks:\n", 1)[1].split("\nvolumes:\n", 1)[0]
     match = re.search(rf"^  {network}:\n((?:    .*\n|\s*#.*\n)+)", networks + "\n", re.M)
-    assert match is not None, network
-    return match[1]
+    return match[1] if match else ""
 
 
 def service_block(compose_text: str, service: str) -> str:
     match = re.search(rf"^  {service}:\n(.*?)(?=^  \S|^\S)", compose_text, re.M | re.S)
-    assert match is not None, service
-    return match[1]
+    return match[1] if match else ""
 
 
 def published_container_ports(service: str, protocol: str) -> set[int]:
@@ -689,40 +866,64 @@ def multiport_ports(text: str) -> set[int]:
     return ports
 
 
+def compose_mismatches(compose_text: str, rules: str) -> list[str]:
+    """Where compose.yaml and firewall.sh's printed rules disagree."""
+    internal, turn = network_block(compose_text, "internal"), network_block(compose_text, "turn")
+    coturn = service_block(compose_text, "coturn")
+    mismatches = []
+    expected_in_networks = {
+        "internal": (internal, ["com.docker.network.bridge.name: br-securecall",
+                                "enable_ipv6: false", "subnet: 172.30.200.16/28"]),
+        "turn": (turn, ["com.docker.network.bridge.name: br-turn", "enable_ipv6: false",
+                        "subnet: 172.30.200.0/29"]),
+    }  # fmt: skip
+    for network, (block, lines) in expected_in_networks.items():
+        mismatches += [f"{network}: {line}" for line in lines if line not in block]
+    if "ipv4_address: 172.30.200.2" not in coturn:
+        mismatches.append("coturn's address")
+    for service, port in (("backend", 8000), ("postgres", 5432)):
+        if published_container_ports(service_block(compose_text, service), "tcp") != {port}:
+            mismatches.append(f"{service}'s port")
+        if f"--dport {port} " not in rules:
+            mismatches.append(f"no rule for {service}'s {port}")
+    udp = re.search(r"-p udp -m multiport --dports (\S+) .*-j RETURN", rules)
+    tcp = re.search(r"-p tcp -m multiport --dports (\S+) -m conntrack --ctstate DNAT", rules)
+    for protocol, match in (("udp", udp), ("tcp", tcp)):
+        if match is None or multiport_ports(match[1]) != published_container_ports(
+            coturn, protocol
+        ):
+            mismatches.append(f"coturn's {protocol} ports")
+    return mismatches
+
+
 def test_rules_match_compose_yaml(tmp_path: Path) -> None:
-    compose = (DEPLOY / "compose.yaml").read_text()
-    internal, turn = network_block(compose, "internal"), network_block(compose, "turn")
-    coturn, backend = service_block(compose, "coturn"), service_block(compose, "backend")
-    postgres = service_block(compose, "postgres")
     rules = FakeHost(tmp_path).run("--print").stdout
 
-    assert "com.docker.network.bridge.name: br-securecall" in internal
-    assert "com.docker.network.bridge.name: br-turn" in turn
-    for block in (internal, turn):
-        assert "enable_ipv6: false" in block
-    assert "subnet: 172.30.200.16/28" in internal
-    assert "subnet: 172.30.200.0/29" in turn
+    assert compose_mismatches((DEPLOY / "compose.yaml").read_text(), rules) == []
     assert not ipaddress.ip_network("172.30.200.16/28").overlaps(
         ipaddress.ip_network("172.30.200.0/29")
     )
-    assert "ipv4_address: 172.30.200.2" in coturn
-    assert published_container_ports(backend, "tcp") == {8000}
-    assert published_container_ports(postgres, "tcp") == {5432}
-    udp = re.search(r"-p udp -m multiport --dports (\S+) .*-j RETURN", rules)
-    tcp = re.search(r"-p tcp -m multiport --dports (\S+) -m conntrack --ctstate DNAT", rules)
-    assert udp is not None
-    assert tcp is not None
-    assert multiport_ports(udp[1]) == published_container_ports(coturn, "udp")
-    assert multiport_ports(tcp[1]) == published_container_ports(coturn, "tcp")
 
 
-def test_negative_a_changed_port_list_is_caught() -> None:
-    coturn = (
-        "    ports:\n      - '${TURN_RELAY_IP}:3478:3478/udp'\n      - '1.2.3.4:5349:5349/tcp'\n"
-    )
+@pytest.mark.parametrize(
+    ("old", "new", "mismatch"),
+    [
+        (":5349:5349/tcp'", ":5350:5350/tcp'", "coturn's tcp ports"),
+        (":49160-49200:49160-49200/udp'", ":49160-49300:49160-49300/udp'", "coturn's udp ports"),
+        ("bridge.name: br-turn", "bridge.name: br-coturn", "turn: com.docker"),
+        ("bridge.name: br-securecall", "bridge.name: br-backend", "internal: com.docker"),
+        ("ipv4_address: 172.30.200.2", "ipv4_address: 172.30.200.3", "coturn's address"),
+    ],
+)
+def test_negative_a_changed_compose_yaml_is_caught(
+    tmp_path: Path, old: str, new: str, mismatch: str
+) -> None:
+    compose = (DEPLOY / "compose.yaml").read_text()
+    rules = FakeHost(tmp_path).run("--print").stdout
 
-    assert published_container_ports(coturn, "udp") == {3478}
-    assert multiport_ports("3478,49160:49200") != published_container_ports(coturn, "udp")
+    assert old in compose
+    changed = compose.replace(old, new)
+    assert any(found.startswith(mismatch) for found in compose_mismatches(changed, rules))
 
 
 def test_coturn_may_not_send_where_turnserver_conf_denies(tmp_path: Path) -> None:
@@ -764,58 +965,73 @@ def test_the_coturn_test_network_is_the_compose_one() -> None:
 
 # --- Persistence -------------------------------------------------------------------------------
 
-UNIT_PLACEHOLDER = "/home/pi/secure-call-backend/deploy/raspberry-pi"
+UNIT_ENV_FILE = "/etc/secure-call/firewall.env"
+UNIT_REQUIRED = {
+    "After": ["docker.service"],
+    "Requires": ["docker.service"],
+    "PartOf": ["docker.service"],
+    "WantedBy": ["docker.service"],
+    "Type": ["oneshot"],
+    "RemainAfterExit": ["yes"],
+    "NoNewPrivileges": ["yes"],
+    "ExecStart": [f"/usr/local/sbin/secure-call-firewall --env-file {UNIT_ENV_FILE}"],
+}
 
 
-def unit_settings(unit_text: str) -> dict[str, list[str]]:
+def unit_problems(unit_text: str) -> list[str]:
     settings: dict[str, list[str]] = {}
     for line in unit_text.splitlines():
         if "=" in line and not line.startswith(("#", "[")):
             key, value = line.split("=", 1)
             settings.setdefault(key, []).append(value)
-    return settings
+    problems = [key for key, value in UNIT_REQUIRED.items() if settings.get(key) != value]
+    if "ExecStop" in settings:
+        problems.append("ExecStop")
+    return problems
 
 
 def test_unit_reapplies_after_docker_starts_or_restarts() -> None:
-    settings = unit_settings((DEPLOY / "secure-call-firewall.service").read_text())
-
-    assert settings["After"] == ["docker.service"]
-    assert settings["Requires"] == ["docker.service"]
-    assert settings["PartOf"] == ["docker.service"]
-    assert settings["WantedBy"] == ["docker.service"]
-    assert settings["Type"] == ["oneshot"]
-    assert settings["RemainAfterExit"] == ["yes"]
-    assert settings["ExecStart"] == [
-        f"/usr/local/sbin/secure-call-firewall --env-file {UNIT_PLACEHOLDER}/.env"
-    ]
-    assert "ExecStop" not in settings
-    assert settings["NoNewPrivileges"] == ["yes"]
+    assert unit_problems((DEPLOY / "secure-call-firewall.service").read_text()) == []
 
 
-def test_negative_a_unit_running_the_repository_copy_would_be_caught() -> None:
-    weakened = unit_settings(
-        "[Service]\nExecStart=/home/pi/secure-call-backend/deploy/raspberry-pi/firewall.sh\n"
-    )
+@pytest.mark.parametrize(
+    ("old", "new", "problem"),
+    [
+        ("/usr/local/sbin/secure-call-firewall --env-file",
+         "/home/pi/secure-call-backend/deploy/raspberry-pi/firewall.sh --env-file", "ExecStart"),
+        ("After=docker.service\n", "", "After"),
+        ("PartOf=docker.service\n", "", "PartOf"),
+        ("RemainAfterExit=yes\n", "ExecStop=/usr/local/sbin/secure-call-firewall --remove\n",
+         "RemainAfterExit"),
+    ],
+)  # fmt: skip
+def test_negative_a_weakened_unit_is_caught(old: str, new: str, problem: str) -> None:
+    unit = (DEPLOY / "secure-call-firewall.service").read_text()
 
-    assert not weakened["ExecStart"][0].startswith("/usr/local/sbin/")
-    assert "After" not in weakened
+    assert old in unit
+    found = unit_problems(unit.replace(old, new, 1))
+    assert problem in found
+    if "ExecStop" in new:
+        assert "ExecStop" in found
 
 
 def test_readme_installs_the_unit_and_documents_the_limits() -> None:
     readme = (DEPLOY / "README.md").read_text()
     script = (DEPLOY / "firewall.sh").read_text()
-
-    assert (
-        "sudo install -o root -g root -m 0755 firewall.sh /usr/local/sbin/secure-call-firewall"
-        in readme
+    install_lines = (
+        "sudo install -o root -g root -m 0755 firewall.sh /usr/local/sbin/secure-call-firewall",
+        "sudo install -o root -g root -m 0644 secure-call-firewall.service /etc/systemd/system/",
+        "sudo install -d -o root -g root -m 0755 /etc/secure-call",
+        f'sudo ln -sfn "$PWD/.env" {UNIT_ENV_FILE}',
+        "sudo secure-call-firewall --remove",
+        "systemctl is-failed secure-call-firewall",
     )
-    assert f'sed "s|{UNIT_PLACEHOLDER}|$PWD|" secure-call-firewall.service' in readme
-    assert "sudo secure-call-firewall --remove" in readme
+
+    for line in install_lines:
+        assert line in readme, line
     for name in (
         "turn_tcp_max_connections_per_source",
         "turn_tcp_new_connections_burst",
         "turn_tcp_new_connections_per_minute",
     ):
-        value = re.search(rf"^{name}=(\d+)", script, re.M)
-        assert value is not None
-        assert f"`{name}={value[1]}`" in readme, name
+        assert f"`{name}={script_constant(script, name)}`" in readme, name

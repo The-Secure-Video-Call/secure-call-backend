@@ -3,18 +3,20 @@ runs on the runner, in a network namespace and inside the containers (the backen
 uses the standard library only.
 
     firewall_probe.py check [--source ADDRESS] KIND:HOST:PORT=EXPECTED ...
-    firewall_probe.py held [--source ADDRESS] HOST:PORT COUNT
+    firewall_probe.py held [--source ADDRESS] HOST:PORT COUNT [PACE_AFTER SECONDS]
     firewall_probe.py burst [--source ADDRESS] HOST:PORT COUNT
     firewall_probe.py listen KIND:ADDRESS:PORT ...
 
-KIND is tcp or udp, EXPECTED open or blocked. For tcp, "open" means the connection was made; for
-udp, that an answer came back (the listeners echo, a public DNS server answers the query sent).
-"blocked" means nothing at all came back in time: no connection, no refusal, no ICMP error, so the
-packets were dropped on the way. Anything else (refused, unreachable) is neither, and fails.
-`check` exits 1 if any result is not the expected one.
+KIND is tcp or udp, EXPECTED open, blocked, refused or any. For tcp, "open" means the connection
+was made; for udp, that an answer came back (the listeners echo, a public DNS server answers the
+query sent). "blocked" means nothing at all came back in time: no connection, no refusal, no ICMP
+error, so the packets were dropped on the way. "refused" means a reset or an ICMP "port
+unreachable" came back at once (a REJECT rule, or nothing listening). "any" only prints the
+result. `check` exits 1 if any result is not the expected one.
 
-`held` opens COUNT TCP connections one after the other and keeps them all open, and `burst` opens
-COUNT and closes each at once (with a reset, so it no longer counts as open); both print how many
+`held` opens COUNT TCP connections one after the other and keeps them all open (after the first
+PACE_AFTER, it waits SECONDS before each further one, to stay inside a rate limit). `burst` opens
+COUNT and closes each at once (with a reset, so it no longer counts as open). Both print how many
 were made, as "made N of COUNT" (for the connlimit and hashlimit rules).
 `listen` accepts TCP connections (kept until the other side closes) and echoes UDP datagrams,
 until it is killed.
@@ -87,7 +89,7 @@ def check(expectations: list[str], source: str | None) -> int:
     failures = 0
     for expectation in expectations:
         target_text, expected = expectation.rsplit("=", 1)
-        if expected not in {"open", "blocked"}:
+        if expected not in {"open", "blocked", "refused", "any"}:
             raise ValueError(expectation)
         target = parse_target(target_text)
         attempts = OPEN_ATTEMPTS if expected == "open" else 1
@@ -96,7 +98,7 @@ def check(expectations: list[str], source: str | None) -> int:
             if result == expected or attempt == attempts - 1:
                 break
             time.sleep(1)
-        verdict = "OK" if result == expected else "FAIL"
+        verdict = "OK" if result == expected else "INFO" if expected == "any" else "FAIL"
         if verdict == "FAIL":
             failures += 1
         from_text = f" from {source}" if source else ""
@@ -110,10 +112,14 @@ def host_and_port(text: str) -> tuple[str, int]:
     return host, int(port)
 
 
-def held(address: tuple[str, int], count: int, source: str | None) -> int:
+def held(
+    address: tuple[str, int], count: int, source: str | None, pace_after: int, seconds: float
+) -> int:
     connections: list[socket.socket] = []
     source_address = (source, 0) if source else None
-    for _ in range(count):
+    for attempt in range(count):
+        if attempt >= pace_after:
+            time.sleep(seconds)
         try:
             connections.append(
                 socket.create_connection(
@@ -193,7 +199,9 @@ def main(arguments: list[str]) -> int:
     if command == "check":
         return check(rest, source)
     if command == "held":
-        return held(host_and_port(rest[0]), int(rest[1]), source)
+        count = int(rest[1])
+        pace_after, seconds = (int(rest[2]), float(rest[3])) if len(rest) > 2 else (count, 0.0)
+        return held(host_and_port(rest[0]), count, source, pace_after, seconds)
     if command == "burst":
         return burst(host_and_port(rest[0]), int(rest[1]), source)
     if command == "listen":

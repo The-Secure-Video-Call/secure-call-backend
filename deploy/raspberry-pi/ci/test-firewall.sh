@@ -4,13 +4,15 @@
 # are already up). Needs Docker, passwordless sudo, ip, curl and the repository's .venv.
 #
 # A network namespace "lan" stands in for the rest of the home network and the internet: the
-# runner is 10.250.0.1 there (the Pi's LAN address: the backend and coturn's stand-in are
-# published on it), 10.250.0.2 is the reverse proxy (TRUSTED_PROXY_IPS), 10.250.0.3 another LAN
-# device or an internet peer, .4 and .5 clients for the TCP limits. Listeners: 10.250.0.2:40900
-# in "lan" (a private address that is not the Pi), and port 40901 on the runner (the Pi itself,
-# through a bridge's gateway or its LAN address). coturn's stand-in is coturn's own service from
-# compose.yaml (network, fixed address, user, no capabilities) running Python from the backend
-# image, tagged with coturn's image name, so it can listen on coturn's ports and probe from there.
+# runner is 10.250.0.1 there (the Pi's LAN address: the backend, PostgreSQL and coturn's stand-in
+# are published on it), 10.250.0.2 is the reverse proxy (TRUSTED_PROXY_IPS), 10.250.0.3 another LAN
+# device or an internet peer, .4 and .5 clients for the TCP limits; 192.168.250.2 and 172.16.250.2
+# are more private addresses there. Listeners: port 40900 in "lan" (private addresses that are not
+# the Pi), and port 40901 on the runner (the Pi itself, through a bridge's gateway or its LAN
+# address). coturn's stand-in is coturn's own service from compose.yaml (network, fixed address,
+# user, no capabilities) running Python from the backend image, tagged with coturn's image name,
+# so it can listen on coturn's ports and probe from there. 1.0.0.1 stands in for the home's public
+# address (TURN_PUBLIC_IP): public, so only firewall.sh's rule for it can block it.
 #
 # Every check runs first without the firewall, where everything it will block must get through
 # (so the setup can tell the difference), and then with it. Run from deploy/raspberry-pi.
@@ -25,10 +27,14 @@ proxy_ip=10.250.0.2
 lan_device_ip=10.250.0.3
 connlimit_client_ip=10.250.0.4
 hashlimit_client_ip=10.250.0.5
-lan_target="$proxy_ip:40900"
+lan_targets=(10.250.0.2:40900 192.168.250.2:40900 172.16.250.2:40900)
 pi_port=40901
+public_ip_stand_in=1.0.0.1
 turn_gateway=172.30.200.1
 coturn_ip=172.30.200.2
+# As on a Pi where the backend is published on its LAN address and PostgreSQL on every address
+# (.env.example offers 0.0.0.0): every docker compose call below sees the same settings.
+export BACKEND_PUBLISH_ADDR="$pi_lan_ip" POSTGRES_PUBLISH_ADDR=0.0.0.0
 failures=0
 
 fail() {
@@ -43,7 +49,8 @@ cleanup() {
   docker rm -f turn-probe >/dev/null 2>&1
   sudo systemctl disable --now secure-call-firewall >/dev/null 2>&1
   sudo ./firewall.sh --remove >/dev/null 2>&1
-  sudo rm -f /usr/local/sbin/secure-call-firewall /etc/systemd/system/secure-call-firewall.service
+  sudo rm -f /usr/local/sbin/secure-call-firewall /etc/systemd/system/secure-call-firewall.service \
+    /etc/secure-call/firewall.env
   sudo systemctl daemon-reload
   sudo ip netns del lan 2>/dev/null
   sudo ip link del lan-host 2>/dev/null
@@ -111,49 +118,69 @@ expect_one_jump_each() {
   if sudo ip6tables -S INPUT >/dev/null 2>&1; then expect_one_jump ip6tables INPUT SECURE-CALL-IN; fi
 }
 
-# $1 = how what the firewall blocks shows: "open" (without it) or "blocked" (with it).
+# $1 = without|with the firewall.
 run_checks() {
-  local stopped="$1"
+  local backend_stopped=open turn_stopped=open docker_decides=any target
+  local backend_lan_checks=() turn_lan_checks=()
+  if [ "$1" = with ]; then
+    backend_stopped=refused # rejected: the backend's mistakes fail fast
+    turn_stopped=blocked    # dropped
+    docker_decides=blocked
+  fi
+  for target in "${lan_targets[@]}"; do
+    backend_lan_checks+=("tcp:$target=$backend_stopped")
+    turn_lan_checks+=("tcp:$target=$turn_stopped")
+  done
   echo "-- From the backend's container (br-securecall): PostgreSQL only"
-  in_backend check tcp:postgres:5432=open "tcp:1.1.1.1:443=$stopped" "tcp:$lan_target=$stopped" \
-    "tcp:$backend_gateway:$pi_port=$stopped" "tcp:$pi_lan_ip:$pi_port=$stopped" \
+  in_backend check tcp:postgres:5432=open "tcp:1.1.1.1:443=$backend_stopped" "${backend_lan_checks[@]}" \
+    "tcp:$backend_gateway:$pi_port=$backend_stopped" "tcp:$pi_lan_ip:$pi_port=$backend_stopped" \
     || fail "connections from the backend's container"
   echo "-- From coturn's network (br-turn): public addresses only"
-  in_turn_network check tcp:1.1.1.1:443=open udp:1.1.1.1:53=open "tcp:$lan_target=$stopped" \
-    "udp:$lan_target=$stopped" "tcp:$turn_gateway:$pi_port=$stopped" "tcp:$pi_lan_ip:$pi_port=$stopped" \
+  in_turn_network check tcp:1.1.1.1:443=open udp:1.1.1.1:53=open "${turn_lan_checks[@]}" \
+    "udp:${lan_targets[0]}=$turn_stopped" "tcp:$public_ip_stand_in:443=$turn_stopped" \
+    "tcp:$turn_gateway:$pi_port=$turn_stopped" "tcp:$pi_lan_ip:$pi_port=$turn_stopped" \
     || fail "connections from coturn's network"
+  # PostgreSQL published on every address: through the Pi's addresses and DNAT into the backend's
+  # bridge. Without the firewall, Docker's own isolation decides (printed, not asserted).
+  echo "-- From coturn's network to PostgreSQL's published port: never (\"any\" = Docker decides)"
+  in_turn_network check "tcp:$turn_gateway:5434=$docker_decides" "tcp:$pi_lan_ip:5434=$docker_decides" \
+    || fail "coturn's network to PostgreSQL's published port"
   echo "-- Into the backend's published port: from the proxy only"
   expect_backend_https_from_lan "$proxy_ip" open
-  expect_backend_https_from_lan "$lan_device_ip" "$stopped"
+  expect_backend_https_from_lan "$lan_device_ip" "$turn_stopped"
+  echo "-- Into PostgreSQL's port published on every address, from the LAN: as published"
+  on_lan check --source "$lan_device_ip" "tcp:$pi_lan_ip:5434=open" || fail "the LAN to PostgreSQL"
   echo "-- Into coturn's published ports from outside: coturn's ports only (3478, 5349, 49160-49200)"
   on_lan check --source "$lan_device_ip" "tcp:$pi_lan_ip:3478=open" "udp:$pi_lan_ip:3478=open" \
     "tcp:$pi_lan_ip:5349=open" "udp:$pi_lan_ip:49160=open" "udp:$pi_lan_ip:49200=open" \
-    "udp:$pi_lan_ip:49201=$stopped" "tcp:$pi_lan_ip:40902=$stopped" \
+    "udp:$pi_lan_ip:49201=$turn_stopped" "tcp:$pi_lan_ip:40902=$turn_stopped" \
     || fail "connections into coturn's published ports"
   echo "-- The Pi itself into its containers (their replies come back through INPUT)"
   on_pi check "tcp:$coturn_ip:3478=open" || fail "the Pi to coturn's container"
   expect_https "HTTPS to the backend from the Pi itself" open "$(backend_https_exit_code "")"
   echo "-- Another project's container (Docker's default bridge): never affected"
-  in_other_project check tcp:1.1.1.1:443=open "tcp:$lan_target=open" "tcp:$pi_lan_ip:$pi_port=open" \
+  in_other_project check tcp:1.1.1.1:443=open "tcp:${lan_targets[0]}=open" "tcp:$pi_lan_ip:$pi_port=open" \
     || fail "connections from another project's container"
 }
 
-# $1 = without|with. One address keeps connections open, another opens them in a row: with the
-# firewall, the first 24 stay open and the 25th is dropped, and after a burst of 30 new ones the
-# rest are held to about one per second (firewall.sh's turn_tcp_* values).
+# $1 = without|with. One address keeps connections open, another opens them in a row. With the
+# firewall, 64 stay open and the 65th is dropped (connlimit; opened at the refill rate after the
+# first 25, so hashlimit never stops one), and after a burst of 30 new ones the rest are held to
+# about one per second (hashlimit). firewall.sh's turn_tcp_* values.
 check_tcp_limits() {
-  local held burst made seconds
-  held="$(on_lan held --source "$connlimit_client_ip" "$pi_lan_ip:3478" 25)"
+  local held burst made seconds pacing=()
+  if [ "$1" = with ]; then pacing=(25 1.2); fi
+  held="$(on_lan held --source "$connlimit_client_ip" "$pi_lan_ip:3478" 65 ${pacing[@]+"${pacing[@]}"})"
   burst="$(on_lan burst --source "$hashlimit_client_ip" "$pi_lan_ip:5349" 45)"
   echo "Held open at once from $connlimit_client_ip to 3478: $held"
   echo "In a row from $hashlimit_client_ip to 5349: $burst"
   read -r _ made _ _ _ seconds _ <<<"$burst"
   seconds="${seconds%.*}"
   if [ "$1" = without ]; then
-    [ "$held" = "made 25 of 25" ] || fail "without the firewall, 25 connections held open: $held"
+    [ "$held" = "made 65 of 65" ] || fail "without the firewall, 65 connections held open: $held"
     [ "$made" = 45 ] || fail "without the firewall, 45 connections in a row: $burst"
   else
-    [ "$held" = "made 24 of 25" ] || fail "with the firewall, expected 24 of 25 held open: $held"
+    [ "$held" = "made 64 of 65" ] || fail "with the firewall, expected 64 of 65 held open: $held"
     if [ "$made" -lt 30 ] || [ "$made" -ge 45 ] || [ "$made" -gt $((30 + seconds + 2)) ]; then
       fail "with the firewall, expected the burst of 30 and then about one per second: $burst"
     fi
@@ -166,21 +193,28 @@ echo "== A stand-in home network (namespace \"lan\") =="
 sudo ip netns add lan
 sudo ip link add lan-host type veth peer name lan-peer
 sudo ip link set lan-peer netns lan
-sudo ip addr add "$pi_lan_ip/24" dev lan-host
+for address in "$pi_lan_ip/24" 192.168.250.1/24 172.16.250.1/24; do
+  sudo ip addr add "$address" dev lan-host
+done
 sudo ip link set lan-host up
 for address in "$proxy_ip" "$lan_device_ip" "$connlimit_client_ip" "$hashlimit_client_ip"; do
   sudo ip netns exec lan ip addr add "$address/24" dev lan-peer
 done
+sudo ip netns exec lan ip addr add 192.168.250.2/24 dev lan-peer
+sudo ip netns exec lan ip addr add 172.16.250.2/24 dev lan-peer
 sudo ip netns exec lan ip link set lan-peer up
 sudo ip netns exec lan ip link set lo up
-on_lan listen "tcp:$lan_target" "udp:$lan_target" >/dev/null &
+on_lan listen tcp:0.0.0.0:40900 udp:0.0.0.0:40900 >/dev/null &
 on_pi listen "tcp:0.0.0.0:$pi_port" >/dev/null &
 pi_listener_pid=$!
 
-echo "== The stack, as on the Pi: the backend published on the LAN address, the proxy trusted =="
-echo "TRUSTED_PROXY_IPS=$proxy_ip" >>.env
+echo "== The stack, as on the Pi: published on the LAN address, the proxy trusted =="
+# An IPv6 entry, as the backend accepts it: firewall.sh skips it with a warning.
+echo "TRUSTED_PROXY_IPS=\"$proxy_ip, fd00::1\"" >>.env
+sed -i "s/^TURN_PUBLIC_IP=.*/TURN_PUBLIC_IP=$public_ip_stand_in/" .env
 chmod 600 .env
-BACKEND_PUBLISH_ADDR="$pi_lan_ip" docker compose up -d --no-deps --pull never backend
+docker compose up -d --no-deps --pull never --wait postgres
+docker compose up -d --no-deps --pull never backend
 wait_for_backend || { echo "FAIL: the backend did not answer on $pi_lan_ip:8001"; exit 1; }
 backend_gateway="$(docker inspect -f '{{range .NetworkSettings.Networks}}{{.Gateway}}{{end}}' "$(docker compose ps -q backend)")"
 docker tag "$backend_image" secure-call-coturn:local
@@ -200,7 +234,7 @@ if [ "$turn_probe_ip" != "$coturn_ip" ]; then
 fi
 for attempt in $(seq 1 10); do
   in_turn_network check tcp:127.0.0.1:3478=open >/dev/null && on_pi check "tcp:127.0.0.1:$pi_port=open" >/dev/null \
-    && on_lan check "tcp:$lan_target=open" >/dev/null && break
+    && on_lan check "tcp:${lan_targets[0]}=open" >/dev/null && break
   [ "$attempt" = 10 ] && { echo "FAIL: the listeners did not start"; exit 1; }
   sleep 1
 done
@@ -211,21 +245,23 @@ ip -o -4 addr show dev br-turn | grep -qF "inet $turn_gateway/29 " \
 echo "Bridges: br-securecall (gateway $backend_gateway), br-turn (gateway $turn_gateway); coturn's stand-in at $turn_probe_ip"
 
 echo "== Without the firewall: everything it will block still gets through =="
-run_checks open
+run_checks without
 check_tcp_limits without
 
 echo "== firewall.sh, applied twice (values from .env) =="
-sudo ./firewall.sh
-sudo ./firewall.sh
+sudo ./firewall.sh 2>&1 | tee "$RUNNER_TEMP/firewall-apply.log"
+grep -qF "'fd00::1' skipped" "$RUNNER_TEMP/firewall-apply.log" \
+  || fail "no warning about the skipped IPv6 entry in TRUSTED_PROXY_IPS"
+sudo ./firewall.sh >/dev/null 2>&1 || fail "the second run of firewall.sh"
 expect_one_jump_each
 applied_rules="$(sudo iptables -S SECURE-CALL-FWD | grep -c '^-A' || true)"
-printed_rules="$(./firewall.sh --print | grep -c '^-A SECURE-CALL-FWD' || true)"
+printed_rules="$(./firewall.sh --print 2>/dev/null | grep -c '^-A SECURE-CALL-FWD' || true)"
 [ "$applied_rules" = "$printed_rules" ] || fail "SECURE-CALL-FWD holds $applied_rules rules, --print shows $printed_rules"
 sudo iptables -S SECURE-CALL-FWD
 sudo iptables -S SECURE-CALL-IN
 
 echo "== With the firewall =="
-run_checks blocked
+run_checks with
 check_tcp_limits with
 echo "-- The backend still reaches PostgreSQL as its own role over TLS 1.3"
 docker compose exec -T backend python -c "import django; django.setup(); from django.db import connection; c = connection.cursor(); c.execute('SELECT current_user, ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()'); row = c.fetchone(); assert row == ('securecall_app', True, 'TLSv1.3'), row; print('OK: the backend reaches PostgreSQL as', row[0], 'over', row[2])" \
@@ -234,13 +270,14 @@ sudo ./firewall.sh --check || fail "--check says the firewall is not active"
 
 echo "== The systemd unit, installed as README.md says, re-applies after Docker restarts =="
 sudo install -o root -g root -m 0755 firewall.sh /usr/local/sbin/secure-call-firewall
-sed "s|/home/pi/secure-call-backend/deploy/raspberry-pi|$PWD|" secure-call-firewall.service \
-  | sudo tee /etc/systemd/system/secure-call-firewall.service >/dev/null
+sudo install -o root -g root -m 0644 secure-call-firewall.service /etc/systemd/system/
+sudo install -d -o root -g root -m 0755 /etc/secure-call
+sudo ln -sfn "$PWD/.env" /etc/secure-call/firewall.env
 sudo systemctl daemon-reload
 sudo systemctl enable --now secure-call-firewall
-if ! systemctl is-active --quiet secure-call-firewall; then
+if [ "$(systemctl is-failed secure-call-firewall || true)" != active ]; then
   systemctl status --no-pager secure-call-firewall || true
-  fail "the unit did not start"
+  fail "the unit did not start cleanly"
 fi
 started_before="$(systemctl show -p ExecMainStartTimestampMonotonic --value secure-call-firewall)"
 sudo systemctl restart docker
@@ -263,7 +300,34 @@ expect_one_jump_each
 sudo secure-call-firewall --check >/dev/null || fail "--check after the Docker restart"
 wait_for_backend || fail "the backend did not come back after the Docker restart"
 expect_backend_https_from_lan "$lan_device_ip" blocked
-in_backend check "tcp:1.1.1.1:443=blocked" || fail "the backend after the Docker restart"
+in_backend check "tcp:1.1.1.1:443=refused" || fail "the backend after the Docker restart"
+
+echo "== A bad value in .env still applies the rules, failing closed, and fails the unit =="
+cp .env "$RUNNER_TEMP/env.good"
+sed -i 's/^TRUSTED_PROXY_IPS=.*/TRUSTED_PROXY_IPS="fd00::1, proxy.lan"/' .env
+sudo systemctl restart secure-call-firewall || true
+if [ "$(systemctl is-failed secure-call-firewall || true)" = failed ]; then
+  echo "OK: the unit shows as failed"
+else
+  fail "with a bad TRUSTED_PROXY_IPS the unit is not marked failed"
+fi
+expect_one_jump_each
+expect_backend_https_from_lan "$proxy_ip" blocked
+# Everything else is in place: the whole chain as --print shows it for this .env (coturn's
+# stand-in may not have come back after the Docker restart, so this is read from iptables).
+applied_rules="$(sudo iptables -S SECURE-CALL-FWD | grep -c '^-A' || true)"
+printed_rules="$(./firewall.sh --print 2>/dev/null | grep -c '^-A SECURE-CALL-FWD' || true)"
+[ "$applied_rules" = "$printed_rules" ] || fail "with a bad TRUSTED_PROXY_IPS, $applied_rules rules applied, --print shows $printed_rules"
+sudo iptables -S SECURE-CALL-FWD | grep -qxF -- '-A SECURE-CALL-FWD -i br-turn -o br-securecall -j DROP' \
+  || fail "with a bad TRUSTED_PROXY_IPS, coturn's rules are missing"
+if sudo iptables -S SECURE-CALL-FWD | grep -q -- ' --dport 8000 .*-j RETURN'; then
+  fail "with a bad TRUSTED_PROXY_IPS, something may still connect to the backend's port"
+fi
+cp "$RUNNER_TEMP/env.good" .env
+chmod 600 .env
+sudo systemctl restart secure-call-firewall || fail "the unit after fixing .env"
+[ "$(systemctl is-failed secure-call-firewall || true)" = active ] || fail "the unit after fixing .env"
+expect_backend_https_from_lan "$proxy_ip" open
 
 echo "== --remove takes out the chains and their jumps, and nothing else =="
 sudo systemctl disable --now secure-call-firewall

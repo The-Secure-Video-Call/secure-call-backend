@@ -21,6 +21,13 @@
 # The reverse proxy's IPv4 address(es): --proxy-ip (repeat it, or separate with commas), else
 # TRUSTED_PROXY_IPS from FILE. The home's public IPv4: --turn-public-ip, else TURN_PUBLIC_IP from
 # FILE. FILE defaults to the .env next to this script. It is read line by line, never run.
+#
+# A bad value on the command line is refused and nothing changes. A bad or missing value in FILE
+# (what the systemd unit uses at boot) never leaves the Pi without the rules: they are applied
+# anyway, failing closed (with no usable proxy address, nobody may connect to the backend's port;
+# without TURN_PUBLIC_IP only the rule for that one address is left out), and the script then
+# exits 1, so the unit shows as failed. IPv6 entries in TRUSTED_PROXY_IPS (which the backend
+# accepts) are skipped with a warning: the backend's port is published on IPv4 only.
 set -euo pipefail
 
 forward_chain=SECURE-CALL-FWD
@@ -62,16 +69,26 @@ turn_denied_ranges=(
 # address. coturn has no per-address connection limit, and on 5349 every connection costs a full
 # TLS handshake (no session cache). A browser opens one connection per TCP URL (we send two: TCP
 # and TLS) per network interface it uses, so 2 per caller, 4 during an ICE restart (the old ones
-# stay for a moment), 8 on two interfaces. The limits leave room for several callers behind one
-# address (a household, or a carrier-grade NAT) and still stop one address from flooding coturn.
-# UDP is not limited here (coturn's quotas cover it). README.md "Firewall" lists these values.
-turn_tcp_max_connections_per_source=24 # open at once (connlimit)
+# stay for a moment), 8 on two interfaces. Everyone behind one address (a household, or a
+# carrier-grade NAT) shares these limits: 64 open connections are 8 such worst-case callers, or
+# 32 ordinary ones. UDP is not limited here (coturn's quotas cover it). README.md "Firewall" lists
+# these values and what they cannot stop.
+turn_tcp_max_connections_per_source=64 # open at once (connlimit)
 turn_tcp_new_connections_burst=30      # opened in a row before the rate applies (hashlimit)
 turn_tcp_new_connections_per_minute=60 # sustained, once the burst is used up (hashlimit)
-# hashlimit's table name (at most 15 characters), and how long a quiet address is remembered:
-# longer than a full burst takes to refill (30 / 60 per minute = 30 s), so pausing does not reset it.
-turn_tcp_hashlimit_name=securecall-turn
-turn_tcp_hashlimit_expire_milliseconds=60000
+# How long hashlimit remembers a quiet address: longer than the burst takes to refill (30 at 60 a
+# minute = 30 s), so a pause does not reset it, and short, so forged addresses leave the table
+# soon. The table holds at most turn_tcp_hashlimit_max addresses; once it is full, connections from
+# addresses not in it are dropped until entries expire (TCP and TLS TURN only; UDP is unaffected).
+turn_tcp_hashlimit_expire_milliseconds=35000
+turn_tcp_hashlimit_size=65536
+turn_tcp_hashlimit_max=262144
+# The kernel keeps a hashlimit table's settings for as long as a rule uses its name, also across
+# an atomic re-apply, so the name carries a checksum of the settings: changed values get a new
+# table on the next run. At most 15 characters.
+turn_tcp_hashlimit_settings="$turn_tcp_new_connections_per_minute/minute $turn_tcp_new_connections_burst srcip $turn_tcp_hashlimit_size $turn_tcp_hashlimit_max $turn_tcp_hashlimit_expire_milliseconds"
+turn_tcp_hashlimit_checksum="$(printf '%s' "$turn_tcp_hashlimit_settings" | cksum)"
+turn_tcp_hashlimit_name="$(printf 'sc-turn-%04x' "$((${turn_tcp_hashlimit_checksum%% *} % 65536))")"
 
 script_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 env_file="$script_directory/.env"
@@ -96,6 +113,18 @@ usage_error() {
   exit 2
 }
 
+problems=0
+# A value from the env file that could not be used: the rules still go in (failing closed), and
+# the script exits 1 at the end.
+problem() {
+  echo "firewall.sh: ERROR: $*" >&2
+  problems=$((problems + 1))
+}
+
+warning() {
+  echo "firewall.sh: WARNING: $*" >&2
+}
+
 trim() {
   local value="$1"
   value="${value#"${value%%[![:space:]]*}"}"
@@ -117,15 +146,24 @@ is_ipv4() {
   [ "$value" != 0.0.0.0 ] && [ "$value" != 255.255.255.255 ]
 }
 
-require_ipv4() { # $1 = value, $2 = where it came from
-  is_ipv4 "$1" || die "$2: '$1' is not an IPv4 address (four numbers 0-255, no leading zeros, no range, name or IPv6). Nothing was changed."
+# Hex digits, colons and dots with at least one colon: an IPv6 address as the backend accepts it.
+# Only used to tell such an entry (skipped) from a malformed one; it never goes into a rule.
+looks_like_ipv6() {
+  [[ $1 == *:* ]] && [[ $1 =~ ^[0-9A-Fa-f:.]+$ ]]
 }
 
-# The value of the last "KEY=value" line of the env file, as docker compose reads it: quotes
-# around it, or a " #" comment after an unquoted value, are not part of it. Fails without a line.
+not_ipv4_message() { # $1 = value, $2 = where it came from
+  local hint=""
+  case "$1" in *'$'*) hint=" (variables are not expanded here: write the address itself)" ;; esac
+  printf "%s: '%s' is not an IPv4 address (four numbers 0-255, no leading zeros, no range or name)%s" "$2" "$1" "$hint"
+}
+
+# The value of the last "KEY=value" (or "export KEY=value") line of the env file, as docker
+# compose reads it: quotes around it, or a " #" comment after an unquoted value, are not part of
+# it. Fails without such a line.
 read_env_value() { # $1 = key
   local line value
-  line="$(grep -E "^[[:space:]]*$1=" "$env_file" | tail -n 1)" || true
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$1=" "$env_file" | tail -n 1)" || true
   [ -n "$line" ] || return 1
   value="$(trim "${line#*=}")"
   case "$value" in
@@ -142,57 +180,80 @@ read_env_value() { # $1 = key
   trim "$value"
 }
 
-require_env_file() {
-  [ -r "$env_file" ] || die "cannot read $env_file. Pass --env-file FILE (the stack's .env), or --proxy-ip and --turn-public-ip. Nothing was changed."
-}
-
 proxy_ips=()
 turn_public_ip=""
 
-# Fills proxy_ips and turn_public_ip from the options, else from the env file, and checks them.
-resolve_values() {
-  local list source part known duplicate
-  if [ "${#proxy_ip_arguments[@]}" -gt 0 ]; then
-    list="$(
-      IFS=,
-      echo "${proxy_ip_arguments[*]}"
-    )"
-    source="--proxy-ip"
-  else
-    require_env_file
-    list="$(read_env_value TRUSTED_PROXY_IPS)" \
-      || die "no TRUSTED_PROXY_IPS line in $env_file: set it to the reverse proxy's LAN IP (the backend needs it too), or pass --proxy-ip. Nothing was changed."
-    source="TRUSTED_PROXY_IPS in $env_file"
-  fi
-  # `read` below takes one line only, so a second line would be dropped unchecked.
-  case "$list" in
-    *$'\n'*) require_ipv4 "$list" "$source" ;;
-  esac
-  local parts=()
-  IFS=, read -r -a parts <<<"$list"
-  for part in ${parts[@]+"${parts[@]}"}; do
-    part="$(trim "$part")"
-    [ -n "$part" ] || continue
-    require_ipv4 "$part" "$source"
-    duplicate=0
-    for known in ${proxy_ips[@]+"${proxy_ips[@]}"}; do
-      if [ "$known" = "$part" ]; then duplicate=1; fi
-    done
-    if [ "$duplicate" = 0 ]; then proxy_ips+=("$part"); fi
+add_proxy_ip() {
+  local known
+  for known in ${proxy_ips[@]+"${proxy_ips[@]}"}; do
+    [ "$known" != "$1" ] || return 0
   done
-  [ "${#proxy_ips[@]}" -gt 0 ] \
-    || die "$source is empty: set the reverse proxy's LAN IP (the only address allowed to reach the backend's published port). Nothing was changed."
+  proxy_ips+=("$1")
+}
+
+# Fills proxy_ips and turn_public_ip: from the options (strict: a bad value stops the script before
+# anything changes), else from the env file (a bad value is reported, and left out).
+resolve_values() {
+  local list part env_readable=1 env_source
+  local parts=()
+  if [ "${#proxy_ip_arguments[@]}" = 0 ] || [ -z "$turn_public_ip_argument" ]; then
+    if [ ! -r "$env_file" ]; then
+      env_readable=0
+      problem "cannot read $env_file: pass --env-file FILE (the stack's .env), or --proxy-ip and --turn-public-ip."
+    fi
+  fi
+
+  if [ "${#proxy_ip_arguments[@]}" -gt 0 ]; then
+    for list in "${proxy_ip_arguments[@]}"; do
+      case "$list" in
+        *$'\n'*) die "$(not_ipv4_message "$list" --proxy-ip). Nothing was changed." ;;
+      esac
+      IFS=, read -r -a parts <<<"$list"
+      for part in ${parts[@]+"${parts[@]}"}; do
+        part="$(trim "$part")"
+        [ -n "$part" ] || continue
+        is_ipv4 "$part" || die "$(not_ipv4_message "$part" --proxy-ip). Nothing was changed."
+        add_proxy_ip "$part"
+      done
+    done
+    [ "${#proxy_ips[@]}" -gt 0 ] || die "--proxy-ip holds no address. Nothing was changed."
+  elif [ "$env_readable" = 1 ]; then
+    env_source="TRUSTED_PROXY_IPS in $env_file"
+    if list="$(read_env_value TRUSTED_PROXY_IPS)"; then
+      IFS=, read -r -a parts <<<"$list"
+      for part in ${parts[@]+"${parts[@]}"}; do
+        part="$(trim "$part")"
+        [ -n "$part" ] || continue
+        if is_ipv4 "$part"; then
+          add_proxy_ip "$part"
+        elif looks_like_ipv6 "$part"; then
+          warning "$env_source: '$part' skipped: the backend's port is published on IPv4 only, so only IPv4 proxy addresses can reach it."
+        else
+          problem "$(not_ipv4_message "$part" "$env_source"); left out."
+        fi
+      done
+    else
+      problem "no TRUSTED_PROXY_IPS line in $env_file (the backend needs it too)."
+    fi
+  fi
+  if [ "${#proxy_ips[@]}" = 0 ]; then
+    problem "no usable IPv4 proxy address: NOBODY may connect to the backend's published port (it fails closed) until TRUSTED_PROXY_IPS holds the reverse proxy's IPv4 address."
+  fi
 
   if [ -n "$turn_public_ip_argument" ]; then
+    is_ipv4 "$turn_public_ip_argument" \
+      || die "$(not_ipv4_message "$turn_public_ip_argument" --turn-public-ip). Nothing was changed."
     turn_public_ip="$turn_public_ip_argument"
-    source="--turn-public-ip"
-  else
-    require_env_file
-    turn_public_ip="$(read_env_value TURN_PUBLIC_IP)" \
-      || die "no TURN_PUBLIC_IP line in $env_file (compose.yaml needs it too), or pass --turn-public-ip. Nothing was changed."
-    source="TURN_PUBLIC_IP in $env_file"
+  elif [ "$env_readable" = 1 ]; then
+    env_source="TURN_PUBLIC_IP in $env_file"
+    if ! turn_public_ip="$(read_env_value TURN_PUBLIC_IP)" || [ -z "$turn_public_ip" ]; then
+      problem "no TURN_PUBLIC_IP in $env_file (compose.yaml needs it too): the rule that keeps coturn from the home's public address is left out."
+      turn_public_ip=""
+    elif ! is_ipv4 "$turn_public_ip"; then
+      problem "$(not_ipv4_message "$turn_public_ip" "$env_source"): the rule that keeps coturn from the home's public address is left out."
+      turn_public_ip=""
+    fi
   fi
-  require_ipv4 "$turn_public_ip" "$source"
 }
 
 ipv4_forward_rules() {
@@ -201,13 +262,27 @@ ipv4_forward_rules() {
   # Packets of connections already allowed (replies, and related ICMP errors) go on unchanged.
   echo "$rule -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN"
   # The backend and PostgreSQL talk to each other (seen here only when br_netfilter is loaded) and
-  # start no connection to anything else: they need nothing outside their bridge.
+  # start no connection to anything else: they need nothing outside their bridge. Rejected, not
+  # dropped, so a mistake shows at once instead of as a hang.
   echo "$rule -i $backend_bridge -o $backend_bridge -j RETURN"
-  echo "$rule -i $backend_bridge -j DROP"
-  # Into their bridge only through a published port (DNAT): the backend's only from the reverse
-  # proxy; PostgreSQL's from wherever POSTGRES_PUBLISH_ADDR publishes it (127.0.0.1 by default,
-  # which only the Pi itself reaches, and not through this chain).
-  for proxy_ip in "${proxy_ips[@]}"; do
+  echo "$rule -i $backend_bridge -p tcp -j REJECT --reject-with tcp-reset"
+  echo "$rule -i $backend_bridge -j REJECT --reject-with icmp-port-unreachable"
+  # Out of coturn's bridge only to public addresses (relaying to them is coturn's job): never the
+  # LAN, the Pi's other networks or the home's own public address. Before every rule below that
+  # lets something into a bridge, so coturn cannot use one of them (for example PostgreSQL's
+  # published port, reached through the Pi's address and DNAT) to get into the backend's bridge.
+  echo "$rule -i $turn_bridge -o $backend_bridge -j DROP"
+  for range in "${turn_denied_ranges[@]}"; do
+    echo "$rule -d $range -i $turn_bridge -j DROP"
+  done
+  if [ -n "$turn_public_ip" ]; then
+    echo "$rule -d $turn_public_ip/32 -i $turn_bridge -j DROP"
+  fi
+  # Into the backend's bridge only through a published port (DNAT): the backend's only from the
+  # reverse proxy (with no proxy address, from nobody); PostgreSQL's from wherever
+  # POSTGRES_PUBLISH_ADDR publishes it (127.0.0.1 by default, which only the Pi itself reaches,
+  # and not through this chain).
+  for proxy_ip in ${proxy_ips[@]+"${proxy_ips[@]}"}; do
     echo "$rule -s $proxy_ip/32 -o $backend_bridge -p tcp -m tcp --dport $backend_container_port -m conntrack --ctstate DNAT -j RETURN"
   done
   echo "$rule -o $backend_bridge -p tcp -m tcp --dport $postgres_container_port -m conntrack --ctstate DNAT -j RETURN"
@@ -215,24 +290,19 @@ ipv4_forward_rules() {
   # coturn's TCP ports: per source address, at most this many connections open at once, and new
   # ones at this rate. Before the RETURN below, or they would never apply.
   echo "$rule $coturn_tcp -m conntrack --ctstate NEW -m connlimit --connlimit-above $turn_tcp_max_connections_per_source --connlimit-mask 32 --connlimit-saddr -j DROP"
-  echo "$rule $coturn_tcp -m conntrack --ctstate NEW -m hashlimit --hashlimit-above $turn_tcp_new_connections_per_minute/minute --hashlimit-burst $turn_tcp_new_connections_burst --hashlimit-mode srcip --hashlimit-name $turn_tcp_hashlimit_name --hashlimit-htable-expire $turn_tcp_hashlimit_expire_milliseconds -j DROP"
+  echo "$rule $coturn_tcp -m conntrack --ctstate NEW -m hashlimit --hashlimit-above $turn_tcp_new_connections_per_minute/minute --hashlimit-burst $turn_tcp_new_connections_burst --hashlimit-mode srcip --hashlimit-name $turn_tcp_hashlimit_name --hashlimit-htable-size $turn_tcp_hashlimit_size --hashlimit-htable-max $turn_tcp_hashlimit_max --hashlimit-htable-expire $turn_tcp_hashlimit_expire_milliseconds -j DROP"
   # Into coturn's bridge only through coturn's published ports.
   echo "$rule -d $coturn_ip/32 -o $turn_bridge -p udp -m multiport --dports $coturn_udp_ports -m conntrack --ctstate DNAT -j RETURN"
   echo "$rule $coturn_tcp -m conntrack --ctstate DNAT -j RETURN"
   echo "$rule -o $turn_bridge -j DROP"
-  # Out of coturn's bridge only to public addresses (relaying to them is coturn's job): never the
-  # LAN, the Pi's other networks or the home's own public address.
-  for range in "${turn_denied_ranges[@]}"; do
-    echo "$rule -d $range -i $turn_bridge -j DROP"
-  done
-  echo "$rule -d $turn_public_ip/32 -i $turn_bridge -j DROP"
 }
 
 # Neither bridge may open a connection to the Pi itself: its gateway address on the bridge, its
 # LAN address or any other. Replies to connections the Pi opened go on unchanged.
 ipv4_input_rules() {
   echo "-A $input_chain -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN"
-  echo "-A $input_chain -i $backend_bridge -j DROP"
+  echo "-A $input_chain -i $backend_bridge -p tcp -j REJECT --reject-with tcp-reset"
+  echo "-A $input_chain -i $backend_bridge -j REJECT --reject-with icmp-port-unreachable"
   echo "-A $input_chain -i $turn_bridge -j DROP"
 }
 
@@ -305,8 +375,15 @@ missing_bridges() {
   done
 }
 
+finish() { # $1 = what was done
+  if [ "$problems" -gt 0 ]; then
+    echo "firewall.sh: $1, but with $problems problem(s) (ERROR above): it failed closed where a value was missing or wrong. Fix .env, then run it again." >&2
+    exit 1
+  fi
+}
+
 apply() {
-  local error_output missing forward_jumps input_jumps ipv6_summary
+  local error_output missing forward_jumps input_jumps ipv6_summary allowed proxy_ip
   resolve_values
   require_iptables
   if ! error_output="$(iptables -w -S DOCKER-USER 2>&1 >/dev/null)"; then
@@ -314,7 +391,7 @@ apply() {
   fi
   missing="$(missing_bridges)"
   if [ -n "$missing" ]; then
-    echo "firewall.sh: WARNING: no interface named $(echo "$missing" | tr '\n' ' ')yet. The rules apply once Docker creates it; if the stack is running, recreate its networks (README.md, Firewall, step 1)." >&2
+    warning "no interface named $(echo "$missing" | tr '\n' ' ')yet. The rules apply once Docker creates it; if the stack is running, recreate its networks (README.md, Firewall, step 1)."
   fi
   forward_jumps="$(count_jumps iptables DOCKER-USER "$forward_chain")"
   input_jumps="$(count_jumps iptables INPUT "$input_chain")"
@@ -327,10 +404,15 @@ apply() {
     ipv6_summary="IPv6: ip6tables does not work on this host, so no IPv6 rules (the bridges are IPv4 only)."
   fi
   echo "Secure Call firewall applied. IPv4: $forward_chain from DOCKER-USER, $input_chain from INPUT. $ipv6_summary"
-  local allowed="${proxy_ips[0]}" proxy_ip
-  for proxy_ip in "${proxy_ips[@]:1}"; do allowed="$allowed, $proxy_ip"; done
-  echo "Only $allowed may connect to the backend's published port."
+  if [ "${#proxy_ips[@]}" -gt 0 ]; then
+    allowed="${proxy_ips[0]}"
+    for proxy_ip in "${proxy_ips[@]:1}"; do allowed="$allowed, $proxy_ip"; done
+    echo "Only $allowed may connect to the backend's published port."
+  else
+    echo "Nobody may connect to the backend's published port (no usable proxy address)."
+  fi
   echo "Check: firewall.sh --check. Undo: firewall.sh --remove."
+  finish "The rules were applied"
 }
 
 print_rules() {
@@ -341,6 +423,7 @@ print_rules() {
   ipv4_input_rules
   echo "# IPv6, chain $input_chain (jumped to first from INPUT; only where ip6tables works):"
   ipv6_input_rules
+  finish "These are the rules it would apply"
 }
 
 show_chain() { # $1 = iptables or ip6tables, $2 = our chain, $3 = the chain that jumps to it
@@ -425,7 +508,10 @@ while [ "$#" -gt 0 ]; do
       case "$1" in
         --env-file) env_file="$2" ;;
         --proxy-ip) proxy_ip_arguments+=("$2") ;;
-        --turn-public-ip) turn_public_ip_argument="$2" ;;
+        --turn-public-ip)
+          [ -n "$2" ] || usage_error "--turn-public-ip needs a value"
+          turn_public_ip_argument="$2"
+          ;;
       esac
       value_option_given=1
       shift
