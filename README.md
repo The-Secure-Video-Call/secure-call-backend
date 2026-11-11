@@ -231,17 +231,18 @@ cd deploy/raspberry-pi && docker compose pull postgres && docker compose up -d p
 
 ## Logs
 
-Every log the project produces or depends on. None may contain message contents, room IDs, IP
-addresses or usernames (PLAN.md §3). Logs stay on the machine that wrote them; if they are ever
+Every log the project produces or depends on. Our own logs (backend, PostgreSQL, coturn) may
+never contain message contents, room IDs, IP addresses or usernames (PLAN.md §3); the proxy's error
+log and the static host's and CDN's logs can contain IP addresses (see their rows). Logs stay on the machine that wrote them; if they are ever
 copied off the Pi, copy them to a host we control, never to a third-party logging service.
 
 | Log | Where it lives | May contain | Retention | Who may read it |
 |---|---|---|---|---|
-| Backend (Daphne and Django) | Docker `local` log of the `secure-call-backend` container on the Pi (`docker compose logs backend`) | Warnings and errors from this app: time, level, logger name and a fixed message. Daphne runs with `-v 0`, so there is no access log | Rotated by `compose.yaml`: at most 3 files of 10 MB (about 30 MB), oldest dropped first | The Pi's owner and users in the `docker` group (root-equivalent), so keep that group trusted |
-| PostgreSQL | Docker `local` log of the `postgres` container on the Pi | Server start-up, checkpoint and error messages. It holds no call data (see Database). Error lines (for example a failed login) can name the database role and the backend container's internal Docker address, never a client's address | Same rotation: 3 files of 10 MB | Same as the backend |
+| Backend (Daphne and Django) | Docker `local` log of the `secure-call-backend` container on the Pi (`docker compose logs backend`) | Warnings and errors from this app: time, level, logger name and message, including request paths of 4xx responses and rejected Host headers; never client addresses. Daphne runs with `-v 0`, so there is no access log | Rotated by `compose.yaml`: at most 3 files of 10 MB (about 30 MB), oldest dropped first | The Pi's owner and users in the `docker` group (root-equivalent), so keep that group trusted |
+| PostgreSQL | Docker `local` log of the `postgres` container on the Pi | Server start-up, checkpoint and error messages. It holds no call data (see Database). Error lines (for example a failed login) can name the database role and the connecting address (the backend container, or for tools on the published port the Docker gateway or a home-LAN device), never a caller's address | Same rotation: 3 files of 10 MB | Same as the backend |
 | coturn | Discarded: `logging: driver: none` and a read-only root filesystem in `compose.yaml` (coturn prints TURN usernames on failed logins). Whether to keep any of it is decided in #70 | Nothing is stored | None; gone as soon as it is written | Nobody |
 | Nginx Proxy Manager | On the proxy machine, `/data/logs/` inside its container. This host's access log is off (setup step 4); the error log is kept | Error log: failed connections, which can name a client address | Managed by the proxy's own log rotation, not by this repo; check it on the proxy machine. Optionally keep it in memory (step 4) | The proxy machine's owner and its `docker` group |
-| Static host and CDN (securevideocall.com) | The web app's host and CDN, outside this repo | Whatever that provider records for requests to static files, typically client addresses. We do not control it | The provider's own policy; document it in the web repository's `docs/security-review.md` | The provider's staff and the account owners |
+| Static host and CDN (securevideocall.com) | The web app's host and CDN, outside this repo | Whatever that provider records for requests to static files, typically client addresses. We do not control it | The provider's own policy; document it in the web repository's `docs/data-inventory.md` (secure-call#124) | The provider's staff and the account owners |
 | GitHub Actions | GitHub, per workflow run of this repository | Build and test output. Workflows must not print secrets or call data | GitHub's default (90 days for logs and artifacts) | Collaborators with access to this repository; public repository logs are readable by anyone |
 
 Rollout of the rotation on the Pi: `cd deploy/raspberry-pi && docker compose up -d`. This recreates
