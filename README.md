@@ -167,7 +167,8 @@ published on `127.0.0.1:5434` by default (`POSTGRES_PUBLISH_ADDR` and `POSTGRES_
 
 ```
 Browser --wss://signal.securevideocall.com--> router :443 --> Nginx Proxy Manager
-        --> Pi :8001 (secure-call-backend container) --> PostgreSQL container
+        --https, checked against our CA--> Pi :8001 (secure-call-backend container)
+        --TLS, checked--> PostgreSQL container
 ```
 
 **How updates arrive:** every pull request and every merge to `main` runs **Publish backend
@@ -201,22 +202,47 @@ Manager already running.
    cd secure-call-backend/deploy/raspberry-pi
    cp .env.example .env        # set BACKEND_PUBLISH_ADDR, DJANGO_SECRET_KEY, POSTGRES_PASSWORD,
                                # POSTGRES_APP_PASSWORD
-   ./make-local-certs.sh       # the database's TLS certificate, into ./tls/
+   ./make-local-certs.sh       # TLS certificates for the database and the backend, into
+                               # ./tls/ (asks for sudo once)
    docker compose up -d postgres
    ./update.sh                 # pulls and starts only a verified backend image
    docker compose up -d
    ```
    compose never pulls the backend image itself (`pull_policy: never`), so `update.sh` must run
    before the first full `docker compose up -d`, which otherwise stops with "No such image".
-4. **Nginx Proxy Manager, Add Proxy Host:** domain `signal.securevideocall.com`; scheme `http`,
-   forward hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
+4. **Nginx Proxy Manager.** First copy this Pi's `tls/local-ca.crt` (public, but copy it over SSH
+   so nobody can swap it) into the proxy's data folder, so it is `/data/secure-call/local-ca.crt`
+   inside the proxy's container, for example from the proxy machine:
+   ```sh
+   scp <pi>:secure-call-backend/deploy/raspberry-pi/tls/local-ca.crt .
+   docker exec nginx-proxy-manager-app-1 mkdir -p /data/secure-call
+   docker cp local-ca.crt nginx-proxy-manager-app-1:/data/secure-call/local-ca.crt
+   ```
+   Then **Add Proxy Host:** domain `signal.securevideocall.com`; scheme **`https`**, forward
+   hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
    machine), port `8001`; **Websockets Support** and **Block
    Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **Force SSL**, **HTTP/2**
-   and **HSTS** on. **Advanced tab**, Custom Nginx Configuration:
+   and **HSTS** on. **Advanced tab**, Custom Nginx Configuration: the lines of
+   `deploy/raspberry-pi/npm-advanced.conf` (CI runs exactly these against the backend):
    ```nginx
    access_log off;
+   proxy_ssl_verify on;
+   proxy_ssl_trusted_certificate /data/secure-call/local-ca.crt;
+   proxy_ssl_name secure-call-backend;
+   proxy_ssl_server_name on;
+   proxy_ssl_protocols TLSv1.3;
    ```
-   so the proxy keeps no record of who connected when (PLAN.md §3.5: no request logging of IP
+   The backend speaks only HTTPS/WSS on 8001 (`BACKEND_TLS_CERTIFICATE` in `compose.yaml`), so
+   room IDs and TURN credentials never cross the home network in plaintext, and without
+   `proxy_ssl_verify` anyone on that network could pose as the backend. A host that works is
+   no proof the check is on (without these lines it works too), so check, with the host's id
+   from step 6 (5 here); this must print the three lines:
+   ```sh
+   docker exec nginx-proxy-manager-app-1 sh -c \
+     'grep -E "proxy_ssl_(verify on|trusted_certificate|name)" /data/nginx/proxy_host/5.conf'
+   ```
+
+   `access_log off;` means the proxy keeps no record of who connected when (PLAN.md §3.5: no request logging of IP
    addresses; this app's own logs never contain them). The proxy still writes this host's error
    log (`/data/logs/proxy-host-<id>_error.log`), and a line there can name a client address when
    a connection fails. The Advanced tab cannot turn it off (another `error_log` only adds a
@@ -248,8 +274,11 @@ from GitHub's runners, outside the home network. When either fails three tries i
 the issue "Uptime: securevideocall.com is down" in that repository, which notifies its watchers,
 and closes it when both answer again. It reads only those two public URLs and records only which
 one failed and when: no personal data, and nothing runs on the Pis. If only the signaling server
-is down, check the proxy machine first (`docker ps -a` there): the backend answers on its own
-with `curl -H 'Host: signal.securevideocall.com' http://<this Pi's LAN IP>:8001/healthz`.
+is down, check the proxy machine first (`docker ps -a` there): the backend answers on its own,
+from `deploy/raspberry-pi` on this Pi, with `curl --cacert tls/local-ca.crt --resolve
+secure-call-backend:8001:127.0.0.1 -H 'Host: signal.securevideocall.com'
+https://secure-call-backend:8001/healthz` (use this Pi's LAN IP instead of 127.0.0.1 if the
+backend is published on it).
 GitHub turns the schedule off after 60 days without activity in the web repository, and a push
 does not turn it back on: re-enable it on that repository's Actions tab, or with
 `gh workflow enable uptime.yml -R The-Secure-Video-Call/secure-call`.
@@ -259,36 +288,55 @@ securecall`. A database tool on port `5434` must use TLS and trust our CA, for e
 `psql "host=127.0.0.1 port=5434 dbname=securecall user=securecall sslmode=verify-full
 sslrootcert=tls/local-ca.crt"` from `deploy/raspberry-pi`.
 
-**Database certificate renewal:** `make-local-certs.sh` prints when the certificates expire
-(825 days). Before then, or if a key may have leaked, run it again (it makes a new CA), then
-`docker compose up -d --force-recreate postgres backend`.
+**Certificate renewal:** `make-local-certs.sh` prints when the certificates expire (825 days).
+Before then, or if a key may have leaked, run it again (it makes a new CA and new certificates
+for PostgreSQL and the backend). The proxy reads its CA file only when it loads its
+configuration, so without a reload it keeps refusing the new certificate:
 
-**Moving an existing Pi to the TLS database (once):** the role is created only when the database
-is first created, and the database holds nothing yet, so the volume is recreated. Comment out
-the `update.sh` line in `crontab -e` for the duration, and approve **no** "Publish backend
-image" run (not even a Dependabot one) until the Pi has been moved. Do this
-**before** approving the "Publish backend image" run for this change: `update.sh` pulls new
-images but not new files, and the new image refuses to start without the certificate, while
-the old image runs fine with the new files (its start-up migration fails harmlessly, and
-signaling does not use the database). In `deploy/raspberry-pi`, after `git pull`:
+1. On the proxy machine, put the new `tls/local-ca.crt` **after** the old one in
+   `/data/secure-call/local-ca.crt` (both trusted for a moment), then
+   `docker exec nginx-proxy-manager-app-1 sh -c 'nginx -t && nginx -s reload'`.
+2. On this Pi: `docker compose up -d --force-recreate postgres backend`.
+3. On the proxy machine, leave only the new CA in the file and reload again (as in 1). After a
+   suspected compromise, skip the overlap: replace the file, reload and recreate at once.
 
-```sh
-# 1. Add a new POSTGRES_APP_PASSWORD to .env (a different value from POSTGRES_PASSWORD):
-python3 -c "import secrets; print(secrets.token_urlsafe(32))"
-nano .env
-# 2. Certificates, then recreate the empty database volume and start everything:
-./make-local-certs.sh
-docker compose down --volumes   # pgdata is the only volume
-docker compose pull backend && docker compose up -d
-docker compose ps    # backend and postgres "healthy" or "running"
-# 3. Once the new image runs (after approving the publish): the role exists, and the backend
-#    itself reaches the database (its start-up migration does not stop on a failure):
-docker compose exec postgres psql -U securecall -d securecall -Atc \
-  "select rolname from pg_roles where rolname = 'securecall_app'"   # securecall_app
-docker compose exec backend python manage.py migrate --check && echo database reachable
-```
+**Moving an existing Pi to TLS everywhere (once):** the database accepts TLS only, the backend
+connects as its own role, and the proxy reaches the backend over checked TLS. The role is created
+only when the database is first created, and the database holds nothing yet, so its volume is
+recreated. The old image speaks plain HTTP and the new one HTTPS only, so the proxy reaches the
+backend again only once the new image runs and the proxy uses `https`. Keep that gap short, and
+for the duration comment out the `update.sh` line in `crontab -e` and approve no other "Publish
+backend image" run (not even a Dependabot one):
 
-Then put the cron line back. If the first start fails (see `docker compose logs postgres`),
+1. **Before approving the "Publish backend image" run**, on this Pi in `deploy/raspberry-pi`:
+   ```sh
+   git pull
+   python3 -c "import secrets; print(secrets.token_urlsafe(32))"   # a new password
+   nano .env            # add POSTGRES_APP_PASSWORD=<it>, different from POSTGRES_PASSWORD
+   ./make-local-certs.sh                       # asks for sudo once
+   docker compose down --volumes               # pgdata, which holds nothing, is the only volume
+   docker compose up -d                        # the old image still serves plain HTTP
+   ```
+   Signaling keeps working: the old image ignores the new TLS settings (its start-up migration
+   fails harmlessly, and signaling does not use the database).
+2. **On the proxy machine**, copy `tls/local-ca.crt` into the proxy (setup step 4), but don't
+   change the host yet.
+3. **Approve the publish** and wait until it finishes. Then, without waiting for cron:
+   `./update.sh` on this Pi, and **at once** switch the proxy host to `https` and add the
+   Advanced lines from setup step 4.
+4. **Check**, then put the cron line back:
+   ```sh
+   docker compose ps    # backend and postgres running
+   docker compose exec postgres psql -U securecall -d securecall -Atc \
+     "select rolname from pg_roles where rolname = 'securecall_app'"   # securecall_app
+   # The backend itself reaches the database (its start-up migration does not stop on a failure):
+   docker compose exec backend python manage.py migrate --check && echo database reachable
+   curl https://signal.securevideocall.com/healthz     # {"status": "ok"}
+   # On the proxy machine: the three proxy_ssl lines are in the host's config (setup step 4).
+   ```
+   and make a test call.
+
+If PostgreSQL's first start fails (see `docker compose logs postgres`),
 the half-created database must be removed before trying again: `docker compose down
 --volumes`.
 

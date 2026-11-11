@@ -197,11 +197,12 @@ if TURN_URLS and not (
 
 # --- Security headers and HTTPS (production) -------------------------------------------------
 
-# TLS is terminated by the reverse proxy (Caddy), which must set X-Forwarded-Proto itself and
+# TLS is terminated by the reverse proxy (Nginx Proxy Manager), which must set X-Forwarded-Proto
+# itself (the hop from it to Daphne is TLS too, README.md setup step 4) and
 # never pass a client-supplied value through.
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", default=not DEBUG)
-SECURE_REDIRECT_EXEMPT = [r"^healthz$"]  # internal health checks use plain HTTP
+SECURE_REDIRECT_EXEMPT = [r"^healthz$"]  # health checks may come without X-Forwarded-Proto
 SECURE_HSTS_SECONDS = 0 if DEBUG else 31_536_000
 SECURE_HSTS_INCLUDE_SUBDOMAINS = not DEBUG
 SECURE_REFERRER_POLICY = "no-referrer"
