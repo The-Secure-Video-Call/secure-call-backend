@@ -167,8 +167,9 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
 
 1. **DNS:** in ServerByt's DNS editor, point `signal.securevideocall.com` (A record) at your
    home's static IP.
-2. **Router:** forward TCP 80 and 443 to the Pi (Nginx Proxy Manager). Never forward 81 (its
-   admin page) or 5432 (the database).
+2. **Router:** forward TCP 80 and 443 to the machine that runs Nginx Proxy Manager, to the ports
+   it publishes (for example 40080 and 40443 if its container maps them there). Never forward its
+   admin port (81 inside the container) or 5432 (the database).
 3. **Get the files and fill in the settings:**
    ```sh
    git clone https://github.com/The-Secure-Video-Call/secure-call-backend.git
@@ -180,12 +181,42 @@ Requirements: 64-bit OS, Docker with the Compose plugin, Nginx Proxy Manager alr
    forward hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
    machine), port `8001`; **Websockets Support** and **Block
    Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **Force SSL**, **HTTP/2**
-   and **HSTS** on.
+   and **HSTS** on. **Advanced tab**, Custom Nginx Configuration:
+   ```nginx
+   access_log off;
+   ```
+   so the proxy keeps no record of who connected when (PLAN.md §3.5: no request logging of IP
+   addresses; this app's own logs never contain them). The proxy still writes this host's error
+   log (`/data/logs/proxy-host-<id>_error.log`), and a line there can name a client address when
+   a connection fails. The Advanced tab cannot turn it off (another `error_log` only adds a
+   destination). Either accept that (it holds failures only), or keep all of the proxy's logs in
+   memory by adding `tmpfs: ["/data/logs:size=16m"]` to its service in its own compose file (this
+   affects every host on that proxy, and the logs then vanish on restart).
 5. **Automatic updates:** `crontab -e`, then add (with your path):
    ```
    */5 * * * * /home/pi/secure-call-backend/deploy/raspberry-pi/update.sh >/dev/null 2>&1
    ```
 6. **Check:** `curl https://signal.securevideocall.com/healthz` returns `{"status": "ok"}`.
+   Then make a short call and, on the proxy machine, check that this host's access log stays
+   empty (replace the container name and look up the host's `<id>` first):
+   ```sh
+   docker exec nginx-proxy-manager-app-1 sh -c 'grep -l signal.securevideocall.com /data/nginx/proxy_host/*.conf'
+   docker exec nginx-proxy-manager-app-1 sh -c 'wc -c /data/logs/proxy-host-<id>_access.log*'
+   ```
+
+### Uptime monitoring
+
+The web repository's `Uptime` workflow (`.github/workflows/uptime.yml` in secure-call) checks
+`https://securevideocall.com/` and `https://signal.securevideocall.com/healthz` every 10 minutes
+from GitHub's runners, outside the home network. When either fails three tries in a row, it opens
+the issue "Uptime: securevideocall.com is down" in that repository, which notifies its watchers,
+and closes it when both answer again. It reads only those two public URLs and records only which
+one failed and when: no personal data, and nothing runs on the Pis. If only the signaling server
+is down, check the proxy machine first (`docker ps -a` there): the backend answers on its own
+with `curl -H 'Host: signal.securevideocall.com' http://<this Pi's LAN IP>:8001/healthz`.
+GitHub turns the schedule off after 60 days without activity in the web repository, and a push
+does not turn it back on: re-enable it on that repository's Actions tab, or with
+`gh workflow enable uptime.yml -R The-Secure-Video-Call/secure-call`.
 
 To look inside the database from the Pi: `docker compose exec postgres psql -U securecall
 securecall`, or point a database tool at port `5434`.
