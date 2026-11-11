@@ -222,12 +222,17 @@ def test_main_passes_when_everything_is_pinned(tmp_path: Path) -> None:
     assert main([str(repository)]) == 0
 
 
-def test_ci_postgres_is_the_same_image_as_on_the_pi() -> None:
-    image_line = re.compile(r"image: (postgres:\S+)")
-    ci_images = image_line.findall((ROOT / ".github/workflows/ci.yml").read_text())
-    pi_images = image_line.findall((ROOT / "deploy/raspberry-pi/compose.yaml").read_text())
+def test_ci_postgres_is_started_from_the_pis_compose_file() -> None:
+    # Not a copy of the image or its settings: CI starts the very service the Pi runs, with its
+    # TLS and role setup, so the two cannot drift apart.
+    ci_text = (ROOT / ".github/workflows/ci.yml").read_text()
+    pi_images = re.findall(
+        r"image: (postgres:\S+)", (ROOT / "deploy/raspberry-pi/compose.yaml").read_text()
+    )
 
-    assert ci_images == pi_images
+    assert "working-directory: deploy/raspberry-pi" in ci_text
+    assert "docker compose up -d --wait postgres" in ci_text
+    assert "image: postgres" not in ci_text
     assert len(pi_images) == 1
 
 

@@ -2,6 +2,7 @@
 #
 # On the Pi, in this folder:
 #   cp .env.example .env      # then fill in the values marked "set"
+#   ./make-local-certs.sh     # certificates from our local CA, into ./tls/
 #   docker compose up -d postgres
 #   ./update.sh               # after its one-time setup (README.md); starts a verified backend
 #   docker compose up -d
@@ -16,6 +17,8 @@
 #   - PostgreSQL is published on POSTGRES_PUBLISH_ADDR:POSTGRES_PUBLISH_PORT (default
 #     127.0.0.1:5434, the Pi only) for database tools. Never forward that port, 5432 or 81
 #     (the proxy's admin page) on your router.
+#   - PostgreSQL accepts TLS connections only, with a certificate from our own local CA
+#     (./make-local-certs.sh writes ./tls/ once), and the backend checks it (verify-full).
 services:
   backend:
     image: ghcr.io/the-secure-video-call/secure-call-backend:main
@@ -29,6 +32,13 @@ services:
       # whatever port is published on the Pi.
       POSTGRES_HOST: postgres
       POSTGRES_PORT: '5432'
+      # The backend's own role (postgres/initdb/10-app-role.sh), never the superuser. These
+      # replace POSTGRES_USER and POSTGRES_PASSWORD from .env, so the backend never receives
+      # the superuser's password.
+      POSTGRES_USER: ${POSTGRES_APP_USER:-securecall_app}
+      POSTGRES_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+      POSTGRES_SSLMODE: verify-full
+      POSTGRES_SSLROOTCERT: /run/secure-call/local-ca.crt
     depends_on:
       postgres:
         condition: service_healthy
@@ -43,20 +53,96 @@ services:
       options:
         max-size: 10m
         max-file: '3'
+    volumes:
+      # The local CA's certificate (public). create_host_path: false, so a missing file stops
+      # the start instead of Docker silently creating an empty directory in its place.
+      - type: bind
+        source: ./tls/local-ca.crt
+        target: /run/secure-call/local-ca.crt
+        read_only: true
+        bind:
+          create_host_path: false
+    # The same hardening as coturn: nothing the backend writes reaches the Pi's disk, no
+    # capabilities, no privilege gain, no core dumps (memory holds the secrets). It runs as the
+    # image's unprivileged user (uid 10001).
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777,noexec,nosuid,nodev
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ulimits:
+      core: 0
 
   postgres:
     image: postgres:18@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
     restart: unless-stopped
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-securecall}
+      # The superuser, for maintenance only.
       POSTGRES_USER: ${POSTGRES_USER:-securecall}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      # Read by postgres/initdb/10-app-role.sh when the database is first created.
+      POSTGRES_APP_USER: ${POSTGRES_APP_USER:-securecall_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?Set POSTGRES_APP_PASSWORD in .env}
+    # The image starts as root. PostgreSQL refuses a key that others can read, so the key is
+    # first copied into memory, readable by the postgres user only; then the image's own
+    # entrypoint takes over (and drops to that user).
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        install -o postgres -g postgres -m 0600 /run/tls-source/postgres.key
+        /run/postgres-tls/postgres.key && exec docker-entrypoint.sh "$$@"
+      - postgres-tls
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/run/tls-source/postgres.crt
+      - -c
+      - ssl_key_file=/run/postgres-tls/postgres.key
+      - -c
+      - ssl_min_protocol_version=TLSv1.3
+      # TLS-only rules: no plaintext connection is accepted over the network.
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    tmpfs:
+      - /run/postgres-tls:size=64k,mode=0755,noexec,nosuid,nodev
     ports:
       - '${POSTGRES_PUBLISH_ADDR:-127.0.0.1}:${POSTGRES_PUBLISH_PORT:-5434}:5432'
     volumes:
       - pgdata:/var/lib/postgresql
+      - type: bind
+        source: ./postgres/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./postgres/initdb
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls/postgres.crt
+        target: /run/tls-source/postgres.crt
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls/postgres.key
+        target: /run/tls-source/postgres.key
+        read_only: true
+        bind:
+          create_host_path: false
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      # Over TCP: the image's temporary first-start server listens on the Unix socket only,
+      # so this stays unhealthy until the real server (TLS, the backend's role) is up.
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 10s
       timeout: 5s
       retries: 5

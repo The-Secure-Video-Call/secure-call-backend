@@ -72,17 +72,93 @@ def test_no_database_without_postgres_host() -> None:
     assert result.stdout.strip() == "none - -"
 
 
-def test_postgres_settings_come_from_environment() -> None:
+def test_postgres_settings_come_from_environment(tmp_path: Path) -> None:
+    root_certificate = tmp_path / "local-ca.crt"
+    root_certificate.write_text("not parsed by the settings\n")
     env = {
         "DJANGO_SECRET_KEY": "k" * 60,
         "POSTGRES_HOST": "127.0.0.1",
         "POSTGRES_DB": "accounts",
         "POSTGRES_PASSWORD": "not-a-real-password",
+        "POSTGRES_SSLROOTCERT": str(root_certificate),
     }
     result = load_settings(env, DB_PRINT)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "django.db.backends.postgresql 127.0.0.1 accounts"
+
+
+DB_TLS_PRINT = (
+    "import config.settings as s; o = s.DATABASES['default']['OPTIONS']; "
+    "print(o['sslmode'], o.get('sslrootcert', '-'))"
+)
+DB_ENV = {
+    "DJANGO_SECRET_KEY": "k" * 60,
+    "POSTGRES_HOST": "postgres",
+    "POSTGRES_PASSWORD": "not-a-real-password",
+}
+
+
+def test_database_tls_checks_certificate_and_host_name_by_default(tmp_path: Path) -> None:
+    root_certificate = tmp_path / "local-ca.crt"
+    root_certificate.write_text("not parsed by the settings\n")
+    result = load_settings({**DB_ENV, "POSTGRES_SSLROOTCERT": str(root_certificate)}, DB_TLS_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == f"verify-full {root_certificate}"
+
+
+def test_database_without_tls_only_when_asked_for_explicitly() -> None:
+    for local_host in ["localhost", "127.0.0.1", "::1", "/var/run/postgresql"]:
+        env = {**DB_ENV, "POSTGRES_HOST": local_host, "POSTGRES_SSLMODE": "disable"}
+        result = load_settings(env, DB_TLS_PRINT)
+
+        assert result.returncode == 0, (local_host, result.stderr)
+        assert result.stdout.strip() == "disable -"
+
+
+def test_negative_no_database_tls_refused_for_a_database_on_another_machine() -> None:
+    for remote_host in ["postgres", "db.example.invalid", "192.0.2.10", "localhost.example"]:
+        env = {**DB_ENV, "POSTGRES_HOST": remote_host, "POSTGRES_SSLMODE": "disable"}
+        result = load_settings(env, DB_TLS_PRINT)
+
+        assert result.returncode != 0, remote_host
+        assert "POSTGRES_SSLMODE=disable is only allowed" in result.stderr
+
+
+def test_no_database_tls_for_another_machine_only_with_debug() -> None:
+    env = {**DB_ENV, "POSTGRES_SSLMODE": "disable", "DJANGO_DEBUG": "1"}
+    result = load_settings(env, DB_TLS_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "disable -"
+
+
+def test_refuses_database_tls_without_a_root_certificate(tmp_path: Path) -> None:
+    for root_certificate in ["", str(tmp_path / "missing.crt"), str(tmp_path)]:
+        env = {**DB_ENV, "POSTGRES_SSLROOTCERT": root_certificate}
+        result = load_settings(env, DB_TLS_PRINT)
+
+        assert result.returncode != 0, root_certificate
+        assert "POSTGRES_SSLROOTCERT must name the root certificate" in result.stderr
+        assert "not-a-real-password" not in result.stdout + result.stderr
+
+
+def test_refuses_database_tls_modes_that_fall_back_or_accept_any_certificate(
+    tmp_path: Path,
+) -> None:
+    root_certificate = tmp_path / "local-ca.crt"
+    root_certificate.write_text("not parsed by the settings\n")
+    for sslmode in ["prefer", "allow", "require", "verify-ca", "VERIFY-FULL", " verify-full", ""]:
+        env = {
+            **DB_ENV,
+            "POSTGRES_SSLMODE": sslmode,
+            "POSTGRES_SSLROOTCERT": str(root_certificate),
+        }
+        result = load_settings(env, DB_TLS_PRINT)
+
+        assert result.returncode != 0, sslmode
+        assert "POSTGRES_SSLMODE must be verify-full" in result.stderr
 
 
 TURN_PRINT = (

@@ -74,11 +74,43 @@ TEMPLATES: list[dict[str, object]] = []
 # POSTGRES_HOST there is no database at all. The database must only be reachable from the
 # backend's own machine or private network: never expose port 5432 to the internet.
 POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "")
+# TLS with the server's certificate and host name checked against a pinned root certificate,
+# or, only when asked for explicitly and only for a database on this machine (or with DEBUG
+# on), no TLS at all: a local development database. The modes
+# in between ("prefer", "allow", "require", "verify-ca") either fall back to plaintext silently
+# or accept any certificate, so they are refused.
+POSTGRES_SSLMODES_ALLOWED = ("verify-full", "disable")
+POSTGRES_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 DATABASES: dict[str, dict[str, object]] = {}
 if POSTGRES_HOST:
     POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
     if not POSTGRES_PASSWORD and not DEBUG:
         raise ImproperlyConfigured("POSTGRES_PASSWORD must be set when POSTGRES_HOST is set.")
+    POSTGRES_SSLMODE = os.environ.get("POSTGRES_SSLMODE", "verify-full")
+    if POSTGRES_SSLMODE not in POSTGRES_SSLMODES_ALLOWED:
+        raise ImproperlyConfigured(
+            "POSTGRES_SSLMODE must be verify-full (the default) or, for a local development "
+            "database only, disable."
+        )
+    if (
+        POSTGRES_SSLMODE == "disable"
+        and not DEBUG
+        and POSTGRES_HOST not in POSTGRES_LOCAL_HOSTS
+        and not POSTGRES_HOST.startswith("/")  # a Unix socket directory
+    ):
+        raise ImproperlyConfigured(
+            "POSTGRES_SSLMODE=disable is only allowed for a database on this machine "
+            "(localhost, 127.0.0.1, ::1 or a socket directory) or with DJANGO_DEBUG on."
+        )
+    POSTGRES_OPTIONS: dict[str, object] = {"sslmode": POSTGRES_SSLMODE, "connect_timeout": 5}
+    if POSTGRES_SSLMODE == "verify-full":
+        POSTGRES_SSLROOTCERT = os.environ.get("POSTGRES_SSLROOTCERT", "")
+        if not POSTGRES_SSLROOTCERT or not Path(POSTGRES_SSLROOTCERT).is_file():
+            raise ImproperlyConfigured(
+                "POSTGRES_SSLROOTCERT must name the root certificate file that signed the "
+                "database's certificate (deploy/raspberry-pi/tls/local-ca.crt on the Pi)."
+            )
+        POSTGRES_OPTIONS["sslrootcert"] = POSTGRES_SSLROOTCERT
     DATABASES["default"] = {
         "ENGINE": "django.db.backends.postgresql",
         "HOST": POSTGRES_HOST,
@@ -88,10 +120,7 @@ if POSTGRES_HOST:
         "PASSWORD": POSTGRES_PASSWORD,
         # ASGI: no persistent connections (Django's advice); add pooling with real traffic.
         "CONN_MAX_AGE": 0,
-        "OPTIONS": {
-            "sslmode": os.environ.get("POSTGRES_SSLMODE", "prefer"),
-            "connect_timeout": 5,
-        },
+        "OPTIONS": POSTGRES_OPTIONS,
     }
 
 LANGUAGE_CODE = "en-us"

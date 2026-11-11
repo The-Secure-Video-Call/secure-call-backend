@@ -12,3 +12,5 @@ htmlcov/
 *.log
 # Read-only copy of the other repo, checked out by the Claude workflows
 .reference/
+# Certificates and keys made on the Pi by deploy/raspberry-pi/make-local-certs.sh
+deploy/raspberry-pi/tls/
