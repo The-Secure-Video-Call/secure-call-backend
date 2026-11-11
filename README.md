@@ -202,7 +202,8 @@ Manager already running.
    cd secure-call-backend/deploy/raspberry-pi
    cp .env.example .env        # set BACKEND_PUBLISH_ADDR, DJANGO_SECRET_KEY, POSTGRES_PASSWORD,
                                # POSTGRES_APP_PASSWORD
-   ./make-local-certs.sh       # the database's TLS certificate, into ./tls/
+   ./make-local-certs.sh       # TLS certificates for the database and the backend, into
+                               # ./tls/ (asks for sudo once)
    docker compose up -d postgres
    ./update.sh                 # pulls and starts only a verified backend image
    docker compose up -d
@@ -221,11 +222,10 @@ Manager already running.
    hostname `127.0.0.1` (proxy on this Pi) or this Pi's home-network IP (proxy on another
    machine), port `8001`; **Websockets Support** and **Block
    Common Exploits** on. SSL tab: request a Let's Encrypt certificate; **Force SSL**, **HTTP/2**
-   and **HSTS** on. **Advanced tab**, Custom Nginx Configuration:
+   and **HSTS** on. **Advanced tab**, Custom Nginx Configuration: the lines of
+   `deploy/raspberry-pi/npm-advanced.conf` (CI runs exactly these against the backend):
    ```nginx
    access_log off;
-   # The hop to the backend: TLS 1.3 only, and its certificate checked against our own CA,
-   # under the name it carries (it need not resolve).
    proxy_ssl_verify on;
    proxy_ssl_trusted_certificate /data/secure-call/local-ca.crt;
    proxy_ssl_name secure-call-backend;
@@ -234,7 +234,13 @@ Manager already running.
    ```
    The backend speaks only HTTPS/WSS on 8001 (`BACKEND_TLS_CERTIFICATE` in `compose.yaml`), so
    room IDs and TURN credentials never cross the home network in plaintext, and without
-   `proxy_ssl_verify` anyone on that network could pose as the backend.
+   `proxy_ssl_verify` anyone on that network could pose as the backend. A host that works is
+   no proof the check is on (without these lines it works too), so check, with the host's id
+   from step 6 (5 here); this must print the three lines:
+   ```sh
+   docker exec nginx-proxy-manager-app-1 sh -c \
+     'grep -E "proxy_ssl_(verify on|trusted_certificate|name)" /data/nginx/proxy_host/5.conf'
+   ```
 
    `access_log off;` means the proxy keeps no record of who connected when (PLAN.md §3.5: no request logging of IP
    addresses; this app's own logs never contain them). The proxy still writes this host's error
@@ -284,9 +290,15 @@ sslrootcert=tls/local-ca.crt"` from `deploy/raspberry-pi`.
 
 **Certificate renewal:** `make-local-certs.sh` prints when the certificates expire (825 days).
 Before then, or if a key may have leaked, run it again (it makes a new CA and new certificates
-for PostgreSQL and the backend), copy the new `tls/local-ca.crt` to the proxy (setup step 4) at
-the same time, then `docker compose up -d --force-recreate postgres backend`. Until the proxy
-has the new CA it refuses the backend, so do both together.
+for PostgreSQL and the backend). The proxy reads its CA file only when it loads its
+configuration, so without a reload it keeps refusing the new certificate:
+
+1. On the proxy machine, put the new `tls/local-ca.crt` **after** the old one in
+   `/data/secure-call/local-ca.crt` (both trusted for a moment), then
+   `docker exec nginx-proxy-manager-app-1 sh -c 'nginx -t && nginx -s reload'`.
+2. On this Pi: `docker compose up -d --force-recreate postgres backend`.
+3. On the proxy machine, leave only the new CA in the file and reload again (as in 1). After a
+   suspected compromise, skip the overlap: replace the file, reload and recreate at once.
 
 **Moving an existing Pi to TLS everywhere (once):** the database accepts TLS only, the backend
 connects as its own role, and the proxy reaches the backend over checked TLS. The role is created
@@ -320,6 +332,7 @@ backend image" run (not even a Dependabot one):
    # The backend itself reaches the database (its start-up migration does not stop on a failure):
    docker compose exec backend python manage.py migrate --check && echo database reachable
    curl https://signal.securevideocall.com/healthz     # {"status": "ok"}
+   # On the proxy machine: the three proxy_ssl lines are in the host's config (setup step 4).
    ```
    and make a test call.
 

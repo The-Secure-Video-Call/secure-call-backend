@@ -27,6 +27,14 @@ if ! openssl version | grep -q '^OpenSSL 3\.'; then
   exit 1
 fi
 
+# The backend's key goes to another user (below), which needs root: ask for sudo now, so a
+# refusal stops the script before any file is replaced.
+as_root=()
+if [ "$(id -u)" -ne 0 ]; then
+  as_root=(sudo)
+  sudo -v
+fi
+
 umask 077
 # In memory where possible, so the CA's key never touches the SD card.
 if [ -d /dev/shm ] && [ -w /dev/shm ]; then
@@ -79,22 +87,23 @@ issue_server_certificate() {
 # for database tools on the Pi (the port is published on 127.0.0.1 by default).
 issue_server_certificate postgres 'DNS:postgres,DNS:localhost,IP:127.0.0.1'
 # "secure-call-backend" is the name the reverse proxy checks (proxy_ssl_name); it need not
-# resolve. localhost and 127.0.0.1 are for a proxy on this Pi and for checks on the Pi.
-issue_server_certificate backend 'DNS:secure-call-backend,DNS:localhost,IP:127.0.0.1'
+# resolve, and checks on the Pi use curl --resolve. Only that name, so this certificate can
+# never pass for PostgreSQL's (localhost, 127.0.0.1) or the other way round.
+issue_server_certificate backend 'DNS:secure-call-backend'
 
-# Replace the old files only once everything above has succeeded.
+# Replace the old files only once everything above has succeeded. The key that needs sudo goes
+# first: the backend container has no capabilities, so it can read only a key its own user
+# owns (with userns-remap or rootless Docker, uid 10001 maps elsewhere and the backend refuses
+# to start).
+${as_root[@]+"${as_root[@]}"} install -m 400 -o "$BACKEND_IMAGE_UID" -g "$BACKEND_IMAGE_UID" \
+  "$work_dir/backend.key" "$TLS_DIR/backend.key"
+install -m 600 "$work_dir/postgres.key" "$TLS_DIR/postgres.key"
 for certificate_name in local-ca postgres backend; do
   install -m 644 "$work_dir/$certificate_name.crt" "$TLS_DIR/$certificate_name.crt"
 done
-install -m 600 "$work_dir/postgres.key" "$TLS_DIR/postgres.key"
-# The backend container has no capabilities, so it can read only a key its own user owns.
-as_root=()
-if [ "$(id -u)" -ne 0 ]; then as_root=(sudo); fi
-${as_root[@]+"${as_root[@]}"} install -m 400 -o "$BACKEND_IMAGE_UID" -g "$BACKEND_IMAGE_UID" \
-  "$work_dir/backend.key" "$TLS_DIR/backend.key"
 
 echo "Made $TLS_DIR/{local-ca.crt,postgres.crt,postgres.key,backend.crt,backend.key}."
-echo "Copy tls/local-ca.crt to the reverse proxy as /data/secure-call/local-ca.crt (README.md,"
-echo "setup step 4), or it will refuse the backend's new certificate."
+echo "Copy tls/local-ca.crt to the reverse proxy as /data/secure-call/local-ca.crt and reload it"
+echo "(README.md, \"Certificate renewal\"), or it will refuse the backend's new certificate."
 echo "They expire on $(openssl x509 -in "$TLS_DIR/local-ca.crt" -noout -enddate | cut -d= -f2):"
 echo "run this script again before then. The CA's private key has been deleted."

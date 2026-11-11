@@ -69,3 +69,16 @@ def test_negative_a_service_without_the_hardening_is_caught() -> None:
 
 def test_certificates_and_keys_are_never_committed() -> None:
     assert "deploy/raspberry-pi/tls/" in (ROOT / ".gitignore").read_text().splitlines()
+
+
+def test_readme_shows_exactly_the_proxy_lines_ci_tests() -> None:
+    advanced_lines = [
+        line
+        for line in (DEPLOY / "npm-advanced.conf").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    readme = (ROOT / "README.md").read_text()
+
+    assert "proxy_ssl_verify on;" in advanced_lines
+    for line in advanced_lines:
+        assert f"   {line}\n" in readme, line

@@ -34,8 +34,10 @@ def dockerfile_start_script() -> str:
     return command[2]
 
 
-def run_start_script(tmp_path: Path, env: dict[str, str]) -> list[str]:
-    """Runs the CMD with stand-ins for daphne and python; returns daphne's arguments."""
+def run_start_script_unchecked(
+    tmp_path: Path, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    """Runs the CMD with stand-ins for daphne and python, which print their arguments."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     for program in ("daphne", "python"):
@@ -48,8 +50,15 @@ def run_start_script(tmp_path: Path, env: dict[str, str]) -> list[str]:
         env={**clean_env, "PATH": f"{bin_dir}:{os.environ['PATH']}", **env},
         capture_output=True,
         text=True,
-        check=True,
+        check=False,
     )
+    return result
+
+
+def run_start_script(tmp_path: Path, env: dict[str, str]) -> list[str]:
+    """Runs the CMD (which must succeed) and returns daphne's arguments."""
+    result = run_start_script_unchecked(tmp_path, env)
+    assert result.returncode == 0, result.stderr
     return [line.removeprefix("daphne: ") for line in result.stdout.splitlines()]
 
 
@@ -72,14 +81,22 @@ def test_start_script_serves_tls_only_when_a_certificate_is_configured(tmp_path:
     assert plain_arguments[-5:] == ["-b", all_interfaces, "-p", "8000", "config.asgi:application"]
 
 
-def test_negative_a_certificate_without_a_key_never_falls_back_to_plain_http(
-    tmp_path: Path,
-) -> None:
-    # Twisted then refuses to start (an empty privateKey); the CMD must not quietly serve HTTP.
-    arguments = run_start_script(tmp_path, {"BACKEND_TLS_CERTIFICATE": "/run/x.crt"})
+def test_negative_a_certificate_without_a_key_stops_the_start(tmp_path: Path) -> None:
+    result = run_start_script_unchecked(tmp_path, {"BACKEND_TLS_CERTIFICATE": "/run/x.crt"})
 
-    assert "-e" in arguments
-    assert "-b" not in arguments
+    assert result.returncode != 0
+    assert "BACKEND_TLS_KEY must be set" in result.stderr
+    assert result.stdout == ""  # neither the migration nor daphne ran
+
+
+def test_negative_paths_twisted_would_misread_stop_the_start(tmp_path: Path) -> None:
+    for bad_path in ["/run/a:b.key", "/run/a=b.key", "/run/a\\b.key"]:
+        env = {"BACKEND_TLS_CERTIFICATE": "/run/x.crt", "BACKEND_TLS_KEY": bad_path}
+        result = run_start_script_unchecked(tmp_path, env)
+
+        assert result.returncode != 0, bad_path
+        assert "must not contain" in result.stderr
+        assert result.stdout == ""
 
 
 def make_certificates(directory: Path, ca_name: str) -> tuple[Path, Path, Path]:
