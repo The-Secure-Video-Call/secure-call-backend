@@ -20,8 +20,9 @@ POSTGRES_REQUIRED = (
     "- ssl=on",
     "- ssl_min_protocol_version=TLSv1.3",
     "- hba_file=/etc/postgresql/pg_hba.conf",
-    "./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro",
-    "./postgres/initdb:/docker-entrypoint-initdb.d:ro",
+    "source: ./postgres/pg_hba.conf\n        target: /etc/postgresql/pg_hba.conf",
+    "source: ./postgres/initdb\n        target: /docker-entrypoint-initdb.d",
+    "pg_isready -h 127.0.0.1",
 )
 
 

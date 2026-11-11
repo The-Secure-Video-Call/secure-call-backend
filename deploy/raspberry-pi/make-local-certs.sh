@@ -16,8 +16,18 @@ readonly VALID_DAYS=825
 readonly DEPLOY_DIR="$(cd "$(dirname "$0")" && pwd)"
 readonly TLS_DIR="$DEPLOY_DIR/tls"
 
+if ! openssl version | grep -q '^OpenSSL 3\.'; then
+  echo "make-local-certs.sh needs OpenSSL 3 (found: $(openssl version))." >&2
+  exit 1
+fi
+
 umask 077
-work_dir="$(mktemp -d)"
+# In memory where possible, so the CA's key never touches the SD card.
+if [ -d /dev/shm ] && [ -w /dev/shm ]; then
+  work_dir="$(mktemp -d -p /dev/shm)"
+else
+  work_dir="$(mktemp -d)"
+fi
 trap 'rm -rf "$work_dir"' EXIT
 
 mkdir -p "$TLS_DIR"
@@ -25,11 +35,18 @@ mkdir -p "$TLS_DIR"
 chmod 755 "$TLS_DIR"
 
 new_ec_key() {
-  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$1"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 \
+    -pkeyopt ec_param_enc:named_curve -out "$1"
 }
 
+# A minimal OpenSSL config, so the system's openssl.cnf cannot add extensions of its own:
+# every extension below is set explicitly.
+printf '%s\n' '[req]' 'distinguished_name = req_dn' 'prompt = no' '[req_dn]' \
+  >"$work_dir/openssl.cnf"
+
 new_ec_key "$work_dir/ca.key"
-openssl req -x509 -new -key "$work_dir/ca.key" -sha256 -days "$VALID_DAYS" \
+openssl req -config "$work_dir/openssl.cnf" -x509 -new -key "$work_dir/ca.key" -sha256 \
+  -days "$VALID_DAYS" \
   -subj "/CN=secure-call local CA" \
   -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
   -addext 'keyUsage=critical,keyCertSign,cRLSign' \
@@ -39,7 +56,8 @@ openssl req -x509 -new -key "$work_dir/ca.key" -sha256 -days "$VALID_DAYS" \
 issue_server_certificate() {
   local name="$1" subject_alt_names="$2"
   new_ec_key "$work_dir/$name.key"
-  openssl req -new -key "$work_dir/$name.key" -subj "/CN=$name" -out "$work_dir/$name.csr"
+  openssl req -config "$work_dir/openssl.cnf" -new -key "$work_dir/$name.key" \
+    -subj "/CN=$name" -out "$work_dir/$name.csr"
   printf '%s\n' \
     'basicConstraints=critical,CA:FALSE' \
     'keyUsage=critical,digitalSignature' \

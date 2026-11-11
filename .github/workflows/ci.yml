@@ -49,6 +49,9 @@ jobs:
           printf '%s\n' \
             POSTGRES_PASSWORD=ci-only-throwaway \
             POSTGRES_APP_PASSWORD=ci-only-throwaway-app \
+            DJANGO_SECRET_KEY=ci-only-throwaway-secret-key-not-used-anywhere-else-0123456789 \
+            DJANGO_ALLOWED_HOSTS=signal.example.invalid \
+            SIGNALING_ALLOWED_ORIGINS=https://call.example.invalid \
             TURN_SHARED_SECRET=ci-only-throwaway \
             TURN_PUBLIC_IP=203.0.113.7 \
             TURN_RELAY_IP=127.0.0.1 > .env
@@ -68,6 +71,18 @@ jobs:
           POSTGRES_APP_USER: securecall_app
           POSTGRES_APP_PASSWORD: ci-only-throwaway-app
         run: uv run pytest -rs
+
+      # This PR's own image, run through the Pi's compose.yaml (its settings, mounts and
+      # hardening: read-only, no capabilities), must reach that database as the backend's own
+      # role over TLS 1.3. The start-up migration ignores a failure, so check it here.
+      - name: The backend image reaches the database as on the Pi
+        working-directory: deploy/raspberry-pi
+        run: |
+          # Built under the name compose.yaml uses, so compose runs it instead of pulling.
+          docker build -q -t ghcr.io/the-secure-video-call/secure-call-backend:main ../..
+          backend=(docker compose run --rm --no-deps --pull never backend)
+          "${backend[@]}" python manage.py migrate --noinput
+          "${backend[@]}" python -c "import django; django.setup(); from django.db import connection; c = connection.cursor(); c.execute('SELECT current_user, ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()'); row = c.fetchone(); assert row == ('securecall_app', True, 'TLSv1.3'), row; print('The backend image reaches PostgreSQL as', row[0], 'over', row[2])"
 
       - name: Django production checks
         env:

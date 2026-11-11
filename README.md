@@ -264,7 +264,9 @@ sslrootcert=tls/local-ca.crt"` from `deploy/raspberry-pi`.
 `docker compose up -d --force-recreate postgres backend`.
 
 **Moving an existing Pi to the TLS database (once):** the role is created only when the database
-is first created, and the database holds nothing yet, so the volume is recreated. Do this
+is first created, and the database holds nothing yet, so the volume is recreated. Comment out
+the `update.sh` line in `crontab -e` for the duration, and approve **no** "Publish backend
+image" run (not even a Dependabot one) until the Pi has been moved. Do this
 **before** approving the "Publish backend image" run for this change: `update.sh` pulls new
 images but not new files, and the new image refuses to start without the certificate, while
 the old image runs fine with the new files (its start-up migration fails harmlessly, and
@@ -279,7 +281,16 @@ nano .env
 docker compose down --volumes   # pgdata is the only volume
 docker compose pull backend && docker compose up -d
 docker compose ps    # backend and postgres "healthy" or "running"
+# 3. Once the new image runs (after approving the publish): the role exists, and the backend
+#    itself reaches the database (its start-up migration does not stop on a failure):
+docker compose exec postgres psql -U securecall -d securecall -Atc \
+  "select rolname from pg_roles where rolname = 'securecall_app'"   # securecall_app
+docker compose exec backend python manage.py migrate --check && echo database reachable
 ```
+
+Then put the cron line back. If the first start fails (see `docker compose logs postgres`),
+the half-created database must be removed before trying again: `docker compose down
+--volumes`.
 
 **PostgreSQL updates:** `compose.yaml` pins `postgres:18` by digest. After merging a Dependabot
 PR that bumps it, run on the Pi (`update.sh` only updates the backend):

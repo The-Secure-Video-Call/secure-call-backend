@@ -2,6 +2,7 @@
 #
 # On the Pi, in this folder:
 #   cp .env.example .env      # then fill in the values marked "set"
+#   ./make-local-certs.sh     # certificates from our local CA, into ./tls/
 #   docker compose up -d postgres
 #   ./update.sh               # after its one-time setup (README.md); starts a verified backend
 #   docker compose up -d
@@ -114,8 +115,18 @@ services:
       - '${POSTGRES_PUBLISH_ADDR:-127.0.0.1}:${POSTGRES_PUBLISH_PORT:-5434}:5432'
     volumes:
       - pgdata:/var/lib/postgresql
-      - ./postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
-      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+      - type: bind
+        source: ./postgres/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./postgres/initdb
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+        bind:
+          create_host_path: false
       - type: bind
         source: ./tls/postgres.crt
         target: /run/tls-source/postgres.crt
@@ -129,7 +140,9 @@ services:
         bind:
           create_host_path: false
     healthcheck:
-      test: ['CMD-SHELL', 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      # Over TCP: the image's temporary first-start server listens on the Unix socket only,
+      # so this stays unhealthy until the real server (TLS, the backend's role) is up.
+      test: ['CMD-SHELL', 'pg_isready -h 127.0.0.1 -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
       interval: 10s
       timeout: 5s
       retries: 5

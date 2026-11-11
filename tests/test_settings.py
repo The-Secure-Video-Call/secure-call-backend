@@ -109,7 +109,26 @@ def test_database_tls_checks_certificate_and_host_name_by_default(tmp_path: Path
 
 
 def test_database_without_tls_only_when_asked_for_explicitly() -> None:
-    result = load_settings({**DB_ENV, "POSTGRES_SSLMODE": "disable"}, DB_TLS_PRINT)
+    for local_host in ["localhost", "127.0.0.1", "::1", "/var/run/postgresql"]:
+        env = {**DB_ENV, "POSTGRES_HOST": local_host, "POSTGRES_SSLMODE": "disable"}
+        result = load_settings(env, DB_TLS_PRINT)
+
+        assert result.returncode == 0, (local_host, result.stderr)
+        assert result.stdout.strip() == "disable -"
+
+
+def test_negative_no_database_tls_refused_for_a_database_on_another_machine() -> None:
+    for remote_host in ["postgres", "db.example.invalid", "192.0.2.10", "localhost.example"]:
+        env = {**DB_ENV, "POSTGRES_HOST": remote_host, "POSTGRES_SSLMODE": "disable"}
+        result = load_settings(env, DB_TLS_PRINT)
+
+        assert result.returncode != 0, remote_host
+        assert "POSTGRES_SSLMODE=disable is only allowed" in result.stderr
+
+
+def test_no_database_tls_for_another_machine_only_with_debug() -> None:
+    env = {**DB_ENV, "POSTGRES_SSLMODE": "disable", "DJANGO_DEBUG": "1"}
+    result = load_settings(env, DB_TLS_PRINT)
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "disable -"

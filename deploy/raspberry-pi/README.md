@@ -2,8 +2,9 @@
 
 `compose.yaml` runs the backend, PostgreSQL and coturn. First do the one-time setup under
 "Updating the backend" below (gh and its token), then copy `.env.example` to `.env`, fill in the
-values marked "set", and run `docker compose up -d postgres`, `./update.sh` and
-`docker compose up -d`, in that order. compose never pulls the backend image itself
+values marked "set", run `./make-local-certs.sh` (README.md, "One-time setup on the Pi"),
+and run `docker compose up -d postgres`, `./update.sh` and `docker compose up -d`, in that
+order. compose never pulls the backend image itself
 (`pull_policy: never`): a bare `docker compose up -d` before `update.sh` stops with "No such
 image" instead of running an unverified one.
 
@@ -144,7 +145,7 @@ Manual steps (owner):
    And set `TURN_RELAY_IP` to the Pi's LAN IPv4 (its default-route address, since Docker's NAT
    sends outgoing relay traffic from there): the ports are published on that address only.
    Compose refuses to start without either value; as it checks the whole file, a `.env` missing
-   any of the three `TURN_*` values also makes `update.sh` fail. Then `docker compose up -d --build coturn`.
+   any of the three `TURN_*` values (or `POSTGRES_APP_PASSWORD`) also makes `update.sh` fail. Then `docker compose up -d --build coturn`.
    Note the secret is visible to local users of the Pi via `docker inspect`.
    On the Pi, use zram or no swap: swapped memory (the secret, and the in-memory log mounts
    below) could otherwise reach the SD card. `ulimits: core: 0` already prevents core dumps.

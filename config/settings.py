@@ -75,10 +75,12 @@ TEMPLATES: list[dict[str, object]] = []
 # backend's own machine or private network: never expose port 5432 to the internet.
 POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "")
 # TLS with the server's certificate and host name checked against a pinned root certificate,
-# or, only when asked for explicitly, no TLS at all (a local development database). The modes
+# or, only when asked for explicitly and only for a database on this machine (or with DEBUG
+# on), no TLS at all: a local development database. The modes
 # in between ("prefer", "allow", "require", "verify-ca") either fall back to plaintext silently
 # or accept any certificate, so they are refused.
 POSTGRES_SSLMODES_ALLOWED = ("verify-full", "disable")
+POSTGRES_LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 DATABASES: dict[str, dict[str, object]] = {}
 if POSTGRES_HOST:
     POSTGRES_PASSWORD = os.environ.get("POSTGRES_PASSWORD", "")
@@ -89,6 +91,16 @@ if POSTGRES_HOST:
         raise ImproperlyConfigured(
             "POSTGRES_SSLMODE must be verify-full (the default) or, for a local development "
             "database only, disable."
+        )
+    if (
+        POSTGRES_SSLMODE == "disable"
+        and not DEBUG
+        and POSTGRES_HOST not in POSTGRES_LOCAL_HOSTS
+        and not POSTGRES_HOST.startswith("/")  # a Unix socket directory
+    ):
+        raise ImproperlyConfigured(
+            "POSTGRES_SSLMODE=disable is only allowed for a database on this machine "
+            "(localhost, 127.0.0.1, ::1 or a socket directory) or with DJANGO_DEBUG on."
         )
     POSTGRES_OPTIONS: dict[str, object] = {"sslmode": POSTGRES_SSLMODE, "connect_timeout": 5}
     if POSTGRES_SSLMODE == "verify-full":
