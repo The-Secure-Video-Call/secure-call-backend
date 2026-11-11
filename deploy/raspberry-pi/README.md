@@ -91,7 +91,7 @@ relay to private, loopback, link-local and multicast addresses, so a credential 
 your home network. Do not remove those lines.
 
 Published ports (only on the Pi's LAN address, `TURN_RELAY_IP`, never on every interface):
-`3478` UDP and TCP, and `49160-49200` UDP. The router forwards are unchanged.
+`3478` UDP and TCP, `5349` TCP (TURN over TLS), and `49160-49200` UDP.
 
 **Why not host networking:** coturn exempts its own addresses from the deny list (two clients on
 one relay must reach each other's relay addresses). On the host network its own address is the
@@ -134,27 +134,57 @@ after `time-sync.target` (`sudo systemctl edit docker`, add `[Unit]` `After=time
 Manual steps (owner):
 
 1. **DNS at ServerByt:** add an A record `turn.securevideocall.com` pointing to the home static IP.
-2. **Router port forwards to the Pi:** `3478` UDP and TCP, and `49160-49200` UDP.
-   Forward nothing else for TURN (no 5349, no 443).
-3. **Secret:** on the Pi run `openssl rand -base64 32` and put the result in `.env` as
-   `TURN_SHARED_SECRET`. The same value goes to the backend
-   later (#26). Never commit it.
+2. **Router port forwards to the Pi:** `3478` UDP and TCP, `5349` TCP, and `49160-49200` UDP.
+   Forward nothing else for TURN (no 5349 UDP: DTLS is off; no 443, which is the proxy's).
+3. **Secret:** in `deploy/raspberry-pi`, run `./make-turn-secret.sh` (it asks for sudo). It
+   makes a random secret and writes it, never printing it, to the two files compose mounts:
+   `secrets/turn-static-auth-secret.conf` for coturn (owner 65534, mode 400) and
+   `secrets/turn-shared-secret` for the backend (owner 10001, mode 400). coturn joins it to
+   its config in memory at start, so it is on no command line and in no environment: neither
+   `ps` nor `docker inspect` shows it (CI checks that). It also makes `.env` mode 600.
+   **Rotating:** run it again, then `docker compose up -d --force-recreate coturn backend` at a
+   quiet time (credentials issued with the old secret stop working). Never commit `secrets/`.
    Also set `TURN_PUBLIC_IP` (the home's public IPv4, which must be static: if it changes, update
    `.env` and restart coturn). Compose passes it as `--external-ip=<public IP>/172.30.200.2` and also as
    `--denied-peer-ip=<public IP>` (defence in depth; relay-to-relay still works with it).
    And set `TURN_RELAY_IP` to the Pi's LAN IPv4 (its default-route address, since Docker's NAT
    sends outgoing relay traffic from there): the ports are published on that address only.
    Compose refuses to start without either value; as it checks the whole file, a `.env` missing
-   any of the three `TURN_*` values (or `POSTGRES_APP_PASSWORD`) also makes `update.sh` fail. Then `docker compose up -d --build coturn`.
-   Note the secret is visible to local users of the Pi via `docker inspect`.
+   either `TURN_*` value (or `POSTGRES_APP_PASSWORD`) also makes `update.sh` fail. Then do step
+   3b and `docker compose up -d --build coturn`.
    On the Pi, use zram or no swap: swapped memory (the secret, and the in-memory log mounts
    below) could otherwise reach the SD card. `ulimits: core: 0` already prevents core dumps.
+3b. **Certificate for TURN over TLS (`turns:`, port 5349):** browsers check it, so it must be
+   publicly trusted. Nginx Proxy Manager gets and renews it (port 80 reaches the proxy):
+   - In Nginx Proxy Manager: **SSL Certificates → Add SSL Certificate → Let's Encrypt**,
+     domain `turn.securevideocall.com` (the A record of step 1).
+   - On the proxy machine, find its folder (`npm-<N>`) and copy the two files out, the key
+     readable by you only:
+     ```sh
+     docker exec nginx-proxy-manager-app-1 sh -c \
+       'grep -l turn.securevideocall.com /etc/letsencrypt/renewal/*.conf'   # npm-<N>.conf
+     umask 077
+     docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/fullchain.pem > fullchain.pem
+     docker exec nginx-proxy-manager-app-1 cat /etc/letsencrypt/live/npm-<N>/privkey.pem > privkey.pem
+     ```
+   - Copy both to this Pi over SSH (`scp`), then in `deploy/raspberry-pi`:
+     `./coturn/install-turn-certificate.sh fullchain.pem privkey.pem`. It refuses a certificate
+     that does not name `turn.securevideocall.com`, does not chain to a trusted CA, expires
+     within 7 days or does not match the key; it installs into `coturn/tls/` (key owner 65534,
+     mode 400) and restarts coturn if the certificate changed. Then delete both copies on both
+     machines (`rm fullchain.pem privkey.pem`).
+   - **Renewal:** Nginx Proxy Manager renews the certificate by itself about 30 days before it
+     expires; repeat the copy and the install script after each renewal (about every 60 days,
+     sooner if Let's Encrypt shortens its certificates). The restart drops the relays of calls
+     in progress, so do it at a quiet time.
+   - **Check:** `openssl s_client -brief -connect turn.securevideocall.com:5349 -servername
+     turn.securevideocall.com </dev/null` shows `Verification: OK` and `TLSv1.3`.
 4. **Backend `TURN_*`:** keep `TURN_SHARED_SECRET`/`TURN_URLS` unset for the backend until
    The-Secure-Video-Call/secure-call#47 is live. `TURN_URLS` is commented out in `.env.example`:
    uncomment it only after the rate limits (#35) are live and DNS and the router forwards are done.
 5. **Check it works:**
-   - **On the Pi**, create a short-lived test credential. Read the secret from `.env` there
-     (`SECRET=$(grep '^TURN_SHARED_SECRET=' .env | cut -d= -f2-)`), then:
+   - **On the Pi**, create a short-lived test credential. Read the secret there
+     (`SECRET=$(sudo cat secrets/turn-shared-secret)`), then:
      `user=$(( $(date +%s) + 600 )); pass=$(printf %s "$user" | openssl dgst -sha1 -hmac "$SECRET" -binary | openssl base64); echo "$user $pass"`.
      Copy only that username and password to the other machine, never the shared secret. They
      stop working after 10 minutes.
@@ -162,7 +192,8 @@ Manual steps (owner):
      `turnutils_uclient -u "$user" -w "$pass" -e 8.8.8.8 -n 1 -m 1 turn.securevideocall.com`.
    - Or open https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/, add
      `turn:turn.securevideocall.com:3478` with that username and password, and gather: a
-     `relay` candidate should appear.
+     `relay` candidate should appear. Then the same with
+     `turns:turn.securevideocall.com:5349?transport=tcp` (TURN over TLS).
 6. **Image pin:** `coturn/Dockerfile` pins the base to `4.18.0` plus its `@sha256:` digest.
    Dependabot proposes upgrades (it watches `deploy/raspberry-pi/coturn`); the CI `coturn` job must
    pass before one is merged. After merging, rebuild on the Pi when no call is running:

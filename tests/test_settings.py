@@ -199,6 +199,55 @@ def test_turn_settings_come_from_environment() -> None:
     assert result.stdout.strip() == "True ['turn:a.example:3478', 'turns:a.example:5349'] 7200"
 
 
+TURN_SECRET_PRINT = "import config.settings as s; print(len(s.TURN_SHARED_SECRET))"  # noqa: S105
+
+
+def test_turn_secret_comes_from_a_file_as_on_the_pi(tmp_path: Path) -> None:
+    secret_file = tmp_path / "turn-shared-secret"
+    secret_file.write_text("file-secret-value\n")  # make-turn-secret.sh ends it with a newline
+    # compose.yaml sets TURN_SHARED_SECRET to empty, so an old value in .env cannot interfere.
+    env = {
+        "DJANGO_SECRET_KEY": "k" * 60,
+        "TURN_SHARED_SECRET_FILE": str(secret_file),
+        "TURN_SHARED_SECRET": "",
+    }
+    result = load_settings(env, TURN_SECRET_PRINT)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(len("file-secret-value"))
+
+
+def test_negative_bad_turn_secret_files_stop_startup_without_echoing_the_secret(
+    tmp_path: Path,
+) -> None:
+    secret = "very-secret-value"  # noqa: S105 - test value
+    two_lines = tmp_path / "two-lines"
+    two_lines.write_text(f"{secret}\nsecond-line\n")
+    empty = tmp_path / "empty"
+    empty.write_text("\n")
+    not_text = tmp_path / "not-text"
+    not_text.write_bytes(b"\xff\xfe" + secret.encode())
+    one_line = tmp_path / "one-line"
+    one_line.write_text(secret)
+    cases = [
+        ({"TURN_SHARED_SECRET_FILE": str(tmp_path / "missing")}, "cannot be read"),
+        ({"TURN_SHARED_SECRET_FILE": str(tmp_path)}, "cannot be read"),
+        ({"TURN_SHARED_SECRET_FILE": str(not_text)}, "cannot be read"),
+        ({"TURN_SHARED_SECRET_FILE": str(empty)}, "on one line"),
+        ({"TURN_SHARED_SECRET_FILE": str(two_lines)}, "on one line"),
+        (
+            {"TURN_SHARED_SECRET_FILE": str(one_line), "TURN_SHARED_SECRET": "other"},
+            "not both",
+        ),
+    ]
+    for bad_env, message in cases:
+        result = load_settings({"DJANGO_SECRET_KEY": "k" * 60, **bad_env}, TURN_SECRET_PRINT)
+
+        assert result.returncode != 0, bad_env
+        assert message in result.stderr, bad_env
+        assert secret not in result.stdout + result.stderr
+
+
 def test_bad_turn_settings_stop_startup_without_echoing_the_secret() -> None:
     secret = "very-secret-value"  # noqa: S105 - test value
     bad_envs = [

@@ -82,3 +82,65 @@ def test_readme_shows_exactly_the_proxy_lines_ci_tests() -> None:
     assert "proxy_ssl_verify on;" in advanced_lines
     for line in advanced_lines:
         assert f"   {line}\n" in readme, line
+
+
+COTURN_REQUIRED = (
+    "- '${TURN_RELAY_IP:?Set TURN_RELAY_IP in .env}:5349:5349/tcp'",
+    "- /run/coturn:size=64k,mode=1777,noexec,nosuid,nodev",
+    "source: ./secrets/turn-static-auth-secret.conf\n"
+    "        target: /run/secrets/turn-static-auth-secret.conf",
+    "source: ./coturn/tls\n        target: /etc/coturn/tls",
+    "user: '65534:65534'",
+    "driver: none",
+)
+
+
+def compose_coturn_start_script(coturn: str) -> str:
+    """The folded `sh -c` script of the coturn entrypoint, as the shell receives it."""
+    folded = re.search(r"      - >-\n((?:        .*\n)+)", coturn)
+    assert folded is not None, "coturn's entrypoint script (a folded >- block) is missing"
+    return " ".join(line.strip() for line in folded.group(1).splitlines()).replace("$$", "$")
+
+
+def test_coturn_reads_the_secret_from_a_file_and_serves_tls() -> None:
+    coturn = service_block((DEPLOY / "compose.yaml").read_text(), "coturn")
+
+    assert missing(coturn, COTURN_REQUIRED) == []
+    assert "static-auth-secret=" not in coturn.replace('"static-auth-secret=..."', "")
+    assert "TURN_SHARED_SECRET" not in coturn
+    assert "env_file:" not in coturn
+
+
+def test_coturn_starts_exactly_as_the_ci_test_starts_it() -> None:
+    coturn = service_block((DEPLOY / "compose.yaml").read_text(), "coturn")
+    test_script = (DEPLOY / "coturn/test-coturn.sh").read_text()
+    test_start = re.search(r"^coturn_start_script='(.*)'$", test_script, re.M)
+
+    assert test_start is not None
+    assert compose_coturn_start_script(coturn) == test_start.group(1)
+    assert "umask 077" in test_start.group(1)
+    assert "exec turnserver -c /run/coturn/turnserver.conf" in test_start.group(1)
+
+
+def test_backend_reads_the_turn_secret_from_a_file() -> None:
+    backend = service_block((DEPLOY / "compose.yaml").read_text(), "backend")
+
+    assert "TURN_SHARED_SECRET: ''" in backend
+    assert "TURN_SHARED_SECRET_FILE: /run/secure-call/turn-shared-secret" in backend
+    assert "source: ./secrets/turn-shared-secret" in backend
+
+
+def test_negative_a_changed_start_script_is_caught() -> None:
+    weakened = (
+        "  coturn:\n    entrypoint:\n      - sh\n      - -c\n      - >-\n"
+        '        exec turnserver --static-auth-secret=x "$$@"\n      - coturn-start\n'
+    )
+    assert compose_coturn_start_script(weakened) == 'exec turnserver --static-auth-secret=x "$@"'
+    assert "umask 077" not in compose_coturn_start_script(weakened)
+
+
+def test_turn_secrets_and_certificates_are_never_committed() -> None:
+    ignored = (ROOT / ".gitignore").read_text().splitlines()
+
+    assert "deploy/raspberry-pi/secrets/" in ignored
+    assert "deploy/raspberry-pi/coturn/tls/" in ignored
