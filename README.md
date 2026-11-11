@@ -291,8 +291,12 @@ Manager already running.
      --work-dir /tmp/letsencrypt-lib --logs-dir /data/logs --cert-name "$cert" --preferred-challenges http
    ```
    (If you set `PUID`/`PGID` for the proxy's container, add `-u <PUID>:<PGID>` after `exec`.)
-   The CDN in front of the static site makes pages of its own too; whether they can carry these
-   headers is a question for the hosting company (#61).
+   The CDN in front of the static site (StackCDN) makes two responses of its own, its `http://`
+   to `https://` redirect and its 405 for TRACE, and they carry none of the site's headers. Its
+   "Security Headers" panel cannot change that: tested on 2026-11-11, a header set there was
+   added a second time to every response from the site and did not reach those two (#61). So
+   the panel stays empty: the site's headers come only from its `.htaccess`, and the two CDN
+   responses have no body worth protecting.
 
    `access_log off;` means the proxy keeps no record of who connected when (PLAN.md §3.5: no request logging of IP
    addresses; this app's own logs never contain them). The proxy still writes this host's error
