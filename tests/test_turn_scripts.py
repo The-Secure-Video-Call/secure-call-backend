@@ -1,6 +1,6 @@
-"""The Pi's TURN scripts: make-turn-secret.sh (#64) and coturn/install-turn-certificate.sh (#58).
-They run for real on copies in a temporary folder, with stand-ins for sudo (records the call, then
-installs without changing the owner) and docker (records the call)."""
+"""The Pi's TURN scripts: make-turn-secret.sh (#64) and coturn/install-turn-certificate.sh (#58,
+#90). They run for real on copies in a temporary folder, with stand-ins for sudo (records the
+call, then installs without changing the owner) and docker (records the call)."""
 
 import os
 import re
@@ -214,6 +214,7 @@ def run_install_script(
 ) -> tuple[subprocess.CompletedProcess[str], Path, str]:
     coturn_copy = tmp_path / "pi/coturn"
     coturn_copy.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "pi/compose.yaml").write_text("# stand-in\n")
     shutil.copy2(DEPLOY / "coturn/install-turn-certificate.sh", coturn_copy)
     env, log = tool_path(tmp_path)
     if ca_certificate is not None:
@@ -340,3 +341,66 @@ def test_the_test_ca_override_is_announced(tmp_path: Path, test_ca: tuple[Path, 
     result, _, _ = run_install_script(tmp_path, fullchain, key, test_ca[1])
 
     assert "WARNING: also trusting" in result.stderr
+
+
+def test_coturn_dir_option_installs_into_the_resolved_stack_folder(
+    tmp_path: Path, test_ca: tuple[Path, Path]
+) -> None:
+    """How sync-turn-certificate.sh runs it: a copy elsewhere, the folder through a link (#90)."""
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    stack = tmp_path / "checkout/deploy/raspberry-pi"
+    (stack / "coturn").mkdir(parents=True)
+    (stack / "compose.yaml").write_text("# stand-in\n")
+    link = tmp_path / "etc/coturn"
+    link.parent.mkdir()
+    link.symlink_to(stack / "coturn")
+    script_copy = tmp_path / "lib/install-turn-certificate.sh"
+    script_copy.parent.mkdir()
+    shutil.copy2(DEPLOY / "coturn/install-turn-certificate.sh", script_copy)
+    env, log = tool_path(tmp_path)
+    env["TURN_CERTIFICATE_TEST_CA_FILE"] = str(test_ca[1])
+    env["FAKE_COTURN_RUNNING"] = "1"
+    result = subprocess.run(  # noqa: S603 - fixed script, no user input
+        ["/bin/bash", str(script_copy), "--coturn-dir", str(link), str(fullchain), str(key)],
+        env=env, capture_output=True, text=True, check=False,
+    )  # fmt: skip
+
+    assert result.returncode == 0, result.stderr
+    tls = stack.resolve() / "coturn/tls"
+    assert (tls / "privkey.pem").read_bytes() == key.read_bytes()
+    assert (tls / "fullchain.pem").read_text() == fullchain.read_text()
+    assert not (tmp_path / "lib/tls").exists()
+    assert f"docker compose -f {stack.resolve()}/coturn/../compose.yaml kill" in log.read_text()
+
+
+def test_negative_a_folder_that_is_not_the_stacks_or_a_linked_tls_installs_nothing(
+    tmp_path: Path, test_ca: tuple[Path, Path]
+) -> None:
+    key, fullchain = make_certificate(tmp_path, "turn", TURN_HOST_NAME, 30, test_ca)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    no_stack, _, _ = run_install_script(tmp_path / "no-stack", fullchain, key, test_ca[1])
+    script = tmp_path / "no-stack/pi/coturn/install-turn-certificate.sh"
+    env, _ = tool_path(tmp_path / "no-stack")
+    for arguments, message in (
+        (["--coturn-dir", str(elsewhere)], "is not the coturn folder next to compose.yaml"),
+        (["--coturn-dir", str(tmp_path / "missing")], "is not the coturn folder"),
+        (["--coturn-dir"], "Usage:"),
+    ):
+        result = subprocess.run(  # noqa: S603 - fixed script, no user input
+            ["/bin/bash", str(script), *arguments, str(fullchain), str(key)],
+            env=env, capture_output=True, text=True, check=False,
+        )  # fmt: skip
+        assert result.returncode == 2, message
+        assert message in result.stderr
+    assert no_stack.returncode == 0  # the same copy works where it belongs
+    assert not (elsewhere / "tls").exists()
+
+    linked = tmp_path / "linked"
+    (linked / "pi/coturn").mkdir(parents=True)
+    (linked / "pi/coturn/tls").symlink_to(elsewhere)
+    result, _, calls = run_install_script(linked, fullchain, key, test_ca[1])
+    assert result.returncode == 1
+    assert "is a symbolic link" in result.stderr
+    assert list(elsewhere.iterdir()) == []
+    assert "install" not in calls

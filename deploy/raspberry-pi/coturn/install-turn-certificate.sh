@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Installs the certificate coturn presents for TURN over TLS (turns:, port 5349, #58):
 #
-#   ./coturn/install-turn-certificate.sh FULLCHAIN.pem PRIVKEY.pem
+#   ./coturn/install-turn-certificate.sh [--coturn-dir DIR] FULLCHAIN.pem PRIVKEY.pem
+#
+# DIR is the stack's coturn folder (next to compose.yaml), by default the one this script is in.
+# sync-turn-certificate.sh runs a root-owned copy of this script with it (#90).
 #
 # for example the files of the Let's Encrypt certificate for turn.securevideocall.com that Nginx
 # Proxy Manager keeps renewed (README.md, TURN step 3b). Browsers check this certificate, so it
@@ -21,9 +24,6 @@ set -euo pipefail
 readonly TURN_HOST_NAME=turn.securevideocall.com
 readonly COTURN_UID=65534          # compose.yaml: user: '65534:65534'
 readonly MIN_VALID_SECONDS=$((7 * 24 * 60 * 60))
-readonly COTURN_DIR="$(cd "$(dirname "$0")" && pwd)"
-readonly TLS_DIR="$COTURN_DIR/tls"
-readonly COMPOSE_FILE="$COTURN_DIR/../compose.yaml"
 # Only for tests: one more CA to trust, on top of the system's CA store.
 readonly TEST_CA_FILE="${TURN_CERTIFICATE_TEST_CA_FILE:-}"
 
@@ -32,9 +32,28 @@ refuse() {
   exit 1
 }
 
+coturn_dir="$(dirname "$0")"
+if [ "$#" -eq 4 ] && [ "$1" = --coturn-dir ]; then
+  coturn_dir="$2"
+  shift 2
+fi
 if [ "$#" -ne 2 ]; then
-  echo "Usage: $0 FULLCHAIN.pem PRIVKEY.pem" >&2
+  echo "Usage: $0 [--coturn-dir DIR] FULLCHAIN.pem PRIVKEY.pem" >&2
   exit 2
+fi
+# The physical path (a link such as /etc/secure-call/turn-certificate/coturn resolved), checked to
+# be next to compose.yaml, so tls/ is never written anywhere else.
+if ! COTURN_DIR="$(cd -- "$coturn_dir" 2>/dev/null && pwd -P)" \
+  || [ ! -f "$COTURN_DIR/../compose.yaml" ]; then
+  echo "install-turn-certificate.sh: $coturn_dir is not the coturn folder next to compose.yaml." >&2
+  exit 2
+fi
+readonly COTURN_DIR
+readonly TLS_DIR="$COTURN_DIR/tls"
+readonly COMPOSE_FILE="$COTURN_DIR/../compose.yaml"
+# Root (sync-turn-certificate.sh) writes there, so it must be the folder itself, not a link.
+if [ -L "$TLS_DIR" ]; then
+  refuse "$TLS_DIR is a symbolic link, not a folder."
 fi
 if [ -n "$TEST_CA_FILE" ]; then
   echo "install-turn-certificate.sh: WARNING: also trusting $TEST_CA_FILE" \
@@ -48,6 +67,7 @@ else
   work_dir="$(mktemp -d)"
 fi
 trap 'rm -rf "$work_dir"' EXIT
+trap 'exit 1' HUP INT TERM
 cp -- "$1" "$work_dir/fullchain.pem" 2>/dev/null || refuse "cannot read $1."
 cp -- "$2" "$work_dir/privkey.pem" 2>/dev/null || refuse "cannot read $2."
 fullchain="$work_dir/fullchain.pem"

@@ -1,0 +1,36 @@
+# Fetches the TURN certificate from Nginx Proxy Manager on the proxy machine and installs it for
+# coturn when it changed (secure-call-backend#90). secure-call-turn-certificate.timer starts it.
+# Install it as deploy/raspberry-pi/README.md, TURN step 3b, describes: it is copied unchanged to
+# /etc/systemd/system/, the two scripts are root-owned copies in /usr/local/lib/secure-call/, and
+# /etc/secure-call/turn-certificate/ (root only) holds the SSH key, the proxy's login and host key,
+# and a link to deploy/raspberry-pi/coturn.
+[Unit]
+Description=Refresh coturn's TLS certificate from Nginx Proxy Manager (sync-turn-certificate.sh)
+Documentation=https://github.com/The-Secure-Video-Call/secure-call-backend/blob/main/deploy/raspberry-pi/README.md
+Wants=network-online.target
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+# A root-owned copy, never the one in the repository, which the login user (and anything running
+# as that user) can change.
+ExecStart=/usr/local/lib/secure-call/sync-turn-certificate.sh
+# `journalctl -t secure-call-turn` shows every run, next to the expiry warning of the cron line.
+SyslogIdentifier=secure-call-turn
+# A stuck connection must not hold up the next run.
+TimeoutStartSec=5min
+UMask=0077
+# A fresh /dev/shm (memory) of its own for every run: the fetched key is visible to no other
+# process and gone when the run ends, even if it is killed.
+TemporaryFileSystem=/dev/shm:mode=0700,nosuid,noexec
+PrivateTmp=yes
+# Only what installing the key for coturn's user (65534) into the login user's checkout needs:
+# give a file to another user and set its mode, and read and write other users' files.
+CapabilityBoundingSet=CAP_CHOWN CAP_FOWNER CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=full
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
