@@ -54,10 +54,11 @@ refuse() {
 days_since_epoch() {
   local year=$((10#$1)) month=$((10#$2)) day=$((10#$3))
   year=$((year - (month <= 2 ? 1 : 0)))
+  local era=$((year / 400))  # whole 400-year eras: integer division on purpose
   local year_of_era=$((year % 400))
   local day_of_year=$(((153 * (month + (month > 2 ? -3 : 9)) + 2) / 5 + day - 1))
   local day_of_era=$((year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year))
-  printf '%s\n' $((year / 400 * 146097 + day_of_era - 719468))
+  printf '%s\n' $((era * 146097 + day_of_era - 719468))
 }
 
 # Warns (never fails) when the token gh uses expires within token_warning_days. GitHub sends the
