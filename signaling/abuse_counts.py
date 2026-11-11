@@ -4,6 +4,9 @@ ASVS V16.3 wants refusals to be visible, but the privacy rules forbid logging wh
 refused. So this module keeps five plain integers in process memory and, every
 REPORT_INTERVAL_SECONDS, logs one line of counts (only if one is non-zero) and resets them.
 
+- "Invalid messages" covers everything refused with a close or a `bad-message` error: malformed,
+  oversized or binary frames, plus valid messages sent at the wrong time (leave without a room,
+  a second join, a signal before joining).
 - Nothing here ever receives an IP address, room ID, username or message content: the only way in
   is `count(kind)` with a fixed `AbuseKind`, so an identifier cannot reach the line by accident.
 - Increments have no `await`, so on the single-threaded event loop they cannot interleave.
@@ -14,6 +17,7 @@ REPORT_INTERVAL_SECONDS, logs one line of counts (only if one is non-zero) and r
 """
 
 import asyncio
+import contextlib
 import enum
 import logging
 
@@ -35,7 +39,15 @@ reporter_task: asyncio.Task[None] | None = None
 
 
 def count(kind: AbuseKind) -> None:
+    """Add one to the count and make sure the report is running (when a loop is running).
+
+    Starting the reporter here, not only on connect, means a server that sees only refused
+    handshakes (bad Origin) still logs them.
+    """
     counts_by_kind[kind] += 1
+    # RuntimeError: no running event loop (a plain synchronous caller); a later count retries.
+    with contextlib.suppress(RuntimeError):
+        start_reporting_if_needed()
 
 
 def report_and_reset_counts() -> None:

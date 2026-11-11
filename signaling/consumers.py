@@ -177,6 +177,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             await self.relay_signal_to_peer(text_data)
         elif isinstance(message, LeaveMessage):
             if self.room_id is None:
+                count(AbuseKind.INVALID_OR_OVERSIZED_MESSAGES)
                 await self.send_message(ErrorMessage(code="bad-message"))
             else:
                 await self.leave_room()
@@ -186,6 +187,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
 
     async def join_room(self, room_id: str) -> None:
         if self.room_id is not None:
+            count(AbuseKind.INVALID_OR_OVERSIZED_MESSAGES)
             await self.send_message(ErrorMessage(code="bad-message"))
             return
         self.join_attempted = True  # a join in progress must not be cut off by the join timeout
@@ -252,6 +254,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
 
     async def relay_signal_to_peer(self, signal_text: str) -> None:
         if self.room_id is None:
+            count(AbuseKind.INVALID_OR_OVERSIZED_MESSAGES)
             await self.send_message(ErrorMessage(code="bad-message"))
             return
         if not room_registry.is_member(self.room_id, self.channel_name):
