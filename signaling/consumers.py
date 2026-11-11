@@ -39,6 +39,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 from pydantic import BaseModel, ValidationError
 
+from signaling.abuse_counts import AbuseKind, count, start_reporting_if_needed
 from signaling.protocol import (
     ClientMessage,
     ErrorMessage,
@@ -106,8 +107,10 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         self.client_keys = client_keys_for_ip(client_ip)
         self.message_bucket = new_message_bucket()
         self.holds_connection_slot = connection_limiter.try_acquire(self.client_keys)
+        start_reporting_if_needed()
         await self.accept()
         if not self.holds_connection_slot:
+            count(AbuseKind.RATE_LIMIT_REFUSALS)
             self.refused_over_cap = True  # receive() ignores anything sent before the close lands
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.close(code=CLOSE_RATE_LIMITED)
@@ -147,18 +150,22 @@ class SignalingConsumer(AsyncWebsocketConsumer):
         if self.refused_over_cap:
             return  # no slot: never join a room
         if not self.message_bucket.try_take_token():
+            count(AbuseKind.RATE_LIMIT_REFUSALS)
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.leave_room_then_close(CLOSE_RATE_LIMITED)
             return
         if text_data is None:
+            count(AbuseKind.INVALID_OR_OVERSIZED_MESSAGES)
             await self.leave_room_then_close(CLOSE_UNSUPPORTED_DATA)
             return
         if len(text_data.encode("utf-8")) > settings.SIGNALING_MAX_MESSAGE_BYTES:
+            count(AbuseKind.INVALID_OR_OVERSIZED_MESSAGES)
             await self.leave_room_then_close(CLOSE_MESSAGE_TOO_BIG)
             return
         try:
             message = ClientMessage.model_validate_json(text_data).root
         except ValidationError:
+            count(AbuseKind.INVALID_OR_OVERSIZED_MESSAGES)
             await self.leave_room_then_close(CLOSE_POLICY_VIOLATION)
             return
 
@@ -183,6 +190,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             return
         self.join_attempted = True  # a join in progress must not be cut off by the join timeout
         if not join_limiter.try_acquire(self.client_keys):
+            count(AbuseKind.RATE_LIMIT_REFUSALS)
             await self.send_message(ErrorMessage(code="rate-limited"))
             await self.close(code=CLOSE_RATE_LIMITED)
             return
@@ -203,6 +211,7 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             room_id, self.channel_name, remember_room_and_join_group
         )
         if role is None:
+            count(AbuseKind.ROOM_FULL)
             await self.send_message(ErrorMessage(code="room-full"))
             await self.close()
             return
@@ -231,7 +240,9 @@ class SignalingConsumer(AsyncWebsocketConsumer):
             return None
         # Charged only when a credential is really issued (after the room-time checks above).
         if not turn_credential_limiter.try_acquire(self.client_keys):
+            count(AbuseKind.RATE_LIMIT_REFUSALS)
             return None  # over the hourly cap: the join works, just without a relay
+        count(AbuseKind.TURN_CREDENTIALS_ISSUED)
         return issue_turn_credentials(
             settings.TURN_SHARED_SECRET,
             settings.TURN_URLS,
