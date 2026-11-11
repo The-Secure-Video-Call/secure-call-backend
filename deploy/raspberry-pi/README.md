@@ -383,9 +383,10 @@ Manual steps (owner):
        `authorized_keys` says. `Match all` closes it, so lines added to the file later apply to
        everyone again.
      - **Checks:** `sshd -t` must print nothing, and sshd is reloaded only then; if it prints an
-       error, fix `sshd_config` before you close the other session. The first `sshd -T` line must show that `forcecommand`,
-       `disableforwarding yes` and `permittty no`. The second, for your own login, must show
-       `forcecommand none`. Note the fingerprint the last command prints.
+       error, fix `sshd_config` before you close the other session. The first `sshd -T` command
+       must print the `forcecommand` line above, `disableforwarding yes` and `permittty no`; the
+       second, for your own login, `forcecommand none`. Note the fingerprint the last command
+       prints.
      - If `/etc/ssh/sshd_config` has an `AllowUsers` or `AllowGroups` line, add
        `turn-certificate` to it.
    - **On this Pi (part 2),** in `deploy/raspberry-pi`, with the proxy machine's LAN IP. First the
