@@ -60,7 +60,8 @@ the server refuses to start without a secret key.
 | `POSTGRES_HOST` | Optional. Set it to connect PostgreSQL; leave it unset for no database. |
 | `POSTGRES_PORT`, `POSTGRES_DB`, `POSTGRES_USER` | Default `5432`, `securecall`, `securecall`. |
 | `POSTGRES_PASSWORD` | Required when `POSTGRES_HOST` is set (outside DEBUG). |
-| `POSTGRES_SSLMODE` | Default `prefer`. Use `require` if the database is on another machine. |
+| `POSTGRES_SSLMODE` | Default `verify-full`: TLS, with the server's certificate and host name checked against `POSTGRES_SSLROOTCERT`. The only other value accepted is `disable`, for a local development database; `prefer`, `require` and the rest are refused, as they fall back to plaintext or accept any certificate. |
+| `POSTGRES_SSLROOTCERT` | Required with `verify-full`: the root certificate that signed the database's certificate. On the Pi, compose.yaml sets it. |
 | `DJANGO_SECURE_SSL_REDIRECT` | Defaults to on in production. TLS is terminated by the reverse proxy. |
 | `DJANGO_LOG_LEVEL` | Defaults to `WARNING`. Every log line reads `<ISO 8601 UTC time>Z <LEVEL> <logger name> <message>`, e.g. `2026-11-10T20:42:01Z WARNING signaling.consumers TURN credential not issued`. The format adds no IP addresses, room IDs or message contents, and this server's own log calls never include them. At `INFO` or lower, Daphne and Django's own loggers may log addresses, so keep the default and run Daphne with `-v 0`. |
 
@@ -146,7 +147,21 @@ must never store call data: no room IDs, call times, IP addresses or message con
 
 The database runs next to the backend on the Raspberry Pi (see below). For database tools it is
 published on `127.0.0.1:5434` by default (`POSTGRES_PUBLISH_ADDR` and `POSTGRES_PUBLISH_PORT` in
-`.env`); never forward that port on your router. CI starts a throwaway PostgreSQL for every run, so the connection is tested on each PR.
+`.env`); never forward that port on your router.
+
+- **TLS only.** PostgreSQL has a certificate from our own small certificate authority
+  (`deploy/raspberry-pi/make-local-certs.sh`, which deletes the CA's key once it has signed). Its
+  access rules (`deploy/raspberry-pi/postgres/pg_hba.conf`) have no plaintext entry, so the server
+  itself refuses a connection without TLS, and TLS 1.3 is the minimum. The backend checks the
+  certificate and the host name (`verify-full`).
+- **Least privilege.** The backend connects as its own role, `securecall_app`
+  (`deploy/raspberry-pi/postgres/initdb/10-app-role.sh`), which owns the database so it can run
+  migrations, and nothing more: no superuser, no creating roles or databases. The superuser
+  (`POSTGRES_USER`) is for maintenance only, and the backend never receives its password.
+- **Tested on every PR.** CI starts PostgreSQL from `deploy/raspberry-pi/compose.yaml` itself and
+  checks, in `tests/test_database_tls.py`, that plaintext, a certificate from another CA and a
+  wrong host name are refused, and that the backend's role has no extra rights.
+- **For local development** without TLS, set `POSTGRES_SSLMODE=disable` explicitly.
 
 ## Deploying to the Raspberry Pi
 
@@ -184,7 +199,9 @@ Manager already running.
    ```sh
    git clone https://github.com/The-Secure-Video-Call/secure-call-backend.git
    cd secure-call-backend/deploy/raspberry-pi
-   cp .env.example .env        # set BACKEND_PUBLISH_ADDR, DJANGO_SECRET_KEY, POSTGRES_PASSWORD
+   cp .env.example .env        # set BACKEND_PUBLISH_ADDR, DJANGO_SECRET_KEY, POSTGRES_PASSWORD,
+                               # POSTGRES_APP_PASSWORD
+   ./make-local-certs.sh       # the database's TLS certificate, into ./tls/
    docker compose up -d postgres
    ./update.sh                 # pulls and starts only a verified backend image
    docker compose up -d
@@ -238,7 +255,31 @@ does not turn it back on: re-enable it on that repository's Actions tab, or with
 `gh workflow enable uptime.yml -R The-Secure-Video-Call/secure-call`.
 
 To look inside the database from the Pi: `docker compose exec postgres psql -U securecall
-securecall`, or point a database tool at port `5434`.
+securecall`. A database tool on port `5434` must use TLS and trust our CA, for example
+`psql "host=127.0.0.1 port=5434 dbname=securecall user=securecall sslmode=verify-full
+sslrootcert=tls/local-ca.crt"` from `deploy/raspberry-pi`.
+
+**Database certificate renewal:** `make-local-certs.sh` prints when the certificates expire
+(825 days). Before then, or if a key may have leaked, run it again (it makes a new CA), then
+`docker compose up -d --force-recreate postgres backend`.
+
+**Moving an existing Pi to the TLS database (once):** the role is created only when the database
+is first created, and the database holds nothing yet, so the volume is recreated. Do this
+**before** approving the "Publish backend image" run for this change: `update.sh` pulls new
+images but not new files, and the new image refuses to start without the certificate, while
+the old image runs fine with the new files (its start-up migration fails harmlessly, and
+signaling does not use the database). In `deploy/raspberry-pi`, after `git pull`:
+
+```sh
+# 1. Add a new POSTGRES_APP_PASSWORD to .env (a different value from POSTGRES_PASSWORD):
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+nano .env
+# 2. Certificates, then recreate the empty database volume and start everything:
+./make-local-certs.sh
+docker compose down --volumes   # pgdata is the only volume
+docker compose pull backend && docker compose up -d
+docker compose ps    # backend and postgres "healthy" or "running"
+```
 
 **PostgreSQL updates:** `compose.yaml` pins `postgres:18` by digest. After merging a Dependabot
 PR that bumps it, run on the Pi (`update.sh` only updates the backend):

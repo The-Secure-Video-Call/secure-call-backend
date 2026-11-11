@@ -18,21 +18,6 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # A throwaway PostgreSQL so the database tests run against a real server.
-    services:
-      postgres:
-        image: postgres:18@sha256:e3d24f6906d0760bf4da0dae872415391ededefad23fd471c47dc53b0ddf3c42
-        env:
-          POSTGRES_DB: securecall
-          POSTGRES_USER: securecall
-          POSTGRES_PASSWORD: ci-only-throwaway
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U securecall"
-          --health-interval 5s
-          --health-timeout 5s
-          --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -53,12 +38,35 @@ jobs:
       - run: uv run ruff check
       - run: uv run ruff format --check
       - run: uv run mypy .
+
+      # A throwaway PostgreSQL started exactly as the Pi runs it (deploy/raspberry-pi/compose.yaml):
+      # TLS only, with certificates from make-local-certs.sh, and the backend's own role.
+      # The TURN values are only there because compose.yaml requires them; coturn isn't started.
+      - name: Start PostgreSQL as the Pi runs it
+        working-directory: deploy/raspberry-pi
+        run: |
+          ./make-local-certs.sh
+          printf '%s\n' \
+            POSTGRES_PASSWORD=ci-only-throwaway \
+            POSTGRES_APP_PASSWORD=ci-only-throwaway-app \
+            TURN_SHARED_SECRET=ci-only-throwaway \
+            TURN_PUBLIC_IP=203.0.113.7 \
+            TURN_RELAY_IP=127.0.0.1 > .env
+          docker compose up -d --wait postgres || { docker compose logs postgres; exit 1; }
+
       - name: Tests (including the real PostgreSQL connection)
         env:
+          # The superuser for Django's tests (they create a test database); the backend's own
+          # role for tests/test_database_tls.py.
           POSTGRES_HOST: localhost
+          POSTGRES_PORT: '5434'
           POSTGRES_DB: securecall
           POSTGRES_USER: securecall
           POSTGRES_PASSWORD: ci-only-throwaway
+          POSTGRES_SSLMODE: verify-full
+          POSTGRES_SSLROOTCERT: ${{ github.workspace }}/deploy/raspberry-pi/tls/local-ca.crt
+          POSTGRES_APP_USER: securecall_app
+          POSTGRES_APP_PASSWORD: ci-only-throwaway-app
         run: uv run pytest -rs
 
       - name: Django production checks
