@@ -5,7 +5,7 @@
 FROM ghcr.io/astral-sh/uv:0.13.7@sha256:96f40d3904aad8d0bd010539001d36c8e2188b981e1334471a90c4a1d93bb490 AS uv
 
 # --- Build stage: install the locked dependencies into /app/.venv with uv --------------------
-FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f AS build
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928 AS build
 COPY --from=uv /uv /bin/uv
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
@@ -19,7 +19,7 @@ COPY config ./config
 COPY signaling ./signaling
 
 # --- Runtime stage: same Python, no build tools, non-root user --------------------------------
-FROM python:3.14-slim@sha256:9aaa474097d094040649f2162a627c0049b408f52138d980916788d80f04802f
+FROM python:3.15-slim@sha256:65a65fc7b30b06cb6df4930fd4650697cb23f4c2698ab81fc87e4b031bc36928
 # Security fix not yet in the pinned base image: zlib1g from Debian's trixie-security (DSA-6613-1:
 # CVE-2026-85091, CVE-2026-76844; the base has 1:1.3.dfsg+really1.3.1-1+b1). The exact version is
 # pinned, so the build stays reproducible and fails loudly if Debian replaces it; apt checks the
