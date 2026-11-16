@@ -34,7 +34,7 @@ RUN apt-get update \
 # base image's pip carries its own copies of urllib3, msgpack and setuptools code that the image
 # scan flags (and that nothing here uses). The bundled wheel for re-creating pip goes too.
 RUN python -m pip uninstall --yes --root-user-action=ignore pip \
-    && rm -rf /usr/local/lib/python3.14/ensurepip/_bundled \
+    && rm -rf /usr/local/lib/python3.15/ensurepip/_bundled \
     && ! python -c "import pip" 2>/dev/null
 RUN useradd --system --uid 10001 --no-create-home --shell /usr/sbin/nologin app
 WORKDIR /app
