@@ -10,7 +10,7 @@
 # Pinned by version and digest (the multi-platform digest Dependabot proposed in #47; compare with
 # `docker buildx imagetools inspect coturn/coturn:4.18.0`). Dependabot proposes upgrades, and the
 # CI coturn job must pass before one is merged.
-FROM coturn/coturn:4.18.0@sha256:bbefd3e1fdfdc0d58770fe01b581fd8b00d9f3a5580d00acb77cf719a6bc78e3
+FROM coturn/coturn:4.19.0@sha256:0a3c026baaab092c79c9005823a72747bd09bf211071d537bb0865d95eae4638
 
 USER root
 # `setcap -r` if the tool is in the image; otherwise replace the binary with a plain copy (cp does
